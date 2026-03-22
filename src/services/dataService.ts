@@ -64,10 +64,11 @@ export async function fetchBTCData(limit: number = 500, interval: string = '1h',
   }
 
   const totalSeconds = endTime - startTime;
-  const estimatedCandles = Math.ceil(totalSeconds / secondsPerCandle);
-  let remainingLimit = startTimeParam && endTimeParam ? estimatedCandles : limit;
+  const estimatedCandles = Math.ceil(totalSeconds / secondsPerCandle) + 10; // Add buffer
+  // If range is specified, we want to fetch until we hit startTime, so set a large limit
+  let remainingLimit = (startTimeParam && endTimeParam) ? Math.max(estimatedCandles, 10000) : limit;
 
-  logger.info(`Fetching candles (${interval}) from Delta Exchange for ${symbol} from ${format(new Date(startTime * 1000), 'yyyy-MM-dd')} to ${format(new Date(endTime * 1000), 'yyyy-MM-dd')}...`);
+  logger.info(`Fetching candles (${interval}) from Delta Exchange for ${symbol} from ${format(new Date(startTime * 1000), 'yyyy-MM-dd HH:mm')} to ${format(new Date(endTime * 1000), 'yyyy-MM-dd HH:mm')} (Est: ${estimatedCandles})...`);
 
   try {
     let currentEndTime = endTime;
@@ -82,7 +83,7 @@ export async function fetchBTCData(limit: number = 500, interval: string = '1h',
       url.searchParams.append('start', batchStartTime.toString());
       url.searchParams.append('end', currentEndTime.toString());
 
-      logger.info(`Requesting batch: ${format(new Date(batchStartTime * 1000), 'yyyy-MM-dd HH:mm')} to ${format(new Date(currentEndTime * 1000), 'yyyy-MM-dd HH:mm')}`);
+      logger.info(`Requesting batch: ${format(new Date(batchStartTime * 1000), 'yyyy-MM-dd HH:mm')} to ${format(new Date(currentEndTime * 1000), 'yyyy-MM-dd HH:mm')} (Remaining: ${remainingLimit})`);
 
       const response = await fetch(url.toString());
       
@@ -100,27 +101,29 @@ export async function fetchBTCData(limit: number = 500, interval: string = '1h',
         break;
       }
 
-      logger.success(`Received ${data.length} candles.`);
+      const batch: Candle[] = data.map((d: any) => ({
+        time: d.time * 1000,
+        open: parseFloat(d.open),
+        high: parseFloat(d.high),
+        low: parseFloat(d.low),
+        close: parseFloat(d.close),
+        volume: parseFloat(d.volume),
+      }));
 
-      const batch: Candle[] = data.map((d: any) => {
-        const candle = {
-          time: d.time * 1000,
-          open: parseFloat(d.open),
-          high: parseFloat(d.high),
-          low: parseFloat(d.low),
-          close: parseFloat(d.close),
-          volume: parseFloat(d.volume),
-        };
-        // Cache the fetched data
+      logger.success(`Received ${batch.length} candles. Range: ${format(new Date(batch[0].time), 'yyyy-MM-dd HH:mm')} to ${format(new Date(batch[batch.length-1].time), 'yyyy-MM-dd HH:mm')}`);
+
+      // Cache the fetched data
+      batch.forEach(candle => {
         candleCache.set(`${interval}:${candle.time}`, candle);
-        return candle;
       });
 
       allCandles = [...batch, ...allCandles];
       remainingLimit -= batch.length;
-      currentEndTime = Math.floor(batch[0].time / 1000) - secondsPerCandle;
+      
+      // Find the oldest candle in this batch to move the window backwards
+      const oldestInBatch = Math.min(...batch.map(c => c.time));
+      currentEndTime = Math.floor(oldestInBatch / 1000) - secondsPerCandle;
 
-      if (batch.length < currentBatchSize / 2 && !startTimeParam) break; 
       if (currentEndTime <= startTime) break;
     }
     

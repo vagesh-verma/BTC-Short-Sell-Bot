@@ -66,7 +66,7 @@ export default function App() {
     end: format(new Date(), 'yyyy-MM-dd')
   });
   const [backtestRange, setBacktestRange] = useState({
-    start: format(new Date(Date.now() - 3 * 24 * 60 * 60 * 1000), 'yyyy-MM-dd'),
+    start: format(new Date(Date.now() - 7 * 24 * 60 * 60 * 1000), 'yyyy-MM-dd'),
     end: format(new Date(), 'yyyy-MM-dd')
   });
   const [dropThreshold, setDropThreshold] = useState<number>(0.5);
@@ -619,62 +619,79 @@ export default function App() {
     
     try {
       const startTs = new Date(backtestRange.start).getTime();
-      const endTs = new Date(backtestRange.end).getTime();
+      // Set endTs to the end of the selected day
+      const endTs = new Date(backtestRange.end).getTime() + (24 * 60 * 60 * 1000) - 1;
+      
+      logger.info(`--- Starting Backtest from ${backtestRange.start} to ${backtestRange.end} ---`);
       
       // 1. Fetch 1h and 4h data for the backtest range to generate predictions
       // We need extra data before the start to fill the window
       const fetchStartTs = startTs - (windowSize * 60 * 60 * 1000);
       
-      logger.info('Fetching 1h and 4h data for prediction generation...');
+      logger.info(`Fetching 1h data from ${format(new Date(fetchStartTs), 'yyyy-MM-dd HH:mm')} to ${format(new Date(endTs), 'yyyy-MM-dd HH:mm')}...`);
       const btCandles1h = await fetchBTCData(0, '1h', fetchStartTs, endTs);
+      
+      logger.info(`Fetching 4h data for trend context...`);
       const btCandles4h = await fetchBTCData(0, '4h', fetchStartTs - (windowSize * 4 * 60 * 60 * 1000), endTs);
 
-      if (btCandles1h.length < windowSize || btCandles4h.length < windowSize) {
-        throw new Error('Insufficient historical data for backtest range');
+      if (btCandles1h.length < windowSize) {
+        throw new Error(`Insufficient 1h data: got ${btCandles1h.length}, need at least ${windowSize}`);
       }
 
       setStatus('Generating predictions for backtest range...');
       const btPredictions = await getPredictionsForRange(btCandles1h, btCandles4h, model1hRef.current, model4hRef.current);
+      logger.info(`Generated ${btPredictions.length} predictions.`);
 
       // 2. Fetch 5m data for high-res backtest
       setStatus('Fetching 5m data for accurate backtest...');
-      logger.info(`Fetching 5m candles for backtest from ${backtestRange.start} to ${backtestRange.end}...`);
+      logger.info(`Fetching 5m candles for backtest from ${format(new Date(startTs), 'yyyy-MM-dd HH:mm')} to ${format(new Date(endTs), 'yyyy-MM-dd HH:mm')}...`);
       const highResCandles = await fetchBTCData(0, '5m', startTs, endTs);
       
       if (highResCandles.length === 0) {
-        logger.error('Failed to fetch 5m data.');
-        throw new Error('Failed to fetch 5m data');
+        throw new Error('Failed to fetch 5m data for the selected range');
       }
 
       setStatus('Aligning predictions with 5m candles...');
-      logger.info('Aligning 1h predictions with 5m resolution...');
       
       const predictionMap = new Map<number, number>();
       btPredictions.forEach((val, i) => {
-        const time = btCandles1h[i + windowSize].time;
-        predictionMap.set(time, val);
+        // btPredictions[i] corresponds to btCandles1h[i + windowSize]
+        const candleIndex = i + windowSize;
+        if (btCandles1h[candleIndex]) {
+          const time = btCandles1h[candleIndex].time;
+          predictionMap.set(time, val);
+        }
       });
 
       const alignedPredictions: number[] = [];
       const validHighResCandles: Candle[] = [];
 
       highResCandles.forEach(c => {
+        // Round down to the nearest hour to find the corresponding prediction
         const hourTimestamp = Math.floor(c.time / (1000 * 60 * 60)) * (1000 * 60 * 60);
         const prediction = predictionMap.get(hourTimestamp);
         
         if (prediction !== undefined) {
-          const isFirst5mOfHour = c.time === hourTimestamp;
-          alignedPredictions.push(isFirst5mOfHour ? prediction : 0);
+          // Carry the prediction for the entire hour
+          alignedPredictions.push(prediction);
           validHighResCandles.push(c);
         }
       });
 
       if (validHighResCandles.length === 0) {
-        throw new Error('No overlapping data found for backtest period');
+        logger.error(`Alignment failed. Prediction map size: ${predictionMap.size}, High-res candles: ${highResCandles.length}`);
+        if (highResCandles.length > 0) {
+          logger.info(`First 5m candle: ${format(new Date(highResCandles[0].time), 'yyyy-MM-dd HH:mm')}`);
+          const firstPredTime = Array.from(predictionMap.keys()).sort()[0];
+          if (firstPredTime) {
+            logger.info(`First prediction time: ${format(new Date(firstPredTime), 'yyyy-MM-dd HH:mm')}`);
+          }
+        }
+        throw new Error('No overlapping data found for backtest period. Ensure the range is within the trained data or fetch more data.');
       }
 
       setStatus('Running High-Resolution Backtest...');
-      logger.info(`Running backtest on ${validHighResCandles.length} candles...`);
+      logger.info(`Running backtest on ${validHighResCandles.length} candles (${(validHighResCandles.length * 5 / 60).toFixed(1)} hours of data)...`);
       const result = runBacktest(validHighResCandles, alignedPredictions, settings, 10000, 0);
       
       setBacktestResult(result);
