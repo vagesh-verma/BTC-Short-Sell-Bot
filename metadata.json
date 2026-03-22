@@ -1,0 +1,5 @@
+{
+  "name": "BTC Short-Sell GRU Bot",
+  "description": "A deep learning-powered trading bot using GRU models to identify short-selling opportunities in BTCUSD with integrated backtesting.",
+  "requestFramePermissions": []
+}

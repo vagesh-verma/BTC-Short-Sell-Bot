@@ -1,0 +1,182 @@
+import { Candle } from './dataService';
+
+export interface Trade {
+  type: 'SHORT';
+  entryPrice: number;
+  exitPrice: number;
+  entryTime: number;
+  exitTime: number;
+  profit: number;
+  profitPct: number;
+  exitReason: 'TIME' | 'STOP_LOSS' | 'TAKE_PROFIT' | 'TRAILING_STOP' | 'PREDICTION';
+}
+
+export interface BacktestSettings {
+  threshold: number;
+  exitThreshold: number;
+  stopLoss: number; // e.g., 0.01 for 1%
+  takeProfit: number; // e.g., 0.02 for 2%
+  trailingStopActivation: number; // e.g., 0.01 for 1% profit
+  trailingStopOffset: number; // e.g., 0.005 for 0.5% offset
+  maxDurationHours: number;
+  quantity: number;
+  quantityType: 'USD' | 'BTC';
+}
+
+export interface BacktestResult {
+  trades: Trade[];
+  totalProfit: number;
+  winRate: number;
+  equityCurve: { time: number; balance: number }[];
+  maxDrawdown: number;
+  avgProfit: number;
+  avgLoss: number;
+  maxProfit: number;
+  maxLoss: number;
+}
+
+export function runBacktest(
+  candles: Candle[],
+  predictions: number[],
+  settings: BacktestSettings,
+  initialBalance: number = 10000,
+  windowSize: number = 20
+): BacktestResult {
+  const trades: Trade[] = [];
+  let balance = initialBalance;
+  let peakBalance = initialBalance;
+  let maxDrawdown = 0;
+  const equityCurve: { time: number; balance: number }[] = [{ time: candles[0].time, balance }];
+  
+  let activeTrade: {
+    entryPrice: number;
+    entryTime: number;
+    highestProfitPct: number;
+    trailingStopPrice: number | null;
+  } | null = null;
+
+  for (let i = 0; i < predictions.length; i++) {
+    const candle = candles[i + windowSize];
+    if (!candle) break;
+    
+    const prediction = predictions[i];
+
+    // Check for exit first if in trade
+    if (activeTrade) {
+      const stopLossPrice = activeTrade.entryPrice * (1 + settings.stopLoss);
+      const takeProfitPrice = activeTrade.entryPrice * (1 - settings.takeProfit);
+      
+      let shouldExit = false;
+      let exitReason: Trade['exitReason'] = 'TIME';
+      let exitPrice = candle.close;
+
+      // Check SL/TP/Trailing Stop
+      if (candle.high >= stopLossPrice) {
+        shouldExit = true;
+        exitReason = 'STOP_LOSS';
+        exitPrice = stopLossPrice;
+      } else if (candle.low <= takeProfitPrice) {
+        shouldExit = true;
+        exitReason = 'TAKE_PROFIT';
+        exitPrice = takeProfitPrice;
+      } else if (activeTrade.trailingStopPrice !== null && candle.high >= activeTrade.trailingStopPrice) {
+        shouldExit = true;
+        exitReason = 'TRAILING_STOP';
+        exitPrice = activeTrade.trailingStopPrice;
+      } else if (prediction < settings.exitThreshold) {
+        shouldExit = true;
+        exitReason = 'PREDICTION';
+        exitPrice = candle.close;
+      } else {
+        const tradeDuration = (candle.time - activeTrade.entryTime) / (1000 * 60 * 60);
+        if (tradeDuration >= settings.maxDurationHours) {
+          shouldExit = true;
+          exitReason = 'TIME';
+          exitPrice = candle.close;
+        }
+      }
+
+      if (shouldExit) {
+        const currentProfitPct = (activeTrade.entryPrice - exitPrice) / activeTrade.entryPrice;
+        
+        let profit = 0;
+        if (settings.quantityType === 'USD') {
+          profit = settings.quantity * currentProfitPct;
+        } else {
+          // BTC quantity: profit = quantity * (entryPrice - exitPrice)
+          profit = settings.quantity * (activeTrade.entryPrice - exitPrice);
+        }
+        
+        balance += profit;
+        
+        trades.push({
+          type: 'SHORT',
+          entryPrice: activeTrade.entryPrice,
+          exitPrice: exitPrice,
+          entryTime: activeTrade.entryTime,
+          exitTime: candle.time,
+          profit,
+          profitPct: currentProfitPct * 100,
+          exitReason,
+        });
+        
+        activeTrade = null;
+      } else {
+        // Update Trailing Stop
+        const currentProfitPct = (activeTrade.entryPrice - candle.low) / activeTrade.entryPrice;
+        activeTrade.highestProfitPct = Math.max(activeTrade.highestProfitPct, currentProfitPct);
+
+        if (activeTrade.highestProfitPct >= settings.trailingStopActivation) {
+          const newTrailingStop = candle.low * (1 + settings.trailingStopOffset);
+          if (activeTrade.trailingStopPrice === null || newTrailingStop < activeTrade.trailingStopPrice) {
+            activeTrade.trailingStopPrice = newTrailingStop;
+          }
+        }
+      }
+    }
+
+    // Check for entry if not in trade
+    if (!activeTrade && prediction > settings.threshold) {
+      activeTrade = {
+        entryPrice: candle.close,
+        entryTime: candle.time,
+        highestProfitPct: 0,
+        trailingStopPrice: null,
+      };
+    }
+    
+    if (balance > peakBalance) peakBalance = balance;
+    const drawdown = (peakBalance - balance) / peakBalance;
+    if (drawdown > maxDrawdown) maxDrawdown = drawdown;
+
+    equityCurve.push({ time: candle.time, balance });
+  }
+
+  const winningTrades = trades.filter(t => t.profit > 0);
+  const losingTrades = trades.filter(t => t.profit <= 0);
+  
+  const wins = winningTrades.length;
+  const winRate = trades.length > 0 ? (wins / trades.length) * 100 : 0;
+
+  const avgProfit = winningTrades.length > 0 
+    ? winningTrades.reduce((acc, t) => acc + t.profit, 0) / winningTrades.length 
+    : 0;
+  const avgLoss = losingTrades.length > 0 
+    ? losingTrades.reduce((acc, t) => acc + t.profit, 0) / losingTrades.length 
+    : 0;
+
+  const maxProfit = trades.length > 0 ? Math.max(...trades.map(t => t.profit)) : 0;
+  const maxLoss = trades.length > 0 ? Math.min(...trades.map(t => t.profit)) : 0;
+
+  return {
+    trades,
+    totalProfit: balance - initialBalance,
+    winRate,
+    equityCurve,
+    maxDrawdown: maxDrawdown * 100,
+    avgProfit,
+    avgLoss,
+    maxProfit,
+    maxLoss
+  };
+}
