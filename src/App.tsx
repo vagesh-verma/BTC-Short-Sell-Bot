@@ -91,9 +91,13 @@ export default function App() {
   });
 
   const [isLiveMode, setIsLiveMode] = useState(false);
+  const [isRealTrading, setIsRealTrading] = useState(false);
   const [livePrice, setLivePrice] = useState<number | null>(null);
+  const [lastLiveUpdate, setLastLiveUpdate] = useState<Date | null>(null);
   const [livePaperBalance, setLivePaperBalance] = useState(10000);
+  const [realBalance, setRealBalance] = useState<number | null>(null);
   const [liveTrades, setLiveTrades] = useState<Trade[]>([]);
+  const [serverStatus, setServerStatus] = useState<{apiKey: string, serverIp: string} | null>(null);
   const [activeLiveTrade, setActiveLiveTrade] = useState<{
     entryPrice: number;
     entryTime: number;
@@ -101,6 +105,18 @@ export default function App() {
     trailingStopPrice: number | null;
   } | null>(null);
   const [livePrediction, setLivePrediction] = useState<number | null>(null);
+  const [liveParams, setLiveParams] = useState<{
+    rsi: number;
+    ema: number;
+    ema9: number;
+    bbUpper: number;
+    bbLower: number;
+    macdHist: number;
+    stochRsi: number;
+    atr: number;
+    emaCross: boolean;
+    secondaryPrediction: number;
+  } | null>(null);
 
   const [savedModels, setSavedModels] = useState<ModelPair[]>([]);
   const [newModelName, setNewModelName] = useState('');
@@ -109,6 +125,21 @@ export default function App() {
 
   useEffect(() => {
     setSavedModels(getSavedModelPairs());
+  }, []);
+
+  useEffect(() => {
+    const fetchServerStatus = async () => {
+      try {
+        const res = await fetch('/api/status');
+        if (res.ok) {
+          const data = await res.json();
+          setServerStatus(data);
+        }
+      } catch (e) {
+        console.error('Failed to fetch server status');
+      }
+    };
+    fetchServerStatus();
   }, []);
 
   useEffect(() => {
@@ -125,6 +156,50 @@ export default function App() {
       return () => socket.disconnect();
     }
   }, [isLiveMode]);
+
+  useEffect(() => {
+    if (isRealTrading) {
+      fetchRealBalance();
+    }
+  }, [isRealTrading]);
+
+  const fetchRealBalance = async () => {
+    try {
+      const response = await fetch('/api/wallet');
+      const data = await response.json();
+      if (data.result) {
+        // Find USDT or BTC balance
+        const usdt = data.result.find((b: any) => b.asset_symbol === 'USDT');
+        if (usdt) setRealBalance(parseFloat(usdt.available_balance));
+      }
+    } catch (error) {
+      console.error('Error fetching real balance:', error);
+    }
+  };
+
+  const placeRealOrder = async (side: 'buy' | 'sell', size: number) => {
+    try {
+      const response = await fetch('/api/order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbol: 'BTCUSD',
+          side,
+          order_type: 'market',
+          size
+        })
+      });
+      const data = await response.json();
+      if (data.result) {
+        logger.success(`Real order placed: ${side} ${size} units`);
+        fetchRealBalance();
+      } else {
+        logger.error(`Real order failed: ${data.error || 'Unknown error'}`);
+      }
+    } catch (error) {
+      logger.error(`Error placing real order: ${error}`);
+    }
+  };
 
   const processLiveUpdate = async (price: number) => {
     if (!model1hRef.current || !model4hRef.current || candles.length < windowSize || candles4h.length < windowSize) return;
@@ -189,6 +264,21 @@ export default function App() {
 
     const prediction = model1hRef.current.predict(x1h);
     setLivePrediction(prediction);
+    setLivePrice(price);
+    setLastLiveUpdate(new Date());
+
+    setLiveParams({
+      rsi: r1h[r1h.length - 1],
+      ema: e1h[e1h.length - 1],
+      ema9: e9_1h[e9_1h.length - 1],
+      bbUpper: b1h.upper[b1h.upper.length - 1],
+      bbLower: b1h.lower[b1h.lower.length - 1],
+      macdHist: m1h.histogram[m1h.histogram.length - 1],
+      stochRsi: s1h[s1h.length - 1],
+      atr: a1h[a1h.length - 1],
+      emaCross: c1h.isBelow[c1h.isBelow.length - 1] === 1,
+      secondaryPrediction: secondaryPrediction
+    });
 
     // 3. Live Paper Trading Logic
     if (activeLiveTrade) {
@@ -226,6 +316,10 @@ export default function App() {
         setLivePaperBalance(prev => prev + profit);
         setActiveLiveTrade(null);
         logger.success(`Live Trade Closed: ${reason} | Profit: $${profit.toFixed(2)}`);
+        
+        if (isRealTrading) {
+          placeRealOrder('buy', settings.quantity); // Close SHORT with BUY
+        }
       }
     } else if (prediction > settings.threshold) {
       setActiveLiveTrade({
@@ -235,6 +329,10 @@ export default function App() {
         trailingStopPrice: null
       });
       logger.info(`Live Trade Opened: SHORT at $${price.toFixed(2)}`);
+      
+      if (isRealTrading) {
+        placeRealOrder('sell', settings.quantity); // Open SHORT with SELL
+      }
     }
   };
 
@@ -724,6 +822,26 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#0A0A0B] text-white font-sans selection:bg-emerald-500/30">
+      {/* Server Status Bar */}
+      {serverStatus && (
+        <div className="bg-white/5 border-b border-white/5 px-6 py-2 flex flex-wrap items-center gap-6 text-[10px] uppercase tracking-widest font-bold text-white/40">
+          <div className="flex items-center gap-2">
+            <ShieldAlert className="w-3 h-3 text-emerald-500" />
+            <span className="text-white/60">Server Status:</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="opacity-60">IP:</span>
+            <code className="bg-white/5 px-2 py-0.5 rounded text-emerald-400 font-mono">{serverStatus.serverIp}</code>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="opacity-60">API Key:</span>
+            <code className="bg-white/5 px-2 py-0.5 rounded text-emerald-400 font-mono">{serverStatus.apiKey}</code>
+          </div>
+          <div className="ml-auto opacity-40 italic normal-case font-medium">
+            Whitelist this IP in Delta Exchange API settings
+          </div>
+        </div>
+      )}
       {/* Header */}
       <header className="border-b border-white/5 bg-[#0D0D0E]/80 backdrop-blur-md sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
@@ -739,7 +857,7 @@ export default function App() {
               onClick={() => setIsLiveMode(!isLiveMode)}
               disabled={!model1hRef.current}
               className={cn(
-                "flex items-center gap-2 px-4 py-2 rounded-full border transition-all font-bold text-xs uppercase tracking-widest",
+                "flex items-center gap-2 px-4 py-2 rounded-full border transition-all font-bold text-[10px] uppercase tracking-widest",
                 isLiveMode 
                   ? "bg-emerald-500/20 border-emerald-500/50 text-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.2)]" 
                   : "bg-white/5 border-white/10 text-white/40 hover:border-white/20"
@@ -748,6 +866,21 @@ export default function App() {
               <Zap className={cn("w-3 h-3", isLiveMode && "fill-emerald-400")} />
               {isLiveMode ? 'Live Mode ON' : 'Live Mode OFF'}
             </button>
+
+            {isLiveMode && (
+              <button
+                onClick={() => setIsRealTrading(!isRealTrading)}
+                className={cn(
+                  "flex items-center gap-2 px-4 py-2 rounded-full border transition-all font-bold text-[10px] uppercase tracking-widest",
+                  isRealTrading 
+                    ? "bg-red-500/20 border-red-500/50 text-red-400 shadow-[0_0_15px_rgba(239,68,68,0.2)]" 
+                    : "bg-white/5 border-white/10 text-white/40 hover:border-white/20"
+                )}
+              >
+                <ShieldAlert className={cn("w-3 h-3", isRealTrading && "fill-red-400")} />
+                {isRealTrading ? 'REAL TRADING ON' : 'PAPER ONLY'}
+              </button>
+            )}
             <div className="flex items-center gap-2 px-3 py-1.5 bg-white/5 rounded-full border border-white/10">
               <div className={cn(
                 "w-2 h-2 rounded-full",
@@ -1185,23 +1318,37 @@ export default function App() {
           <section className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-700">
             <div className="flex items-center gap-2 border-b border-emerald-500/20 pb-2">
               <Activity className="w-5 h-5 text-emerald-500" />
-              <h2 className="text-xl font-bold tracking-tight">5. Live Paper Trading Monitor</h2>
+              <h2 className="text-xl font-bold tracking-tight">5. Live {isRealTrading ? 'Real' : 'Paper'} Trading Monitor</h2>
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
               <div className="lg:col-span-1 space-y-4">
-                <div className="bg-[#0D0D0E] border border-emerald-500/20 rounded-2xl p-6 shadow-xl relative overflow-hidden">
+                <div className={cn(
+                  "border rounded-2xl p-6 shadow-xl relative overflow-hidden",
+                  isRealTrading ? "bg-red-950/20 border-red-500/20" : "bg-[#0D0D0E] border-emerald-500/20"
+                )}>
                   <div className="absolute top-0 right-0 p-2">
-                    <div className="w-2 h-2 bg-emerald-500 rounded-full animate-ping" />
+                    <div className={cn("w-2 h-2 rounded-full animate-ping", isRealTrading ? "bg-red-500" : "bg-emerald-500")} />
                   </div>
-                  <h3 className="text-xs font-bold text-white/40 uppercase mb-4">Live Paper Balance</h3>
-                  <div className="text-3xl font-bold text-emerald-400">${livePaperBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
-                  <div className="mt-2 text-[10px] text-white/30">Starting: $10,000.00</div>
+                  <h3 className="text-xs font-bold text-white/40 uppercase mb-4">{isRealTrading ? 'Real Wallet Balance (USDT)' : 'Live Paper Balance'}</h3>
+                  <div className={cn(
+                    "text-3xl font-bold",
+                    isRealTrading ? "text-red-400" : "text-emerald-400"
+                  )}>
+                    ${(isRealTrading ? (realBalance || 0) : livePaperBalance).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </div>
+                  <div className="mt-2 text-[10px] text-white/30">{isRealTrading ? 'Connected to Delta Exchange' : 'Starting: $10,000.00'}</div>
                 </div>
 
                 <div className="bg-[#0D0D0E] border border-white/5 rounded-2xl p-6 shadow-xl">
-                  <h3 className="text-xs font-bold text-white/40 uppercase mb-4">Live Signal</h3>
+                  <h3 className="text-xs font-bold text-white/40 uppercase mb-4">Live Signal & Parameters</h3>
                   <div className="space-y-4">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs text-white/60">Current Price</span>
+                      <span className="text-xs font-mono font-bold text-emerald-400">
+                        ${livePrice ? livePrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '--'}
+                      </span>
+                    </div>
                     <div className="flex items-center justify-between">
                       <span className="text-xs text-white/60">Model Confidence</span>
                       <span className={cn(
@@ -1219,6 +1366,48 @@ export default function App() {
                         )}
                         style={{ width: `${(livePrediction || 0) * 100}%` }}
                       />
+                    </div>
+
+                    {liveParams && (
+                      <div className="grid grid-cols-2 gap-x-4 gap-y-2 pt-4 border-t border-white/5">
+                        <div className="flex justify-between items-center">
+                          <span className="text-[10px] text-white/30 uppercase">RSI</span>
+                          <span className="text-[10px] font-mono text-white/60">{liveParams.rsi.toFixed(1)}</span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-[10px] text-white/30 uppercase">EMA9/20</span>
+                          <span className={cn("text-[10px] font-mono", liveParams.emaCross ? "text-emerald-400" : "text-red-400")}>
+                            {liveParams.emaCross ? 'UP' : 'DOWN'}
+                          </span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-[10px] text-white/30 uppercase">MACD Hist</span>
+                          <span className="text-[10px] font-mono text-white/60">{liveParams.macdHist.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-[10px] text-white/30 uppercase">StochRSI</span>
+                          <span className="text-[10px] font-mono text-white/60">{liveParams.stochRsi.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-[10px] text-white/30 uppercase">ATR</span>
+                          <span className="text-[10px] font-mono text-white/60">{liveParams.atr.toFixed(1)}</span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-[10px] text-white/30 uppercase">4h Pred</span>
+                          <span className="text-[10px] font-mono text-white/60">{(liveParams.secondaryPrediction * 100).toFixed(1)}%</span>
+                        </div>
+                        <div className="col-span-2 flex justify-between items-center pt-2 border-t border-white/5 opacity-40">
+                          <span className="text-[9px] uppercase tracking-tighter">Last Updated</span>
+                          <span className="text-[9px] font-mono">{lastLiveUpdate ? format(lastLiveUpdate, 'HH:mm:ss') : '--:--:--'}</span>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="flex items-center justify-between pt-2 border-t border-white/5">
+                      <span className="text-xs text-white/60">Last Updated</span>
+                      <span className="text-[10px] font-mono text-white/40">
+                        {lastLiveUpdate ? format(lastLiveUpdate, 'HH:mm:ss') : '--'}
+                      </span>
                     </div>
                     <div className="flex items-center justify-between pt-2 border-t border-white/5">
                       <span className="text-xs text-white/60">Status</span>
