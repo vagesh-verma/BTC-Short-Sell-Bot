@@ -8,7 +8,7 @@ export interface Trade {
   exitTime: number;
   profit: number;
   profitPct: number;
-  exitReason: 'TIME' | 'STOP_LOSS' | 'TAKE_PROFIT' | 'TRAILING_STOP' | 'PREDICTION';
+  exitReason: 'TIME' | 'STOP_LOSS' | 'TAKE_PROFIT' | 'TRAILING_STOP' | 'PREDICTION' | 'MANUAL';
 }
 
 export interface BacktestSettings {
@@ -21,6 +21,7 @@ export interface BacktestSettings {
   maxDurationHours: number;
   quantity: number;
   quantityType: 'USD' | 'BTC';
+  onlyHighVolumeSessions?: boolean;
 }
 
 export interface BacktestResult {
@@ -137,12 +138,23 @@ export function runBacktest(
 
     // Check for entry if not in trade
     if (!activeTrade && prediction > settings.threshold) {
-      activeTrade = {
-        entryPrice: candle.close,
-        entryTime: candle.time,
-        highestProfitPct: 0,
-        trailingStopPrice: null,
-      };
+      let canTrade = true;
+      if (settings.onlyHighVolumeSessions) {
+        const hour = new Date(candle.time).getUTCHours();
+        const isAsia = hour >= 0 && hour <= 9;
+        const isLondon = hour >= 8 && hour <= 17;
+        const isNY = hour >= 13 && hour <= 22;
+        canTrade = isAsia || isLondon || isNY;
+      }
+
+      if (canTrade) {
+        activeTrade = {
+          entryPrice: candle.close,
+          entryTime: candle.time,
+          highestProfitPct: 0,
+          trailingStopPrice: null,
+        };
+      }
     }
     
     if (balance > peakBalance) peakBalance = balance;

@@ -133,3 +133,104 @@ export function calculateEMACross(shortEMA: number[], longEMA: number[]) {
 
   return { isBelow, isCross };
 }
+
+export function calculateOBV(prices: number[], volumes: number[]): number[] {
+  if (prices.length === 0) return [];
+  const obv: number[] = [0];
+  for (let i = 1; i < prices.length; i++) {
+    if (prices[i] > prices[i - 1]) {
+      obv.push(obv[i - 1] + volumes[i]);
+    } else if (prices[i] < prices[i - 1]) {
+      obv.push(obv[i - 1] - volumes[i]);
+    } else {
+      obv.push(obv[i - 1]);
+    }
+  }
+  return obv;
+}
+
+export function calculateMFI(highs: number[], lows: number[], closes: number[], volumes: number[], period: number = 14): number[] {
+  const typicalPrices = highs.map((h, i) => (h + lows[i] + closes[i]) / 3);
+  const moneyFlow = typicalPrices.map((tp, i) => tp * volumes[i]);
+  const mfi: number[] = new Array(closes.length).fill(50);
+
+  for (let i = 1; i < closes.length; i++) {
+    if (i < period) continue;
+
+    let posFlow = 0;
+    let negFlow = 0;
+
+    for (let j = i - period + 1; j <= i; j++) {
+      if (typicalPrices[j] > typicalPrices[j - 1]) {
+        posFlow += moneyFlow[j];
+      } else if (typicalPrices[j] < typicalPrices[j - 1]) {
+        negFlow += moneyFlow[j];
+      }
+    }
+
+    const moneyRatio = negFlow === 0 ? 100 : posFlow / negFlow;
+    mfi[i] = 100 - (100 / (1 + moneyRatio));
+  }
+
+  return mfi;
+}
+
+export function calculateVolatility(prices: number[], period: number = 20): number[] {
+  const volatility: number[] = new Array(prices.length).fill(0);
+  for (let i = period; i < prices.length; i++) {
+    const slice = prices.slice(i - period + 1, i + 1);
+    const returns = [];
+    for (let j = 1; j < slice.length; j++) {
+      returns.push(Math.log(slice[j] / slice[j - 1]));
+    }
+    const avg = returns.reduce((a, b) => a + b, 0) / returns.length;
+    const variance = returns.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / returns.length;
+    volatility[i] = Math.sqrt(variance);
+  }
+  return volatility;
+}
+
+export function calculateBearishHarami(opens: number[], prices: number[]): number[] {
+  const result: number[] = new Array(prices.length).fill(0);
+  for (let i = 1; i < prices.length; i++) {
+    const prevBullish = prices[i - 1] > opens[i - 1];
+    const currBearish = prices[i] < opens[i];
+    const isHarami = prevBullish && currBearish && 
+                     opens[i] <= prices[i - 1] && 
+                     prices[i] >= opens[i - 1];
+    result[i] = isHarami ? 1 : 0;
+  }
+  return result;
+}
+
+export function calculateMarubozu(opens: number[], highs: number[], lows: number[], prices: number[]): number[] {
+  const result: number[] = new Array(prices.length).fill(0);
+  for (let i = 0; i < prices.length; i++) {
+    const bodySize = Math.abs(prices[i] - opens[i]);
+    const totalSize = highs[i] - lows[i];
+    if (totalSize > 0 && (bodySize / totalSize) > 0.95) {
+      result[i] = prices[i] > opens[i] ? 1 : -1; // 1 for bullish, -1 for bearish
+    }
+  }
+  return result;
+}
+
+export function calculateEngulfing(opens: number[], prices: number[]): number[] {
+  const result: number[] = new Array(prices.length).fill(0);
+  for (let i = 1; i < prices.length; i++) {
+    const prevBearish = prices[i - 1] < opens[i - 1];
+    const prevBullish = prices[i - 1] > opens[i - 1];
+    const currBearish = prices[i] < opens[i];
+    const currBullish = prices[i] > opens[i];
+
+    // Bullish Engulfing
+    if (prevBearish && currBullish && opens[i] < prices[i - 1] && prices[i] > opens[i - 1]) {
+      result[i] = 1;
+    }
+    // Bearish Engulfing
+    else if (prevBullish && currBearish && opens[i] > prices[i - 1] && prices[i] < opens[i - 1]) {
+      result[i] = -1;
+    }
+  }
+  return result;
+}

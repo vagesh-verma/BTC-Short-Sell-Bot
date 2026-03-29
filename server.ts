@@ -31,10 +31,14 @@ function generateSignature(secret: string, method: string, nonce: string, path: 
 async function deltaRequest(method: string, endpoint: string, data: any = null) {
   const { apiKey, apiSecret } = getCredentials();
 
-  const nonce = Math.floor(Date.now() / 1000).toString();
+  const nonce = Date.now().toString();
   const body = data ? JSON.stringify(data) : "";
-  const signature = generateSignature(apiSecret, method, nonce, endpoint, "", body);
-// ... existing headers logic ...
+  
+  // Split endpoint into path and query for signature
+  const [path, queryStr] = endpoint.split('?');
+  const query = queryStr ? `?${queryStr}` : "";
+  
+  const signature = generateSignature(apiSecret, method, nonce, path, query, body);
 
   const headers = {
     "Content-Type": "application/json",

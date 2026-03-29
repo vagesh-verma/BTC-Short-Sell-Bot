@@ -21,6 +21,7 @@ import {
   ArrowUpRight,
   Wallet,
   History,
+  Settings,
   Settings2,
   ShieldAlert,
   Target,
@@ -33,7 +34,7 @@ import { twMerge } from 'tailwind-merge';
 import { fetchBTCData, Candle } from './services/dataService';
 import { GRUModel, prepareData } from './services/modelService';
 import { runBacktest, BacktestResult, Trade, BacktestSettings } from './services/backtestService';
-import { calculateEMA, calculateRSI, calculateBollingerBands, calculateMACD, calculateStochasticRSI, calculateATR, calculateEMACross } from './services/indicatorService';
+import { calculateEMA, calculateRSI, calculateBollingerBands, calculateMACD, calculateStochasticRSI, calculateATR, calculateEMACross, calculateOBV, calculateMFI, calculateVolatility, calculateBearishHarami, calculateMarubozu, calculateEngulfing } from './services/indicatorService';
 import { DeltaSocketService, TickerUpdate } from './services/deltaSocketService';
 import { getSavedModelPairs, saveModelPair, loadModelPair, deleteModelPair, ModelPair } from './services/storageService';
 
@@ -55,6 +56,8 @@ export default function App() {
   const [epochs, setEpochs] = useState<number>(15);
   const [trainingLogs, setTrainingLogs] = useState<{epoch: number, loss: number, acc: number}[]>([]);
   const [secondaryTrainingLogs, setSecondaryTrainingLogs] = useState<{epoch: number, loss: number, acc: number}[]>([]);
+  const [trainingStats1h, setTrainingStats1h] = useState<{total: number, positive: number, negative: number} | null>(null);
+  const [trainingStats4h, setTrainingStats4h] = useState<{total: number, positive: number, negative: number} | null>(null);
   const [predictions, setPredictions] = useState<number[]>([]);
   const [predictionStats, setPredictionStats] = useState<{total: number, aboveThreshold: number} | null>(null);
   
@@ -70,24 +73,32 @@ export default function App() {
     end: format(new Date(), 'yyyy-MM-dd')
   });
   const [dropThreshold, setDropThreshold] = useState<number>(0.5);
+  const [dropThreshold4h, setDropThreshold4h] = useState<number>(0.5);
+  const [modelHyperparams, setModelHyperparams] = useState({
+    units: 128,
+    dropout: 0.2,
+    learningRate: 0.001
+  });
   const [indicatorPeriods, setIndicatorPeriods] = useState({
     rsi: 14,
     ema: 20,
     ema9: 9,
-    bb: 20
+    bb: 20,
+    mfi: 14,
+    volatility: 20
   });
 
-  // Backtest Settings
+  // Backtest & Live Settings
   const [settings, setSettings] = useState<BacktestSettings>({
-    threshold: 0.15,
-    exitThreshold: 0.05,
-    stopLoss: 0.015, // 1.5%
-    takeProfit: 0.03, // 3%
-    trailingStopActivation: 0.01, // 1%
-    trailingStopOffset: 0.005, // 0.5%
+    threshold: 0.2,
+    exitThreshold: 0,
+    stopLoss: 0.01, // 1%
+    takeProfit: 0.02, // 2%
+    trailingStopActivation: 0.005, // 0.5%
+    trailingStopOffset: 0.003, // 0.3%
     maxDurationHours: 12,
-    quantity: 1000,
-    quantityType: 'USD',
+    quantity: 0.2,
+    quantityType: 'BTC',
   });
 
   const [isLiveMode, setIsLiveMode] = useState(false);
@@ -116,6 +127,14 @@ export default function App() {
     atr: number;
     emaCross: boolean;
     secondaryPrediction: number;
+    obv: number;
+    mfi: number;
+    volatility: number;
+    harami: number;
+    marubozu: number;
+    engulfing: number;
+    session: string;
+    dayOfWeek: number;
   } | null>(null);
 
   const [savedModels, setSavedModels] = useState<ModelPair[]>([]);
@@ -150,7 +169,9 @@ export default function App() {
     if (isLiveMode && model1hRef.current && model4hRef.current) {
       const socket = new DeltaSocketService('BTCUSD', (update: TickerUpdate) => {
         setLivePrice(update.price);
-        processLiveUpdate(update.price);
+        if (processLiveUpdateRef.current) {
+          processLiveUpdateRef.current(update.price);
+        }
       });
       socket.connect();
       return () => socket.disconnect();
@@ -201,64 +222,159 @@ export default function App() {
     }
   };
 
+  // Use a ref to store the latest processLiveUpdate function to avoid stale closures in the socket listener
+  const processLiveUpdateRef = useRef<((price: number) => Promise<void>) | null>(null);
+
   const processLiveUpdate = async (price: number) => {
     if (!model1hRef.current || !model4hRef.current || candles.length < windowSize || candles4h.length < windowSize) return;
 
     // 1. Calculate 4h prediction as a feature
-    const last4h = candles4h.slice(-windowSize);
-    const p4h = last4h.map(c => c.close);
-    const r4h = calculateRSI(p4h, indicatorPeriods.rsi);
-    const e4h = calculateEMA(p4h, indicatorPeriods.ema);
-    const b4h = calculateBollingerBands(p4h, indicatorPeriods.bb);
+    const prices4h = candles4h.map(c => c.close);
+    const highs4h = candles4h.map(c => c.high);
+    const lows4h = candles4h.map(c => c.low);
+    const volumes4h = candles4h.map(c => c.volume);
+    const hours4h = candles4h.map(c => new Date(c.time).getHours());
+    const days4h = candles4h.map(c => new Date(c.time).getDay());
     
+    const rsi4h = calculateRSI(prices4h, indicatorPeriods.rsi);
+    const ema4h = calculateEMA(prices4h, indicatorPeriods.ema);
+    const ema9_4h = calculateEMA(prices4h, indicatorPeriods.ema9);
+    const bb4h = calculateBollingerBands(prices4h, indicatorPeriods.bb);
+    const macd4h = calculateMACD(prices4h);
+    const stochRsi4h = calculateStochasticRSI(rsi4h);
+    const atr4h = calculateATR(highs4h, lows4h, prices4h);
+    const cross4h = calculateEMACross(ema9_4h, ema4h);
+    const obv4h = calculateOBV(prices4h, volumes4h);
+    const mfi4h = calculateMFI(highs4h, lows4h, prices4h, volumes4h, indicatorPeriods.mfi);
+    const vol4h = calculateVolatility(prices4h, indicatorPeriods.volatility);
+    const opens4h = candles4h.map(c => c.open);
+    const harami4h = calculateBearishHarami(opens4h, prices4h);
+    const marubozu4h = calculateMarubozu(opens4h, highs4h, lows4h, prices4h);
+    const engulfing4h = calculateEngulfing(opens4h, prices4h);
+
     const normalize = (arr: number[]) => {
       const min = Math.min(...arr);
       const max = Math.max(...arr);
       return arr.map(v => (max === min ? 0 : (v - min) / (max - min)));
     };
 
-    const np4h = normalize(p4h);
-    const nr4h = r4h.map(v => v / 100);
-    const ne4h = normalize(e4h);
-    const nu4h = normalize(b4h.upper);
-    const nl4h = normalize(b4h.lower);
+    const last4hIdx = prices4h.length - 1;
+    const windowIndices4h = Array.from({ length: windowSize }, (_, k) => last4hIdx - windowSize + 1 + k);
+    
+    const pWindow4h = windowIndices4h.map(idx => prices4h[idx]);
+    const rWindow4h = windowIndices4h.map(idx => rsi4h[idx]);
+    const eWindow4h = windowIndices4h.map(idx => ema4h[idx]);
+    const uWindow4h = windowIndices4h.map(idx => bb4h.upper[idx]);
+    const lWindow4h = windowIndices4h.map(idx => bb4h.lower[idx]);
+    const mWindow4h = windowIndices4h.map(idx => macd4h.histogram[idx]);
+    const sWindow4h = windowIndices4h.map(idx => stochRsi4h[idx]);
+    const aWindow4h = windowIndices4h.map(idx => atr4h[idx]);
+    const e9Window4h = windowIndices4h.map(idx => ema9_4h[idx]);
+    const belowWindow4h = windowIndices4h.map(idx => cross4h.isBelow[idx]);
+    const crossWindow4h = windowIndices4h.map(idx => cross4h.isCross[idx]);
+    const obvWindow4h = windowIndices4h.map(idx => obv4h[idx]);
+    const mfiWindow4h = windowIndices4h.map(idx => mfi4h[idx]);
+    const volWindow4h = windowIndices4h.map(idx => vol4h[idx]);
+    const hourWindow4h = windowIndices4h.map(idx => hours4h[idx]);
+
+    const np4h = normalize(pWindow4h);
+    const nr4h = rWindow4h.map(v => v / 100);
+    const ne4h = normalize(eWindow4h);
+    const nu4h = normalize(uWindow4h);
+    const nl4h = normalize(lWindow4h);
+    const nm4h = normalize(mWindow4h);
+    const na4h = normalize(aWindow4h);
+    const ne9_4h = normalize(e9Window4h);
+    const nobv4h = normalize(obvWindow4h);
+    const nvol4h = normalize(volWindow4h);
+    const nday4h = windowIndices4h.map(idx => days4h[idx]);
+    const nharami4h = windowIndices4h.map(idx => harami4h[idx]);
+    const nmarubozu4h = windowIndices4h.map(idx => marubozu4h[idx]);
+    const nengulfing4h = windowIndices4h.map(idx => engulfing4h[idx]);
 
     const x4h: number[] = [];
     for (let j = 0; j < windowSize; j++) {
-      x4h.push(np4h[j], nr4h[j], ne4h[j], nu4h[j], nl4h[j]);
+      const h = hourWindow4h[j];
+      x4h.push(
+        np4h[j], nr4h[j], ne4h[j], nu4h[j], nl4h[j],
+        nm4h[j], sWindow4h[j], na4h[j], ne9_4h[j],
+        belowWindow4h[j], crossWindow4h[j], nobv4h[j],
+        mfiWindow4h[j] / 100, nvol4h[j],
+        h / 24, h >= 0 && h <= 9 ? 1 : 0, h >= 8 && h <= 17 ? 1 : 0, h >= 13 && h <= 22 ? 1 : 0, nday4h[j] / 7,
+        nharami4h[j], nmarubozu4h[j], nengulfing4h[j]
+      );
     }
     const secondaryPrediction = model4hRef.current.predict(x4h);
 
     // 2. Calculate 1h prediction
-    const last1h = candles.slice(-windowSize + 1);
-    const p1h = [...last1h.map(c => c.close), price];
-    const h1h = [...last1h.map(c => c.high), price];
-    const l1h = [...last1h.map(c => c.low), price];
+    const fullPrices1h = [...candles.map(c => c.close), price];
+    const fullHighs1h = [...candles.map(c => c.high), price];
+    const fullLows1h = [...candles.map(c => c.low), price];
+    const fullVolumes1h = [...candles.map(c => c.volume), 0];
+    const now = new Date();
+    const fullHours1h = [...candles.map(c => new Date(c.time).getHours()), now.getHours()];
+    const fullDays1h = [...candles.map(c => new Date(c.time).getDay()), now.getDay()];
     
-    const r1h = calculateRSI(p1h, indicatorPeriods.rsi);
-    const e1h = calculateEMA(p1h, indicatorPeriods.ema);
-    const e9_1h = calculateEMA(p1h, indicatorPeriods.ema9);
-    const b1h = calculateBollingerBands(p1h, indicatorPeriods.bb);
-    const m1h = calculateMACD(p1h);
-    const s1h = calculateStochasticRSI(r1h);
-    const a1h = calculateATR(h1h, l1h, p1h);
-    const c1h = calculateEMACross(e9_1h, e1h);
+    const rsi1h = calculateRSI(fullPrices1h, indicatorPeriods.rsi);
+    const ema1h = calculateEMA(fullPrices1h, indicatorPeriods.ema);
+    const ema9_1h = calculateEMA(fullPrices1h, indicatorPeriods.ema9);
+    const bb1h = calculateBollingerBands(fullPrices1h, indicatorPeriods.bb);
+    const macd1h = calculateMACD(fullPrices1h);
+    const stochRsi1h = calculateStochasticRSI(rsi1h);
+    const atr1h = calculateATR(fullHighs1h, fullLows1h, fullPrices1h);
+    const cross1h = calculateEMACross(ema9_1h, ema1h);
+    const obv1h = calculateOBV(fullPrices1h, fullVolumes1h);
+    const mfi1h = calculateMFI(fullHighs1h, fullLows1h, fullPrices1h, fullVolumes1h, indicatorPeriods.mfi);
+    const vol1h = calculateVolatility(fullPrices1h, indicatorPeriods.volatility);
+    const opens1h = [...candles.map(c => c.open), price];
+    const harami1h = calculateBearishHarami(opens1h, fullPrices1h);
+    const marubozu1h = calculateMarubozu(opens1h, fullHighs1h, fullLows1h, fullPrices1h);
+    const engulfing1h = calculateEngulfing(opens1h, fullPrices1h);
 
-    const np1h = normalize(p1h);
-    const nr1h = r1h.map(v => v / 100);
-    const ne1h = normalize(e1h);
-    const nu1h = normalize(b1h.upper);
-    const nl1h = normalize(b1h.lower);
-    const nm1h = normalize(m1h.histogram);
-    const na1h = normalize(a1h);
-    const ne9_1h = normalize(e9_1h);
+    const last1hIdx = fullPrices1h.length - 1;
+    const windowIndices1h = Array.from({ length: windowSize }, (_, k) => last1hIdx - windowSize + 1 + k);
+
+    const pWindow1h = windowIndices1h.map(idx => fullPrices1h[idx]);
+    const rWindow1h = windowIndices1h.map(idx => rsi1h[idx]);
+    const eWindow1h = windowIndices1h.map(idx => ema1h[idx]);
+    const uWindow1h = windowIndices1h.map(idx => bb1h.upper[idx]);
+    const lWindow1h = windowIndices1h.map(idx => bb1h.lower[idx]);
+    const mWindow1h = windowIndices1h.map(idx => macd1h.histogram[idx]);
+    const sWindow1h = windowIndices1h.map(idx => stochRsi1h[idx]);
+    const aWindow1h = windowIndices1h.map(idx => atr1h[idx]);
+    const e9Window1h = windowIndices1h.map(idx => ema9_1h[idx]);
+    const belowWindow1h = windowIndices1h.map(idx => cross1h.isBelow[idx]);
+    const crossWindow1h = windowIndices1h.map(idx => cross1h.isCross[idx]);
+    const obvWindow1h = windowIndices1h.map(idx => obv1h[idx]);
+    const mfiWindow1h = windowIndices1h.map(idx => mfi1h[idx]);
+    const volWindow1h = windowIndices1h.map(idx => vol1h[idx]);
+    const hourWindow1h = windowIndices1h.map(idx => fullHours1h[idx]);
+
+    const np1h = normalize(pWindow1h);
+    const nr1h = rWindow1h.map(v => v / 100);
+    const ne1h = normalize(eWindow1h);
+    const nu1h = normalize(uWindow1h);
+    const nl1h = normalize(lWindow1h);
+    const nm1h = normalize(mWindow1h);
+    const na1h = normalize(aWindow1h);
+    const ne9_1h = normalize(e9Window1h);
+    const nobv1h = normalize(obvWindow1h);
+    const nvol1h = normalize(volWindow1h);
+    const nday1h = windowIndices1h.map(idx => fullDays1h[idx]);
+    const nharami1h = windowIndices1h.map(idx => harami1h[idx]);
+    const nmarubozu1h = windowIndices1h.map(idx => marubozu1h[idx]);
+    const nengulfing1h = windowIndices1h.map(idx => engulfing1h[idx]);
 
     const x1h: number[] = [];
     for (let j = 0; j < windowSize; j++) {
+      const h = hourWindow1h[j];
       x1h.push(
         np1h[j], nr1h[j], ne1h[j], nu1h[j], nl1h[j],
-        nm1h[j], s1h[j], na1h[j], secondaryPrediction,
-        ne9_1h[j], c1h.isBelow[j], c1h.isCross[j]
+        nm1h[j], sWindow1h[j], na1h[j], secondaryPrediction,
+        ne9_1h[j], belowWindow1h[j], crossWindow1h[j],
+        nobv1h[j], mfiWindow1h[j] / 100, nvol1h[j],
+        h / 24, h >= 0 && h <= 9 ? 1 : 0, h >= 8 && h <= 17 ? 1 : 0, h >= 13 && h <= 22 ? 1 : 0, nday1h[j] / 7,
+        nharami1h[j], nmarubozu1h[j], nengulfing1h[j]
       );
     }
 
@@ -268,16 +384,26 @@ export default function App() {
     setLastLiveUpdate(new Date());
 
     setLiveParams({
-      rsi: r1h[r1h.length - 1],
-      ema: e1h[e1h.length - 1],
-      ema9: e9_1h[e9_1h.length - 1],
-      bbUpper: b1h.upper[b1h.upper.length - 1],
-      bbLower: b1h.lower[b1h.lower.length - 1],
-      macdHist: m1h.histogram[m1h.histogram.length - 1],
-      stochRsi: s1h[s1h.length - 1],
-      atr: a1h[a1h.length - 1],
-      emaCross: c1h.isBelow[c1h.isBelow.length - 1] === 1,
-      secondaryPrediction: secondaryPrediction
+      rsi: rsi1h[rsi1h.length - 1],
+      ema: ema1h[ema1h.length - 1],
+      ema9: ema9_1h[ema9_1h.length - 1],
+      bbUpper: bb1h.upper[bb1h.upper.length - 1],
+      bbLower: bb1h.lower[bb1h.lower.length - 1],
+      macdHist: macd1h.histogram[macd1h.histogram.length - 1],
+      stochRsi: stochRsi1h[stochRsi1h.length - 1],
+      atr: atr1h[atr1h.length - 1],
+      emaCross: cross1h.isBelow[cross1h.isBelow.length - 1] === 1,
+      secondaryPrediction: secondaryPrediction,
+      obv: obv1h[obv1h.length - 1],
+      mfi: mfi1h[mfi1h.length - 1],
+      volatility: vol1h[vol1h.length - 1],
+      harami: harami1h[harami1h.length - 1],
+      marubozu: marubozu1h[marubozu1h.length - 1],
+      engulfing: engulfing1h[engulfing1h.length - 1],
+      session: now.getHours() >= 0 && now.getHours() <= 9 ? 'Asia' : 
+               now.getHours() >= 8 && now.getHours() <= 17 ? 'London' : 
+               now.getHours() >= 13 && now.getHours() <= 22 ? 'New York' : 'Off-Session',
+      dayOfWeek: now.getDay()
     });
 
     // 3. Live Paper Trading Logic
@@ -285,6 +411,17 @@ export default function App() {
       const profitPct = (activeLiveTrade.entryPrice - price) / activeLiveTrade.entryPrice;
       const stopLossPrice = activeLiveTrade.entryPrice * (1 + settings.stopLoss);
       const takeProfitPrice = activeLiveTrade.entryPrice * (1 - settings.takeProfit);
+
+      let currentTrailingStop = activeLiveTrade.trailingStopPrice;
+      let highestProfit = activeLiveTrade.highestProfitPct;
+
+      // Update trailing stop
+      if (profitPct > highestProfit) {
+        highestProfit = profitPct;
+        if (profitPct >= settings.trailingStopActivation) {
+          currentTrailingStop = price * (1 + settings.trailingStopOffset);
+        }
+      }
 
       let shouldExit = false;
       let reason: Trade['exitReason'] = 'TIME';
@@ -295,13 +432,19 @@ export default function App() {
       } else if (price <= takeProfitPrice) {
         shouldExit = true;
         reason = 'TAKE_PROFIT';
+      } else if (currentTrailingStop && price >= currentTrailingStop) {
+        shouldExit = true;
+        reason = 'TRAILING_STOP';
       } else if (prediction < settings.exitThreshold) {
         shouldExit = true;
         reason = 'PREDICTION';
       }
 
       if (shouldExit) {
-        const profit = settings.quantity * profitPct;
+        const profit = settings.quantityType === 'USD' 
+          ? settings.quantity * profitPct 
+          : settings.quantity * (activeLiveTrade.entryPrice - price);
+          
         const newTrade: Trade = {
           type: 'SHORT',
           entryPrice: activeLiveTrade.entryPrice,
@@ -320,8 +463,26 @@ export default function App() {
         if (isRealTrading) {
           placeRealOrder('buy', settings.quantity); // Close SHORT with BUY
         }
+      } else {
+        // Update active trade state
+        setActiveLiveTrade({
+          ...activeLiveTrade,
+          highestProfitPct: highestProfit,
+          trailingStopPrice: currentTrailingStop
+        });
       }
     } else if (prediction > settings.threshold) {
+      // Check for session-based trading
+      if (settings.onlyHighVolumeSessions) {
+        const hour = now.getHours();
+        const isAsia = hour >= 0 && hour <= 9;
+        const isLondon = hour >= 8 && hour <= 17;
+        const isNY = hour >= 13 && hour <= 22;
+        if (!isAsia && !isLondon && !isNY) {
+          return;
+        }
+      }
+
       setActiveLiveTrade({
         entryPrice: price,
         entryTime: Date.now(),
@@ -335,6 +496,10 @@ export default function App() {
       }
     }
   };
+
+  useEffect(() => {
+    processLiveUpdateRef.current = processLiveUpdate;
+  }, [processLiveUpdate]);
 
   const handleSaveModel = async () => {
     if (!newModelName.trim()) {
@@ -411,6 +576,10 @@ export default function App() {
     const prices4h = candles4h.map(c => c.close);
     const highs4h = candles4h.map(c => c.high);
     const lows4h = candles4h.map(c => c.low);
+    const volumes4h = candles4h.map(c => c.volume);
+    const hours4h = candles4h.map(c => new Date(c.time).getHours());
+    const days4h = candles4h.map(c => new Date(c.time).getDay());
+
     const rsi4h = calculateRSI(prices4h, indicatorPeriods.rsi);
     const ema4h = calculateEMA(prices4h, indicatorPeriods.ema);
     const ema9_4h = calculateEMA(prices4h, indicatorPeriods.ema9);
@@ -419,6 +588,13 @@ export default function App() {
     const macd4h = calculateMACD(prices4h);
     const stochRsi4h = calculateStochasticRSI(rsi4h);
     const atr4h = calculateATR(highs4h, lows4h, prices4h);
+    const obv4h = calculateOBV(prices4h, volumes4h);
+    const mfi4h = calculateMFI(highs4h, lows4h, prices4h, volumes4h, indicatorPeriods.mfi);
+    const vol4h = calculateVolatility(prices4h, indicatorPeriods.volatility);
+    const opens4h = candles4h.map(c => c.open);
+    const harami4h = calculateBearishHarami(opens4h, prices4h);
+    const marubozu4h = calculateMarubozu(opens4h, highs4h, lows4h, prices4h);
+    const engulfing4h = calculateEngulfing(opens4h, prices4h);
 
     const secondaryPredictionsFor1h: number[] = [];
     const prices1h = candles1h.map(c => c.close);
@@ -461,8 +637,22 @@ export default function App() {
         const nBelow = windowIndices.map(idx => cross4h.isBelow[idx]);
         const nCross = windowIndices.map(idx => cross4h.isCross[idx]);
 
+        const nObv = normalize(windowIndices.map(idx => obv4h[idx]));
+        const nMfi = windowIndices.map(idx => mfi4h[idx]).map(v => v / 100);
+        const nVol = normalize(windowIndices.map(idx => vol4h[idx]));
+        const nHour = windowIndices.map(idx => hours4h[idx]);
+        const nDay = windowIndices.map(idx => days4h[idx]);
+        const nHarami = windowIndices.map(idx => harami4h[idx]);
+        const nMarubozu = windowIndices.map(idx => marubozu4h[idx]);
+        const nEngulfing = windowIndices.map(idx => engulfing4h[idx]);
+
         for (let j = 0; j < windowSize; j++) {
-          input.push(nP[j], nR[j], nE[j], nU[j], nL[j], nH[j], nS[j], nA[j], nE9[j], nBelow[j], nCross[j]);
+          const h = nHour[j];
+          input.push(
+            nP[j], nR[j], nE[j], nU[j], nL[j], nH[j], nS[j], nA[j], nE9[j], nBelow[j], nCross[j], nObv[j], nMfi[j], nVol[j],
+            h / 24, h >= 0 && h <= 9 ? 1 : 0, h >= 8 && h <= 17 ? 1 : 0, h >= 13 && h <= 22 ? 1 : 0, nDay[j] / 7,
+            nHarami[j], nMarubozu[j], nEngulfing[j]
+          );
         }
         secondaryPredictionsFor1h.push(m4h.predict(input));
       } else {
@@ -472,6 +662,10 @@ export default function App() {
 
     const highs1h = candles1h.map(c => c.high);
     const lows1h = candles1h.map(c => c.low);
+    const volumes1h = candles1h.map(c => c.volume);
+    const hours1h = candles1h.map(c => new Date(c.time).getHours());
+    const days1h = candles1h.map(c => new Date(c.time).getDay());
+
     const rsi1h = calculateRSI(prices1h, indicatorPeriods.rsi);
     const ema1h = calculateEMA(prices1h, indicatorPeriods.ema);
     const ema9_1h = calculateEMA(prices1h, indicatorPeriods.ema9);
@@ -480,6 +674,13 @@ export default function App() {
     const macd1h = calculateMACD(prices1h);
     const stochRsi1h = calculateStochasticRSI(rsi1h);
     const atr1h = calculateATR(highs1h, lows1h, prices1h);
+    const obv1h = calculateOBV(prices1h, volumes1h);
+    const mfi1h = calculateMFI(highs1h, lows1h, prices1h, volumes1h, indicatorPeriods.mfi);
+    const vol1h = calculateVolatility(prices1h, indicatorPeriods.volatility);
+    const opens1h = candles1h.map(c => c.open);
+    const harami1h = calculateBearishHarami(opens1h, prices1h);
+    const marubozu1h = calculateMarubozu(opens1h, highs1h, lows1h, prices1h);
+    const engulfing1h = calculateEngulfing(opens1h, prices1h);
 
     const generatedPredictions: number[] = [];
     for (let i = windowSize; i < prices1h.length; i++) {
@@ -510,13 +711,24 @@ export default function App() {
       const normAtr = normalize(windowIndices.map(idx => atr1h[idx]));
       const normBelow = windowIndices.map(idx => cross1h.isBelow[idx]);
       const normCross = windowIndices.map(idx => cross1h.isCross[idx]);
+      const normObv = normalize(windowIndices.map(idx => obv1h[idx]));
+      const normMfi = windowIndices.map(idx => mfi1h[idx]).map(v => v / 100);
+      const normVol = normalize(windowIndices.map(idx => vol1h[idx]));
+      const normHour = windowIndices.map(idx => hours1h[idx]);
+      const normDay = windowIndices.map(idx => days1h[idx]);
+      const normHarami = windowIndices.map(idx => harami1h[idx]);
+      const normMarubozu = windowIndices.map(idx => marubozu1h[idx]);
+      const normEngulfing = windowIndices.map(idx => engulfing1h[idx]);
 
       const input: number[] = [];
       for (let j = 0; j < windowSize; j++) {
+        const h = normHour[j];
         input.push(
           normPrice[j], normRsi[j], normEma[j], normBbUpper[j], normBbLower[j],
           normMacd[j], normStochRsi[j], normAtr[j], secWindow[j],
-          normEma9[j], normBelow[j], normCross[j]
+          normEma9[j], normBelow[j], normCross[j], normObv[j], normMfi[j], normVol[j],
+          h / 24, h >= 0 && h <= 9 ? 1 : 0, h >= 8 && h <= 17 ? 1 : 0, h >= 13 && h <= 22 ? 1 : 0, normDay[j] / 7,
+          normHarami[j], normMarubozu[j], normEngulfing[j]
         );
       }
       generatedPredictions.push(m1h.predict(input));
@@ -533,6 +745,8 @@ export default function App() {
     setBacktestResult(null);
     setTrainingLogs([]);
     setSecondaryTrainingLogs([]);
+    setTrainingStats1h(null);
+    setTrainingStats4h(null);
     
     try {
       // 1. Fetch 4h data for secondary model
@@ -553,6 +767,10 @@ export default function App() {
       const prices4h = candles4h.map(c => c.close);
       const highs4h = candles4h.map(c => c.high);
       const lows4h = candles4h.map(c => c.low);
+      const volumes4h = candles4h.map(c => c.volume);
+      const hours4h = candles4h.map(c => new Date(c.time).getHours());
+      const days4h = candles4h.map(c => new Date(c.time).getDay());
+
       const rsi4h = calculateRSI(prices4h, indicatorPeriods.rsi);
       const ema4h = calculateEMA(prices4h, indicatorPeriods.ema);
       const ema9_4h = calculateEMA(prices4h, indicatorPeriods.ema9);
@@ -561,16 +779,26 @@ export default function App() {
       const macd4h = calculateMACD(prices4h);
       const stochRsi4h = calculateStochasticRSI(rsi4h);
       const atr4h = calculateATR(highs4h, lows4h, prices4h);
+      const obv4h = calculateOBV(prices4h, volumes4h);
+      const mfi4h = calculateMFI(highs4h, lows4h, prices4h, volumes4h, indicatorPeriods.mfi);
+      const vol4h = calculateVolatility(prices4h, indicatorPeriods.volatility);
+      const opens4h = candles4h.map(c => c.open);
+      const harami4h = calculateBearishHarami(opens4h, prices4h);
+      const marubozu4h = calculateMarubozu(opens4h, highs4h, lows4h, prices4h);
+      const engulfing4h = calculateEngulfing(opens4h, prices4h);
       
       const data4h = prepareData(
         prices4h, rsi4h, ema4h, bb4h.upper, bb4h.lower, windowSize, 
-        undefined, macd4h.histogram, stochRsi4h, atr4h, dropThreshold,
-        ema9_4h, cross4h.isBelow, cross4h.isCross
+        undefined, macd4h.histogram, stochRsi4h, atr4h, dropThreshold4h,
+        ema9_4h, cross4h.isBelow, cross4h.isCross,
+        obv4h, mfi4h, vol4h, hours4h, days4h,
+        harami4h, marubozu4h, engulfing4h
       );
-      const model4h = new GRUModel(windowSize, 11);
-      await model4h.buildModel();
+      setTrainingStats4h(data4h.stats);
+      const model4h = new GRUModel(windowSize, 22); // Updated feature count (19 + 3)
+      await model4h.buildModel(modelHyperparams.units, modelHyperparams.dropout, modelHyperparams.learningRate);
       
-      await model4h.train(data4h.xs, data4h.ys, 10, (epoch, logs) => {
+      await model4h.train(data4h.xs, data4h.ys, epochs, modelHyperparams.units, modelHyperparams.dropout, modelHyperparams.learningRate, (epoch, logs) => {
         if (logs) {
           setSecondaryTrainingLogs(prev => [...prev, { epoch: epoch + 1, loss: logs.loss, acc: logs.acc }]);
         }
@@ -622,9 +850,22 @@ export default function App() {
           const nA = normalize(windowIndices.map(idx => atr4h[idx]));
           const nBelow = windowIndices.map(idx => cross4h.isBelow[idx]);
           const nCross = windowIndices.map(idx => cross4h.isCross[idx]);
+          const nObv = normalize(windowIndices.map(idx => obv4h[idx]));
+          const nMfi = windowIndices.map(idx => mfi4h[idx]).map(v => v / 100);
+          const nVol = normalize(windowIndices.map(idx => vol4h[idx]));
+          const nHour = windowIndices.map(idx => hours4h[idx]);
+          const nDay = windowIndices.map(idx => days4h[idx]);
+          const nHarami = windowIndices.map(idx => harami4h[idx]);
+          const nMarubozu = windowIndices.map(idx => marubozu4h[idx]);
+          const nEngulfing = windowIndices.map(idx => engulfing4h[idx]);
 
           for (let j = 0; j < windowSize; j++) {
-            input.push(nP[j], nR[j], nE[j], nU[j], nL[j], nH[j], nS[j], nA[j], nE9[j], nBelow[j], nCross[j]);
+            const h = nHour[j];
+            input.push(
+              nP[j], nR[j], nE[j], nU[j], nL[j], nH[j], nS[j], nA[j], nE9[j], nBelow[j], nCross[j], nObv[j], nMfi[j], nVol[j],
+              h / 24, h >= 0 && h <= 9 ? 1 : 0, h >= 8 && h <= 17 ? 1 : 0, h >= 13 && h <= 22 ? 1 : 0, nDay[j] / 7,
+              nHarami[j], nMarubozu[j], nEngulfing[j]
+            );
           }
           secondaryPredictionsFor1h.push(model4h.predict(input));
         } else {
@@ -637,6 +878,10 @@ export default function App() {
       logger.info('Calculating 1h technical indicators...');
       const highs1h = candles.map(c => c.high);
       const lows1h = candles.map(c => c.low);
+      const volumes1h = candles.map(c => c.volume);
+      const hours1h = candles.map(c => new Date(c.time).getHours());
+      const days1h = candles.map(c => new Date(c.time).getDay());
+
       const rsi1h = calculateRSI(prices1h, indicatorPeriods.rsi);
       const ema1h = calculateEMA(prices1h, indicatorPeriods.ema);
       const ema9_1h = calculateEMA(prices1h, indicatorPeriods.ema9);
@@ -645,6 +890,13 @@ export default function App() {
       const macd1h = calculateMACD(prices1h);
       const stochRsi1h = calculateStochasticRSI(rsi1h);
       const atr1h = calculateATR(highs1h, lows1h, prices1h);
+      const obv1h = calculateOBV(prices1h, volumes1h);
+      const mfi1h = calculateMFI(highs1h, lows1h, prices1h, volumes1h, indicatorPeriods.mfi);
+      const vol1h = calculateVolatility(prices1h, indicatorPeriods.volatility);
+      const opens1h = candles.map(c => c.open);
+      const harami1h = calculateBearishHarami(opens1h, prices1h);
+      const marubozu1h = calculateMarubozu(opens1h, highs1h, lows1h, prices1h);
+      const engulfing1h = calculateEngulfing(opens1h, prices1h);
 
       setStatus('Preparing 1h Data with Secondary Feature...');
       logger.info('Preparing 1h training data...');
@@ -662,16 +914,26 @@ export default function App() {
         dropThreshold,
         ema9_1h,
         cross1h.isBelow,
-        cross1h.isCross
+        cross1h.isCross,
+        obv1h,
+        mfi1h,
+        vol1h,
+        hours1h,
+        days1h,
+        harami1h,
+        marubozu1h,
+        engulfing1h
       );
+      setTrainingStats1h(data1h.stats);
       
-      const model1h = new GRUModel(windowSize, 12);
-      setStatus('Building Deep GRU Architecture (12 Features)...');
-      await model1h.buildModel();
+      const featureCount1h = 23; // Updated feature count (20 + 3)
+      const model1h = new GRUModel(windowSize, featureCount1h);
+      setStatus(`Building Deep GRU Architecture (${featureCount1h} Features)...`);
+      await model1h.buildModel(modelHyperparams.units, modelHyperparams.dropout, modelHyperparams.learningRate);
       
       setStatus(`Training Primary Model (${epochs} Epochs)...`);
       logger.info(`Training primary model for ${epochs} epochs...`);
-      await model1h.train(data1h.xs, data1h.ys, epochs, (epoch, logs) => {
+      await model1h.train(data1h.xs, data1h.ys, epochs, modelHyperparams.units, modelHyperparams.dropout, modelHyperparams.learningRate, (epoch, logs) => {
         if (logs) {
           setTrainingLogs(prev => [...prev, { 
             epoch: epoch + 1, 
@@ -821,7 +1083,7 @@ export default function App() {
   }, [backtestResult]);
 
   return (
-    <div className="min-h-screen bg-[#0A0A0B] text-white font-sans selection:bg-emerald-500/30">
+    <div className="min-h-screen bg-black text-white font-sans selection:bg-emerald-500/30">
       {/* Server Status Bar */}
       {serverStatus && (
         <div className="bg-white/5 border-b border-white/5 px-6 py-2 flex flex-wrap items-center gap-6 text-[10px] uppercase tracking-widest font-bold text-white/40">
@@ -986,12 +1248,32 @@ export default function App() {
                   </div>
                   <div className="grid grid-cols-2 gap-4">
                     <div className="space-y-1.5">
-                      <label className="text-[10px] text-white/40 uppercase font-bold">Drop Target (%)</label>
+                      <label className="text-[10px] text-white/40 uppercase font-bold">Drop Target (1H) %</label>
                       <input type="number" step="0.1" min="0.1" max="5" value={dropThreshold} onChange={(e) => setDropThreshold(parseFloat(e.target.value) || 0.5)} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs focus:border-purple-500/50 outline-none" />
                     </div>
                     <div className="space-y-1.5">
+                      <label className="text-[10px] text-white/40 uppercase font-bold">Drop Target (4H) %</label>
+                      <input type="number" step="0.1" min="0.1" max="5" value={dropThreshold4h} onChange={(e) => setDropThreshold4h(parseFloat(e.target.value) || 0.5)} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs focus:border-purple-500/50 outline-none" />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="space-y-1.5">
                       <label className="text-[10px] text-white/40 uppercase font-bold">Epochs</label>
                       <input type="number" min="5" max="100" value={epochs} onChange={(e) => setEpochs(parseInt(e.target.value) || 15)} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs focus:border-purple-500/50 outline-none" />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-white/40 uppercase font-bold">GRU Units</label>
+                      <input type="number" step="8" min="8" max="256" value={modelHyperparams.units} onChange={(e) => setModelHyperparams({...modelHyperparams, units: parseInt(e.target.value) || 64})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs focus:border-purple-500/50 outline-none" />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-white/40 uppercase font-bold">Dropout</label>
+                      <input type="number" step="0.05" min="0" max="0.5" value={modelHyperparams.dropout} onChange={(e) => setModelHyperparams({...modelHyperparams, dropout: parseFloat(e.target.value) || 0.2})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs focus:border-purple-500/50 outline-none" />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 gap-3">
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-white/40 uppercase font-bold">Learning Rate</label>
+                      <input type="number" step="0.0001" min="0.0001" max="0.01" value={modelHyperparams.learningRate} onChange={(e) => setModelHyperparams({...modelHyperparams, learningRate: parseFloat(e.target.value) || 0.001})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs focus:border-purple-500/50 outline-none" />
                     </div>
                   </div>
                   <div className="grid grid-cols-3 gap-3">
@@ -1008,10 +1290,18 @@ export default function App() {
                       <input type="number" value={indicatorPeriods.ema} onChange={(e) => setIndicatorPeriods({...indicatorPeriods, ema: parseInt(e.target.value) || 20})} className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-2 text-xs focus:border-purple-500/50 outline-none" />
                     </div>
                   </div>
-                  <div className="grid grid-cols-2 gap-4">
+                  <div className="grid grid-cols-3 gap-3">
                     <div className="space-y-1.5">
                       <label className="text-[10px] text-white/40 uppercase font-bold">BB</label>
                       <input type="number" value={indicatorPeriods.bb} onChange={(e) => setIndicatorPeriods({...indicatorPeriods, bb: parseInt(e.target.value) || 20})} className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-2 text-xs focus:border-purple-500/50 outline-none" />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-white/40 uppercase font-bold">MFI</label>
+                      <input type="number" value={indicatorPeriods.mfi} onChange={(e) => setIndicatorPeriods({...indicatorPeriods, mfi: parseInt(e.target.value) || 14})} className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-2 text-xs focus:border-purple-500/50 outline-none" />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-white/40 uppercase font-bold">Volatility</label>
+                      <input type="number" value={indicatorPeriods.volatility} onChange={(e) => setIndicatorPeriods({...indicatorPeriods, volatility: parseInt(e.target.value) || 20})} className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-2 text-xs focus:border-purple-500/50 outline-none" />
                     </div>
                   </div>
                   <button onClick={startTraining} disabled={loading || training || candles.length === 0} className={cn("w-full py-3 rounded-xl font-semibold flex items-center justify-center gap-2 transition-all active:scale-95", training ? "bg-white/5 text-white/50 cursor-not-allowed" : "bg-purple-600 hover:bg-purple-500 text-white shadow-[0_0_20px_rgba(147,51,234,0.2)]")}>
@@ -1050,7 +1340,14 @@ export default function App() {
                 <div className="space-y-4">
                   <div className="grid grid-cols-2 gap-4">
                     <div className="space-y-2">
-                      <h4 className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Primary Logs (1h)</h4>
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Primary Logs (1h)</h4>
+                        {trainingStats1h && (
+                          <span className="text-[9px] text-purple-400 font-mono">
+                            Drops: {trainingStats1h.positive} / {trainingStats1h.total} ({(trainingStats1h.positive / trainingStats1h.total * 100).toFixed(1)}%)
+                          </span>
+                        )}
+                      </div>
                       <div className="bg-black/40 rounded-xl border border-white/5 p-4 h-[200px] overflow-y-auto font-mono text-[10px] space-y-1 custom-scrollbar">
                         {trainingLogs.length === 0 ? (
                           <div className="h-full flex items-center justify-center text-white/20 italic">Waiting for training...</div>
@@ -1066,7 +1363,14 @@ export default function App() {
                       </div>
                     </div>
                     <div className="space-y-2">
-                      <h4 className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Secondary Logs (4h)</h4>
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Secondary Logs (4h)</h4>
+                        {trainingStats4h && (
+                          <span className="text-[9px] text-purple-400 font-mono">
+                            Drops: {trainingStats4h.positive} / {trainingStats4h.total} ({(trainingStats4h.positive / trainingStats4h.total * 100).toFixed(1)}%)
+                          </span>
+                        )}
+                      </div>
                       <div className="bg-black/40 rounded-xl border border-white/5 p-4 h-[200px] overflow-y-auto font-mono text-[10px] space-y-1 custom-scrollbar">
                         {secondaryTrainingLogs.length === 0 ? (
                           <div className="h-full flex items-center justify-center text-white/20 italic">Waiting for training...</div>
@@ -1161,6 +1465,16 @@ export default function App() {
                     <div className="space-y-1.5">
                       <label className="text-[10px] text-white/40 uppercase font-bold">Trail Offset %</label>
                       <input type="number" step="0.1" value={settings.trailingStopOffset * 100} onChange={(e) => setSettings({...settings, trailingStopOffset: parseFloat(e.target.value) / 100})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
+                    </div>
+                    <div className="flex items-center gap-2 pt-4">
+                      <input 
+                        type="checkbox" 
+                        id="onlyHighVolumeSessionsLive"
+                        checked={settings.onlyHighVolumeSessions} 
+                        onChange={(e) => setSettings({...settings, onlyHighVolumeSessions: e.target.checked})}
+                        className="w-4 h-4 rounded border-white/10 bg-white/5 text-amber-500 focus:ring-amber-500/50"
+                      />
+                      <label htmlFor="onlyHighVolumeSessionsLive" className="text-[10px] text-white/60 uppercase font-bold cursor-pointer">Only High Volume Sessions</label>
                     </div>
                   </div>
                   <button onClick={startBacktest} disabled={loading || training || !model1hRef.current} className={cn("w-full py-3 rounded-xl font-semibold flex items-center justify-center gap-2 transition-all active:scale-95", !model1hRef.current ? "bg-white/5 text-white/50 cursor-not-allowed" : "bg-amber-500 hover:bg-amber-400 text-black shadow-[0_0_20px_rgba(245,158,11,0.2)]")}>
@@ -1313,12 +1627,137 @@ export default function App() {
           </div>
         </section>
 
-        {/* Section 5: Live Paper Trading Monitor */}
+        {/* Section 5: Live Trading Configuration */}
+        <section className="space-y-6">
+          <div className="flex items-center gap-2 border-b border-white/5 pb-2">
+            <Settings className="w-5 h-5 text-purple-500" />
+            <h2 className="text-xl font-bold tracking-tight">5. Live Trading Configuration</h2>
+          </div>
+
+          <div className="bg-[#0D0D0E] border border-white/5 rounded-2xl p-6 shadow-xl">
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
+              <div className="space-y-4">
+                <h3 className="text-xs font-bold text-white/40 uppercase tracking-wider">Thresholds</h3>
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                    <div className="flex justify-between text-xs">
+                      <span className="text-white/60">Entry Threshold</span>
+                      <span className="text-blue-400 font-mono">{(settings.threshold * 100).toFixed(1)}%</span>
+                    </div>
+                    <input 
+                      type="range" min="0" max="1" step="0.01" 
+                      value={settings.threshold} 
+                      onChange={(e) => setSettings({...settings, threshold: parseFloat(e.target.value)})}
+                      className="w-full h-1.5 bg-white/5 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <div className="flex justify-between text-xs">
+                      <span className="text-white/60">Exit Threshold</span>
+                      <span className="text-purple-400 font-mono">{(settings.exitThreshold * 100).toFixed(1)}%</span>
+                    </div>
+                    <input 
+                      type="range" min="0" max="0.5" step="0.01" 
+                      value={settings.exitThreshold} 
+                      onChange={(e) => setSettings({...settings, exitThreshold: parseFloat(e.target.value)})}
+                      className="w-full h-1.5 bg-white/5 rounded-lg appearance-none cursor-pointer accent-purple-500"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <h3 className="text-xs font-bold text-white/40 uppercase tracking-wider">Risk Management</h3>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-white/30 uppercase">Stop Loss (%)</label>
+                    <input 
+                      type="number" step="0.1"
+                      value={settings.stopLoss * 100}
+                      onChange={(e) => setSettings({...settings, stopLoss: parseFloat(e.target.value) / 100})}
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-white/30 uppercase">Take Profit (%)</label>
+                    <input 
+                      type="number" step="0.1"
+                      value={settings.takeProfit * 100}
+                      onChange={(e) => setSettings({...settings, takeProfit: parseFloat(e.target.value) / 100})}
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
+                    />
+                  </div>
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[10px] text-white/30 uppercase">Max Duration (Hours)</label>
+                  <input 
+                    type="number"
+                    value={settings.maxDurationHours}
+                    onChange={(e) => setSettings({...settings, maxDurationHours: parseInt(e.target.value)})}
+                    className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <h3 className="text-xs font-bold text-white/40 uppercase tracking-wider">Trailing Stop</h3>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-white/30 uppercase">Activation (%)</label>
+                    <input 
+                      type="number" step="0.1"
+                      value={settings.trailingStopActivation * 100}
+                      onChange={(e) => setSettings({...settings, trailingStopActivation: parseFloat(e.target.value) / 100})}
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-white/30 uppercase">Offset (%)</label>
+                    <input 
+                      type="number" step="0.1"
+                      value={settings.trailingStopOffset * 100}
+                      onChange={(e) => setSettings({...settings, trailingStopOffset: parseFloat(e.target.value) / 100})}
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <h3 className="text-xs font-bold text-white/40 uppercase tracking-wider">Position Size</h3>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-white/30 uppercase">Unit</label>
+                    <select 
+                      value={settings.quantityType}
+                      onChange={(e) => setSettings({...settings, quantityType: e.target.value as 'USD' | 'BTC'})}
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
+                    >
+                      <option value="USD">USD</option>
+                      <option value="BTC">BTC Lots</option>
+                    </select>
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-white/30 uppercase">Quantity</label>
+                    <input 
+                      type="number" step="0.01"
+                      value={settings.quantity}
+                      onChange={(e) => setSettings({...settings, quantity: parseFloat(e.target.value)})}
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Section 6: Live Paper Trading Monitor */}
         {isLiveMode && (
           <section className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-700">
             <div className="flex items-center gap-2 border-b border-emerald-500/20 pb-2">
               <Activity className="w-5 h-5 text-emerald-500" />
-              <h2 className="text-xl font-bold tracking-tight">5. Live {isRealTrading ? 'Real' : 'Paper'} Trading Monitor</h2>
+              <h2 className="text-xl font-bold tracking-tight">6. Live {isRealTrading ? 'Real' : 'Paper'} Trading Monitor</h2>
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
@@ -1396,6 +1835,40 @@ export default function App() {
                           <span className="text-[10px] text-white/30 uppercase">4h Pred</span>
                           <span className="text-[10px] font-mono text-white/60">{(liveParams.secondaryPrediction * 100).toFixed(1)}%</span>
                         </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-[10px] text-white/30 uppercase">OBV</span>
+                          <span className="text-[10px] font-mono text-white/60">{liveParams.obv.toLocaleString()}</span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-[10px] text-white/30 uppercase">MFI</span>
+                          <span className="text-[10px] font-mono text-white/60">{liveParams.mfi.toFixed(1)}</span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-[10px] text-white/30 uppercase">Volat.</span>
+                          <span className="text-[10px] font-mono text-white/60">{liveParams.volatility.toFixed(1)}%</span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-[10px] text-white/30 uppercase">Harami</span>
+                          <span className={cn("text-[10px] font-mono", liveParams.harami === 1 ? "text-red-400" : "text-white/40")}>
+                            {liveParams.harami === 1 ? 'YES' : 'NO'}
+                          </span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-[10px] text-white/30 uppercase">Marubozu</span>
+                          <span className={cn("text-[10px] font-mono", liveParams.marubozu === 1 ? "text-red-400" : "text-white/40")}>
+                            {liveParams.marubozu === 1 ? 'YES' : 'NO'}
+                          </span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-[10px] text-white/30 uppercase">Engulfing</span>
+                          <span className={cn("text-[10px] font-mono", liveParams.engulfing === 1 ? "text-red-400" : "text-white/40")}>
+                            {liveParams.engulfing === 1 ? 'YES' : 'NO'}
+                          </span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span className="text-[10px] text-white/30 uppercase">Session</span>
+                          <span className="text-[10px] font-mono text-amber-400">{liveParams.session}</span>
+                        </div>
                         <div className="col-span-2 flex justify-between items-center pt-2 border-t border-white/5 opacity-40">
                           <span className="text-[9px] uppercase tracking-tighter">Last Updated</span>
                           <span className="text-[9px] font-mono">{lastLiveUpdate ? format(lastLiveUpdate, 'HH:mm:ss') : '--:--:--'}</span>
@@ -1403,12 +1876,6 @@ export default function App() {
                       </div>
                     )}
 
-                    <div className="flex items-center justify-between pt-2 border-t border-white/5">
-                      <span className="text-xs text-white/60">Last Updated</span>
-                      <span className="text-[10px] font-mono text-white/40">
-                        {lastLiveUpdate ? format(lastLiveUpdate, 'HH:mm:ss') : '--'}
-                      </span>
-                    </div>
                     <div className="flex items-center justify-between pt-2 border-t border-white/5">
                       <span className="text-xs text-white/60">Status</span>
                       <span className={cn(
@@ -1422,13 +1889,101 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="lg:col-span-3">
+              <div className="lg:col-span-3 space-y-6">
+                {/* Ongoing Trade Card */}
+                {activeLiveTrade && livePrice && (
+                  <div className="bg-[#0D0D0E] border border-amber-500/30 rounded-2xl p-6 shadow-xl animate-in zoom-in-95 duration-300">
+                    <div className="flex items-center justify-between mb-6">
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 bg-amber-500/10 rounded-xl flex items-center justify-center">
+                          <Activity className="w-5 h-5 text-amber-500" />
+                        </div>
+                        <div>
+                          <h3 className="font-bold text-white/90">Active SHORT Position</h3>
+                          <p className="text-[10px] text-white/30">Opened {format(activeLiveTrade.entryTime, 'HH:mm:ss')}</p>
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <div className={cn(
+                          "text-2xl font-bold",
+                          ((activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice) >= 0 ? "text-emerald-400" : "text-red-400"
+                        )}>
+                          {((activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice * 100).toFixed(2)}%
+                        </div>
+                        <div className="text-[10px] text-white/30">Live P&L</div>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
+                      <div className="space-y-1">
+                        <span className="text-[10px] text-white/30 uppercase">Entry Price</span>
+                        <div className="text-sm font-mono text-white/80">${activeLiveTrade.entryPrice.toLocaleString()}</div>
+                      </div>
+                      <div className="space-y-1">
+                        <span className="text-[10px] text-white/30 uppercase">Current Price</span>
+                        <div className="text-sm font-mono text-white/80">${livePrice.toLocaleString()}</div>
+                      </div>
+                      <div className="space-y-1">
+                        <span className="text-[10px] text-white/30 uppercase">Stop Loss</span>
+                        <div className="text-sm font-mono text-red-400/70">${(activeLiveTrade.entryPrice * (1 + settings.stopLoss)).toLocaleString()}</div>
+                      </div>
+                      <div className="space-y-1">
+                        <span className="text-[10px] text-white/30 uppercase">Take Profit</span>
+                        <div className="text-sm font-mono text-emerald-400/70">${(activeLiveTrade.entryPrice * (1 - settings.takeProfit)).toLocaleString()}</div>
+                      </div>
+                    </div>
+
+                    <div className="mt-6 pt-6 border-t border-white/5 flex items-center justify-between">
+                      <div className="flex items-center gap-4">
+                        <div className="space-y-1">
+                          <span className="text-[9px] text-white/30 uppercase">Unrealized P&L</span>
+                          <div className={cn(
+                            "text-sm font-bold",
+                            ((activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice) >= 0 ? "text-emerald-400" : "text-red-400"
+                          )}>
+                            ${(settings.quantityType === 'USD' 
+                              ? (settings.quantity * (activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice)
+                              : (settings.quantity * (activeLiveTrade.entryPrice - livePrice))
+                            ).toFixed(2)}
+                          </div>
+                        </div>
+                      </div>
+                      <button 
+                        onClick={() => {
+                          const profitPct = (activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice;
+                          const profit = settings.quantityType === 'USD'
+                            ? settings.quantity * profitPct
+                            : settings.quantity * (activeLiveTrade.entryPrice - livePrice);
+                            
+                          const newTrade: Trade = {
+                            type: 'SHORT',
+                            entryPrice: activeLiveTrade.entryPrice,
+                            exitPrice: livePrice,
+                            entryTime: activeLiveTrade.entryTime,
+                            exitTime: Date.now(),
+                            profit,
+                            profitPct: profitPct * 100,
+                            exitReason: 'MANUAL'
+                          };
+                          setLiveTrades(prev => [newTrade, ...prev]);
+                          setLivePaperBalance(prev => prev + profit);
+                          setActiveLiveTrade(null);
+                          if (isRealTrading) placeRealOrder('buy', settings.quantity);
+                        }}
+                        className="px-4 py-2 bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white border border-red-500/20 rounded-lg text-xs font-bold transition-all"
+                      >
+                        Close Position Manually
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 <div className="bg-[#0D0D0E] border border-white/5 rounded-2xl p-6 shadow-xl h-full">
                   <h3 className="font-medium mb-4 flex items-center gap-2 text-emerald-400">
                     <History className="w-4 h-4" />
                     Live Trade History
                   </h3>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-h-[600px] overflow-y-auto pr-2 custom-scrollbar">
                     {liveTrades.length > 0 ? (
                       liveTrades.map((trade, idx) => (
                         <div key={idx} className="p-3 bg-white/5 rounded-xl border border-white/5 hover:border-white/10 transition-colors space-y-2">
@@ -1440,7 +1995,8 @@ export default function App() {
                                 trade.exitReason === 'TAKE_PROFIT' ? "text-emerald-500 bg-emerald-500/10" :
                                 trade.exitReason === 'STOP_LOSS' ? "text-red-500 bg-red-500/10" :
                                 trade.exitReason === 'PREDICTION' ? "text-purple-500 bg-purple-500/10" :
-                                "text-blue-500 bg-blue-500/10"
+                                trade.exitReason === 'MANUAL' ? "text-blue-500 bg-blue-500/10" :
+                                "text-white/20 bg-white/5"
                               )}>
                                 {trade.exitReason.replace('_', ' ')}
                               </span>
@@ -1458,6 +2014,12 @@ export default function App() {
                               <div className="text-white/30 uppercase">Exit</div>
                               <div className="text-white/70 font-medium">${trade.exitPrice.toLocaleString()}</div>
                             </div>
+                          </div>
+                          <div className="pt-2 border-t border-white/5 flex justify-between items-center">
+                            <span className="text-[9px] text-white/30 italic">{format(trade.exitTime, 'MMM dd, HH:mm')}</span>
+                            <span className={cn("text-[10px] font-bold", trade.profitPct >= 0 ? "text-emerald-500/70" : "text-red-500/70")}>
+                              {trade.profitPct >= 0 ? '+' : ''}{trade.profitPct.toFixed(2)}%
+                            </span>
                           </div>
                         </div>
                       ))

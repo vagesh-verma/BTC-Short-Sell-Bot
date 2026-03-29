@@ -11,31 +11,35 @@ export class GRUModel {
     this.featureCount = featureCount;
   }
 
-  public async buildModel() {
-    logger.info(`Building GRU Model (Window: ${this.windowSize}, Features: ${this.featureCount})...`);
+  public async buildModel(
+    units: number = 128, 
+    dropout: number = 0.2, 
+    learningRate: number = 0.001
+  ) {
+    logger.info(`Building GRU Model (Window: ${this.windowSize}, Features: ${this.featureCount}, Units: ${units}, Dropout: ${dropout}, LR: ${learningRate})...`);
     const model = tf.sequential();
     
     // GRU Layer
     model.add(tf.layers.gru({
-      units: 128,
+      units: units,
       inputShape: [this.windowSize, this.featureCount],
       returnSequences: true,
     }));
     
-    model.add(tf.layers.dropout({ rate: 0.2 }));
+    model.add(tf.layers.dropout({ rate: dropout }));
 
     model.add(tf.layers.gru({
-      units: 64,
+      units: Math.floor(units / 2),
       returnSequences: false,
     }));
     
-    model.add(tf.layers.dropout({ rate: 0.2 }));
+    model.add(tf.layers.dropout({ rate: dropout }));
     
     // Output Layer: Predict if the price will go DOWN (Short opportunity)
     model.add(tf.layers.dense({ units: 1, activation: 'sigmoid' }));
 
     model.compile({
-      optimizer: tf.train.adam(0.001),
+      optimizer: tf.train.adam(learningRate),
       loss: 'binaryCrossentropy',
       metrics: ['accuracy'],
     });
@@ -48,9 +52,12 @@ export class GRUModel {
     data: number[], 
     labels: number[], 
     epochs: number = 10, 
+    units: number = 128,
+    dropout: number = 0.2,
+    learningRate: number = 0.001,
     onEpochEnd?: (epoch: number, logs?: tf.Logs) => void
   ) {
-    if (!this.model) await this.buildModel();
+    if (!this.model) await this.buildModel(units, dropout, learningRate);
     
     const numSamples = data.length / (this.windowSize * this.featureCount);
     logger.info(`Starting training with ${numSamples} samples for ${epochs} epochs...`);
@@ -129,7 +136,15 @@ export function prepareData(
   dropThreshold: number = 0.5,
   ema9?: number[],
   emaBelow?: number[],
-  emaCross?: number[]
+  emaCross?: number[],
+  obv?: number[],
+  mfi?: number[],
+  volatility?: number[],
+  hourOfDay?: number[],
+  dayOfWeek?: number[],
+  bearishHarami?: number[],
+  marubozu?: number[],
+  engulfing?: number[]
 ) {
   const samples: { x: number[], y: number }[] = [];
   
@@ -148,6 +163,14 @@ export function prepareData(
     const ema9Window = ema9 ? windowIndices.map(idx => ema9[idx]) : [];
     const emaBelowWindow = emaBelow ? windowIndices.map(idx => emaBelow[idx]) : [];
     const emaCrossWindow = emaCross ? windowIndices.map(idx => emaCross[idx]) : [];
+    const obvWindow = obv ? windowIndices.map(idx => obv[idx]) : [];
+    const mfiWindow = mfi ? windowIndices.map(idx => mfi[idx]) : [];
+    const volWindow = volatility ? windowIndices.map(idx => volatility[idx]) : [];
+    const hourWindow = hourOfDay ? windowIndices.map(idx => hourOfDay[idx]) : [];
+    const dayWindow = dayOfWeek ? windowIndices.map(idx => dayOfWeek[idx]) : [];
+    const haramiWindow = bearishHarami ? windowIndices.map(idx => bearishHarami[idx]) : [];
+    const marubozuWindow = marubozu ? windowIndices.map(idx => marubozu[idx]) : [];
+    const engulfingWindow = engulfing ? windowIndices.map(idx => engulfing[idx]) : [];
 
     const normalize = (arr: number[]) => {
       const min = Math.min(...arr);
@@ -163,6 +186,8 @@ export function prepareData(
     const normMacd = macdHistogram ? normalize(macdWindow) : [];
     const normAtr = atr ? normalize(atrWindow) : [];
     const normEma9 = ema9 ? normalize(ema9Window) : [];
+    const normObv = obv ? normalize(obvWindow) : [];
+    const normVol = volatility ? normalize(volWindow) : [];
 
     const x: number[] = [];
     for (let j = 0; j < windowSize; j++) {
@@ -174,6 +199,23 @@ export function prepareData(
       if (ema9) x.push(normEma9[j]);
       if (emaBelow) x.push(emaBelowWindow[j]);
       if (emaCross) x.push(emaCrossWindow[j]);
+      if (obv) x.push(normObv[j]);
+      if (mfi) x.push(mfiWindow[j] / 100);
+      if (volatility) x.push(normVol[j]);
+      if (hourOfDay) {
+        const h = hourWindow[j];
+        x.push(h / 24);
+        // Asia: 0-9 UTC
+        x.push(h >= 0 && h <= 9 ? 1 : 0);
+        // London: 8-17 UTC
+        x.push(h >= 8 && h <= 17 ? 1 : 0);
+        // NY: 13-22 UTC
+        x.push(h >= 13 && h <= 22 ? 1 : 0);
+      }
+      if (dayOfWeek) x.push(dayWindow[j] / 7);
+      if (bearishHarami) x.push(haramiWindow[j]);
+      if (marubozu) x.push(marubozuWindow[j]);
+      if (engulfing) x.push(engulfingWindow[j]);
     }
     
     const currentPrice = prices[i];
@@ -214,5 +256,13 @@ export function prepareData(
   const xs = balancedSamples.flatMap(s => s.x);
   const ys = balancedSamples.map(s => s.y);
 
-  return { xs, ys };
+  return { 
+    xs, 
+    ys, 
+    stats: { 
+      total: samples.length, 
+      positive: positiveSamples.length, 
+      negative: negativeSamples.length 
+    } 
+  };
 }
