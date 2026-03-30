@@ -13,56 +13,83 @@ const PORT = 3000;
 app.use(express.json());
 
 const DELTA_BASE_URL = "https://api.india.delta.exchange";
+let productMap: Record<string, number> = { 'BTCUSD': 1 };
+
+async function fetchProducts() {
+  try {
+    const result = await deltaRequest("GET", "/v2/products") as any;
+    if (result.success && Array.isArray(result.result)) {
+      result.result.forEach((p: any) => {
+        productMap[p.symbol] = p.id;
+      });
+      console.log(`[Delta] Loaded ${result.result.length} products.`);
+    }
+  } catch (error: any) {
+    console.warn("[Delta] Could not fetch products:", error.message);
+  }
+}
 
 function getCredentials() {
-  const apiKey = process.env.DELTA_API_KEY;
-  const apiSecret = process.env.DELTA_API_SECRET;
+  const apiKey = process.env.DELTA_API_KEY?.trim();
+  const apiSecret = process.env.DELTA_API_SECRET?.trim();
   if (!apiKey || !apiSecret) {
     throw new Error("Delta API credentials missing. Please set DELTA_API_KEY and DELTA_API_SECRET in Settings.");
   }
   return { apiKey, apiSecret };
 }
 
-function generateSignature(secret: string, method: string, nonce: string, path: string, query: string = "", body: string = "") {
-  const payload = method + nonce + path + query + body;
+function generateSignature(secret: string, method: string, nonce: string, endpoint: string, body: string = "") {
+  const payload = method + nonce + endpoint + body;
   return crypto.createHmac("sha256", secret).update(payload).digest("hex");
+}
+
+let lastRestNonce = 0;
+function getNextRestNonce() {
+  let now = Date.now();
+  if (now <= lastRestNonce) {
+    now = lastRestNonce + 1;
+  }
+  lastRestNonce = now;
+  return now.toString();
 }
 
 async function deltaRequest(method: string, endpoint: string, data: any = null) {
   const { apiKey, apiSecret } = getCredentials();
 
-  const nonce = Date.now().toString();
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  
+  // Ensure the body is stringified ONCE and used for both signature and request
   const body = data ? JSON.stringify(data) : "";
   
-  // Split endpoint into path and query for signature
-  const [path, queryStr] = endpoint.split('?');
-  const query = queryStr ? `?${queryStr}` : "";
-  
-  const signature = generateSignature(apiSecret, method, nonce, path, query, body);
+  const signaturePayload = method + timestamp + endpoint + body;
+  const signature = crypto.createHmac("sha256", apiSecret).update(signaturePayload).digest("hex");
+
+  console.log(`[Delta] Request: ${method} ${endpoint}`);
+  console.log(`[Delta] Payload: ${signaturePayload}`);
 
   const headers = {
     "Content-Type": "application/json",
+    "Accept": "application/json",
     "api-key": apiKey,
-    "api-signature": signature,
-    "api-nonce": nonce,
+    "signature": signature,
+    "timestamp": timestamp,
+    "User-Agent": "node-js-client"
   };
 
   const options: any = {
     method,
     headers,
+    body: data ? body : undefined
   };
 
-  if (data) {
-    options.body = body;
-  }
+  console.log(`[Delta] Headers:`, JSON.stringify({ ...headers, "api-key": "MASKED" }, null, 2));
 
   const response = await fetch(`${DELTA_BASE_URL}${endpoint}`, options);
-  const result = await response.json();
+  const result = await response.json() as any;
 
   if (!response.ok) {
-    console.error("Delta API Error:", result);
-    const errorMsg = (result as any).error?.message || "Delta API Error";
-    throw new Error(errorMsg);
+    console.error(`Delta API Error (${method} ${endpoint}):`, JSON.stringify(result, null, 2));
+    throw new Error(JSON.stringify(result.error || result));
   }
 
   return result;
@@ -85,18 +112,17 @@ app.get("/api/wallet", async (req, res) => {
 app.post("/api/order", async (req, res) => {
   try {
     const { symbol, side, order_type, size, limit_price } = req.body;
-    // symbol should be 'BTCUSD' or similar
-    // side: 'buy' or 'sell'
-    // order_type: 'market' or 'limit'
+    
+    const productId = productMap[symbol] || 1;
     
     const orderData = {
-      product_id: 1, // BTCUSD on Delta India is usually product_id 1, but we should fetch it or use symbol
+      product_id: productId,
       side,
       order_type,
       size: Math.floor(size),
     };
 
-    if (order_type === 'limit' && limit_price) {
+    if (order_type === 'limit_order' && limit_price) {
       (orderData as any).limit_price = limit_price.toString();
     }
 
@@ -162,6 +188,7 @@ async function logServerInfo() {
 
 async function startServer() {
   await logServerInfo();
+  await fetchProducts();
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },

@@ -25,7 +25,8 @@ import {
   Settings2,
   ShieldAlert,
   Target,
-  Zap
+  Zap,
+  ChevronDown
 } from 'lucide-react';
 import { format } from 'date-fns';
 import { clsx, type ClassValue } from 'clsx';
@@ -97,8 +98,8 @@ export default function App() {
     trailingStopActivation: 0.005, // 0.5%
     trailingStopOffset: 0.003, // 0.3%
     maxDurationHours: 12,
-    quantity: 0.2,
-    quantityType: 'BTC',
+    quantity: 200,
+    quantityType: 'LOTS',
   });
 
   const [isLiveMode, setIsLiveMode] = useState(false);
@@ -179,40 +180,65 @@ export default function App() {
   }, [isLiveMode]);
 
   useEffect(() => {
+    let interval: NodeJS.Timeout;
     if (isRealTrading) {
       fetchRealBalance();
+      interval = setInterval(fetchRealBalance, 30000); // Fetch every 30 seconds
     }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
   }, [isRealTrading]);
 
   const fetchRealBalance = async () => {
     try {
       const response = await fetch('/api/wallet');
       const data = await response.json();
-      if (data.result) {
-        // Find USDT or BTC balance
-        const usdt = data.result.find((b: any) => b.asset_symbol === 'USDT');
-        if (usdt) setRealBalance(parseFloat(usdt.available_balance));
+      if (data.success && data.result) {
+        // Find USD or BTC balance
+        const usd = data.result.find((b: any) => b.asset_symbol === 'USD');
+        if (usd) {
+          setRealBalance(parseFloat(usd.available_balance));
+        } else {
+          logger.warning('USD balance not found in wallet.');
+        }
+      } else if (data.error) {
+        logger.error(`Delta API Error: ${data.error}`);
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error fetching real balance:', error);
+      logger.error(`Failed to fetch wallet balance: ${error.message}`);
     }
   };
 
-  const placeRealOrder = async (side: 'buy' | 'sell', size: number) => {
+  const placeRealOrder = async (side: 'buy' | 'sell', quantity: number) => {
     try {
+      let lots = 0;
+      if (settings.quantityType === 'LOTS') {
+        lots = quantity;
+      } else if (settings.quantityType === 'BTC') {
+        lots = quantity * 1000;
+      } else if (settings.quantityType === 'USD' && livePrice) {
+        // 1 lot = 0.001 BTC. So lots = (USD / price) / 0.001
+        lots = (quantity / livePrice) / 0.001;
+      }
+
+      const finalSize = Math.max(1, Math.floor(lots));
+
       const response = await fetch('/api/order', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           symbol: 'BTCUSD',
           side,
-          order_type: 'market',
-          size
+          order_type: 'limit_order',
+          size: finalSize,
+          limit_price: livePrice
         })
       });
       const data = await response.json();
       if (data.result) {
-        logger.success(`Real order placed: ${side} ${size} units`);
+        logger.success(`Real order placed: ${side} ${finalSize} lots at $${livePrice}`);
         fetchRealBalance();
       } else {
         logger.error(`Real order failed: ${data.error || 'Unknown error'}`);
@@ -441,9 +467,10 @@ export default function App() {
       }
 
       if (shouldExit) {
+        const btcQuantity = settings.quantityType === 'LOTS' ? settings.quantity * 0.001 : settings.quantity;
         const profit = settings.quantityType === 'USD' 
           ? settings.quantity * profitPct 
-          : settings.quantity * (activeLiveTrade.entryPrice - price);
+          : btcQuantity * (activeLiveTrade.entryPrice - price);
           
         const newTrade: Trade = {
           type: 'SHORT',
@@ -685,6 +712,7 @@ export default function App() {
     const engulfing1h = calculateEngulfing(opens1h, prices1h);
 
     const generatedPredictions: number[] = [];
+    const generatedFeatures: number[][] = [];
     for (let i = windowSize; i < prices1h.length; i++) {
       const windowIndices = Array.from({ length: windowSize }, (_, k) => i - windowSize + k);
       
@@ -734,8 +762,9 @@ export default function App() {
         );
       }
       generatedPredictions.push(m1h.predict(input));
+      generatedFeatures.push(input);
     }
-    return generatedPredictions;
+    return { predictions: generatedPredictions, features: generatedFeatures };
   };
 
   const startTraining = async () => {
@@ -947,7 +976,7 @@ export default function App() {
       model1hRef.current = model1h;
       
       setStatus('Generating Final Predictions...');
-      const generatedPredictions = await getPredictionsForRange(candles, candles4h, model1h, model4h);
+      const { predictions: generatedPredictions, features: generatedFeatures } = await getPredictionsForRange(candles, candles4h, model1h, model4h);
       
       setPredictions(generatedPredictions);
       const above = generatedPredictions.filter(p => p > settings.threshold).length;
@@ -957,7 +986,7 @@ export default function App() {
       
       // Auto-run initial backtest
       logger.info('Running initial backtest...');
-      const result = runBacktest(candles.slice(windowSize), generatedPredictions, settings, 10000, 0);
+      const result = runBacktest(candles.slice(windowSize), generatedPredictions, settings, 10000, 0, generatedFeatures);
       setBacktestResult(result);
       logger.success('--- Training and Backtest Complete ---');
     } catch (err: any) {
@@ -1001,7 +1030,7 @@ export default function App() {
       }
 
       setStatus('Generating predictions for backtest range...');
-      const btPredictions = await getPredictionsForRange(btCandles1h, btCandles4h, model1hRef.current, model4hRef.current);
+      const { predictions: btPredictions, features: btFeatures } = await getPredictionsForRange(btCandles1h, btCandles4h, model1hRef.current, model4hRef.current);
       logger.info(`Generated ${btPredictions.length} predictions.`);
 
       // 2. Fetch 5m data for high-res backtest
@@ -1015,27 +1044,29 @@ export default function App() {
 
       setStatus('Aligning predictions with 5m candles...');
       
-      const predictionMap = new Map<number, number>();
+      const predictionMap = new Map<number, { val: number, features: number[] }>();
       btPredictions.forEach((val, i) => {
         // btPredictions[i] corresponds to btCandles1h[i + windowSize]
         const candleIndex = i + windowSize;
         if (btCandles1h[candleIndex]) {
           const time = btCandles1h[candleIndex].time;
-          predictionMap.set(time, val);
+          predictionMap.set(time, { val, features: btFeatures[i] });
         }
       });
 
       const alignedPredictions: number[] = [];
+      const alignedFeatures: number[][] = [];
       const validHighResCandles: Candle[] = [];
 
       highResCandles.forEach(c => {
         // Round down to the nearest hour to find the corresponding prediction
         const hourTimestamp = Math.floor(c.time / (1000 * 60 * 60)) * (1000 * 60 * 60);
-        const prediction = predictionMap.get(hourTimestamp);
+        const predictionData = predictionMap.get(hourTimestamp);
         
-        if (prediction !== undefined) {
+        if (predictionData !== undefined) {
           // Carry the prediction for the entire hour
-          alignedPredictions.push(prediction);
+          alignedPredictions.push(predictionData.val);
+          alignedFeatures.push(predictionData.features);
           validHighResCandles.push(c);
         }
       });
@@ -1054,7 +1085,7 @@ export default function App() {
 
       setStatus('Running High-Resolution Backtest...');
       logger.info(`Running backtest on ${validHighResCandles.length} candles (${(validHighResCandles.length * 5 / 60).toFixed(1)} hours of data)...`);
-      const result = runBacktest(validHighResCandles, alignedPredictions, settings, 10000, 0);
+      const result = runBacktest(validHighResCandles, alignedPredictions, settings, 10000, 0, alignedFeatures);
       
       setBacktestResult(result);
       setStatus('Backtest complete!');
@@ -1185,7 +1216,7 @@ export default function App() {
                 <div className="flex items-center justify-between mb-6">
                   <div className="flex items-center gap-2">
                     <BarChart3 className="w-5 h-5 text-emerald-500" />
-                    <h2 className="font-medium">BTC/USDT Price (1h)</h2>
+                    <h2 className="font-medium">BTC/USD Price (1h)</h2>
                   </div>
                   <span className="px-2 py-1 bg-emerald-500/10 text-emerald-500 text-[10px] font-bold rounded uppercase tracking-wider">Live Feed</span>
                 </div>
@@ -1443,9 +1474,10 @@ export default function App() {
                   <div className="grid grid-cols-2 gap-4 pt-2 border-t border-white/5">
                     <div className="space-y-1.5">
                       <label className="text-[10px] text-white/40 uppercase font-bold">Unit</label>
-                      <select value={settings.quantityType} onChange={(e) => setSettings({...settings, quantityType: e.target.value as 'USD' | 'BTC'})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50 appearance-none">
+                      <select value={settings.quantityType} onChange={(e) => setSettings({...settings, quantityType: e.target.value as 'USD' | 'BTC' | 'LOTS'})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50 appearance-none">
                         <option value="USD">USD</option>
                         <option value="BTC">BTC</option>
+                        <option value="LOTS">Lots</option>
                       </select>
                     </div>
                     <div className="space-y-1.5">
@@ -1562,6 +1594,9 @@ export default function App() {
                             <p className="text-white/40 uppercase font-bold tracking-wider">Entry</p>
                             <p className="text-white/80">{format(new Date(trade.entryTime), 'MM/dd HH:mm')}</p>
                             <p className="text-white font-mono font-medium">${trade.entryPrice.toLocaleString()}</p>
+                            {trade.prediction !== undefined && (
+                              <p className="text-amber-400 font-bold mt-1">Pred: {(trade.prediction * 100).toFixed(1)}%</p>
+                            )}
                           </div>
                           <div className="space-y-1 text-right">
                             <p className="text-white/40 uppercase font-bold tracking-wider">Exit</p>
@@ -1569,6 +1604,25 @@ export default function App() {
                             <p className="text-white font-mono font-medium">${trade.exitPrice.toLocaleString()}</p>
                           </div>
                         </div>
+
+                        {trade.features && (
+                          <div className="pt-2 border-t border-white/5">
+                            <details className="group">
+                              <summary className="text-[9px] text-white/30 cursor-pointer hover:text-white/50 flex items-center gap-1 list-none">
+                                <ChevronDown className="w-2 h-2 group-open:rotate-180 transition-transform" />
+                                View Features at Entry
+                              </summary>
+                              <div className="mt-2 grid grid-cols-3 gap-x-2 gap-y-1 text-[8px] text-white/40 font-mono bg-black/40 p-2 rounded-lg">
+                                {trade.features.slice(-20).map((f, i) => (
+                                  <div key={i} className="truncate">F{i}: {f.toFixed(4)}</div>
+                                ))}
+                                <div className="col-span-full mt-1 pt-1 border-t border-white/5 text-[7px] italic opacity-50">
+                                  Showing last 20 normalized features
+                                </div>
+                              </div>
+                            </details>
+                          </div>
+                        )}
 
                         <div className="pt-2 border-t border-white/5 flex justify-between items-center">
                           <span className="text-[9px] text-white/30 italic">Duration: {((trade.exitTime - trade.entryTime) / (1000 * 60 * 60)).toFixed(1)}h</span>
@@ -1732,11 +1786,12 @@ export default function App() {
                     <label className="text-[10px] text-white/30 uppercase">Unit</label>
                     <select 
                       value={settings.quantityType}
-                      onChange={(e) => setSettings({...settings, quantityType: e.target.value as 'USD' | 'BTC'})}
+                      onChange={(e) => setSettings({...settings, quantityType: e.target.value as 'USD' | 'BTC' | 'LOTS'})}
                       className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
                     >
                       <option value="USD">USD</option>
-                      <option value="BTC">BTC Lots</option>
+                      <option value="BTC">BTC</option>
+                      <option value="LOTS">Lots (0.001 BTC)</option>
                     </select>
                   </div>
                   <div className="space-y-1">
@@ -1771,7 +1826,18 @@ export default function App() {
                   <div className="absolute top-0 right-0 p-2">
                     <div className={cn("w-2 h-2 rounded-full animate-ping", isRealTrading ? "bg-red-500" : "bg-emerald-500")} />
                   </div>
-                  <h3 className="text-xs font-bold text-white/40 uppercase mb-4">{isRealTrading ? 'Real Wallet Balance (USDT)' : 'Live Paper Balance'}</h3>
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-xs font-bold text-white/40 uppercase">{isRealTrading ? 'Real Wallet Balance (USD)' : 'Live Paper Balance'}</h3>
+                    {isRealTrading && (
+                      <button 
+                        onClick={fetchRealBalance}
+                        className="p-1 hover:bg-white/5 rounded-md transition-colors"
+                        title="Refresh Balance"
+                      >
+                        <RefreshCw className="w-3 h-3 text-white/40 hover:text-white" />
+                      </button>
+                    )}
+                  </div>
                   <div className={cn(
                     "text-3xl font-bold",
                     isRealTrading ? "text-red-400" : "text-emerald-400"
@@ -1945,7 +2011,9 @@ export default function App() {
                           )}>
                             ${(settings.quantityType === 'USD' 
                               ? (settings.quantity * (activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice)
-                              : (settings.quantity * (activeLiveTrade.entryPrice - livePrice))
+                              : (settings.quantityType === 'LOTS'
+                                ? (settings.quantity * 0.001 * (activeLiveTrade.entryPrice - livePrice))
+                                : (settings.quantity * (activeLiveTrade.entryPrice - livePrice)))
                             ).toFixed(2)}
                           </div>
                         </div>
@@ -1953,9 +2021,10 @@ export default function App() {
                       <button 
                         onClick={() => {
                           const profitPct = (activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice;
+                          const btcQuantity = settings.quantityType === 'LOTS' ? settings.quantity * 0.001 : settings.quantity;
                           const profit = settings.quantityType === 'USD'
                             ? settings.quantity * profitPct
-                            : settings.quantity * (activeLiveTrade.entryPrice - livePrice);
+                            : btcQuantity * (activeLiveTrade.entryPrice - livePrice);
                             
                           const newTrade: Trade = {
                             type: 'SHORT',

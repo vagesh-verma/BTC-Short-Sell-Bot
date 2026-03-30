@@ -9,6 +9,8 @@ export interface Trade {
   profit: number;
   profitPct: number;
   exitReason: 'TIME' | 'STOP_LOSS' | 'TAKE_PROFIT' | 'TRAILING_STOP' | 'PREDICTION' | 'MANUAL';
+  prediction?: number;
+  features?: number[];
 }
 
 export interface BacktestSettings {
@@ -20,7 +22,7 @@ export interface BacktestSettings {
   trailingStopOffset: number; // e.g., 0.005 for 0.5% offset
   maxDurationHours: number;
   quantity: number;
-  quantityType: 'USD' | 'BTC';
+  quantityType: 'USD' | 'BTC' | 'LOTS';
   onlyHighVolumeSessions?: boolean;
 }
 
@@ -41,7 +43,8 @@ export function runBacktest(
   predictions: number[],
   settings: BacktestSettings,
   initialBalance: number = 10000,
-  windowSize: number = 20
+  windowSize: number = 20,
+  features?: number[][]
 ): BacktestResult {
   const trades: Trade[] = [];
   let balance = initialBalance;
@@ -54,6 +57,8 @@ export function runBacktest(
     entryTime: number;
     highestProfitPct: number;
     trailingStopPrice: number | null;
+    prediction: number;
+    features?: number[];
   } | null = null;
 
   for (let i = 0; i < predictions.length; i++) {
@@ -103,9 +108,13 @@ export function runBacktest(
         let profit = 0;
         if (settings.quantityType === 'USD') {
           profit = settings.quantity * currentProfitPct;
-        } else {
+        } else if (settings.quantityType === 'BTC') {
           // BTC quantity: profit = quantity * (entryPrice - exitPrice)
           profit = settings.quantity * (activeTrade.entryPrice - exitPrice);
+        } else {
+          // LOTS: 1 lot = 0.001 BTC
+          const btcQuantity = settings.quantity * 0.001;
+          profit = btcQuantity * (activeTrade.entryPrice - exitPrice);
         }
         
         balance += profit;
@@ -119,6 +128,8 @@ export function runBacktest(
           profit,
           profitPct: currentProfitPct * 100,
           exitReason,
+          prediction: activeTrade.prediction,
+          features: activeTrade.features
         });
         
         activeTrade = null;
@@ -153,6 +164,8 @@ export function runBacktest(
           entryTime: candle.time,
           highestProfitPct: 0,
           trailingStopPrice: null,
+          prediction: prediction,
+          features: features ? features[i] : undefined
         };
       }
     }
