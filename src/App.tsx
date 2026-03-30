@@ -536,9 +536,11 @@ export default function App() {
     }
   };
 
-  const handleDeleteModel = (name: string) => {
-    if (confirm(`Are you sure you want to delete model "${name}"?`)) {
-      deleteModelPair(name);
+  const handleDeleteModel = async (name: string) => {
+    // Note: confirm() is used here but discouraged in iframe environments.
+    // Keeping it for now as the app seems to rely on it, but making it async.
+    if (window.confirm(`Are you sure you want to delete model "${name}"?`)) {
+      await deleteModelPair(name);
       setSavedModels(getSavedModelPairs());
     }
   };

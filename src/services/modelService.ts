@@ -99,7 +99,7 @@ export class GRUModel {
 
   public async save(name: string) {
     if (!this.model) throw new Error('No model to save');
-    await this.model.save(`localstorage://${name}`);
+    await this.model.save(`indexeddb://${name}`);
     localStorage.setItem(`${name}_metadata`, JSON.stringify({
       windowSize: this.windowSize,
       featureCount: this.featureCount
@@ -112,13 +112,33 @@ export class GRUModel {
     const metadata = JSON.parse(metadataStr);
     
     const gru = new GRUModel(metadata.windowSize, metadata.featureCount);
-    gru.model = await tf.loadLayersModel(`localstorage://${name}`);
+    try {
+      gru.model = await tf.loadLayersModel(`indexeddb://${name}`);
+    } catch (err) {
+      logger.info(`Model ${name} not found in IndexedDB, trying LocalStorage...`);
+      gru.model = await tf.loadLayersModel(`localstorage://${name}`);
+    }
+    
     gru.model.compile({
       optimizer: tf.train.adam(0.001),
       loss: 'binaryCrossentropy',
       metrics: ['accuracy'],
     });
     return gru;
+  }
+
+  public static async remove(name: string) {
+    try {
+      await tf.io.removeModel(`indexeddb://${name}`);
+    } catch (err) {
+      // Ignore if not found in IndexedDB
+    }
+    try {
+      await tf.io.removeModel(`localstorage://${name}`);
+    } catch (err) {
+      // Ignore if not found in LocalStorage
+    }
+    localStorage.removeItem(`${name}_metadata`);
   }
 }
 

@@ -51,20 +51,24 @@ export async function loadModelPair(name: string): Promise<{ model1h: GRUModel, 
   }
 }
 
-export function deleteModelPair(name: string) {
+export async function deleteModelPair(name: string) {
   const id = name.replace(/\s+/g, '_').toLowerCase();
+  
+  // Remove from IndexedDB
+  await GRUModel.remove(`model_pair_${id}_1h`);
+  await GRUModel.remove(`model_pair_${id}_4h`);
+  
+  // Also clean up any legacy localStorage entries
   localStorage.removeItem(`model_pair_${id}_1h`);
   localStorage.removeItem(`model_pair_${id}_1h_metadata`);
   localStorage.removeItem(`model_pair_${id}_4h`);
   localStorage.removeItem(`model_pair_${id}_4h_metadata`);
   
-  // Also remove the tfjs keys from localStorage
-  // tfjs uses keys like 'tensorflowjs_models/model_pair_.../model_topology'
   for (let i = 0; i < localStorage.length; i++) {
     const key = localStorage.key(i);
     if (key && key.includes(`model_pair_${id}`)) {
       localStorage.removeItem(key);
-      i--; // Adjust index after removal
+      i--;
     }
   }
 
