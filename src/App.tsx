@@ -26,7 +26,10 @@ import {
   ShieldAlert,
   Target,
   Zap,
-  ChevronDown
+  ChevronDown,
+  CloudUpload,
+  CloudOff,
+  Github
 } from 'lucide-react';
 import { format } from 'date-fns';
 import { clsx, type ClassValue } from 'clsx';
@@ -37,7 +40,8 @@ import { GRUModel, prepareData } from './services/modelService';
 import { runBacktest, BacktestResult, Trade, BacktestSettings } from './services/backtestService';
 import { calculateEMA, calculateRSI, calculateBollingerBands, calculateMACD, calculateStochasticRSI, calculateATR, calculateEMACross, calculateOBV, calculateMFI, calculateVolatility, calculateBearishHarami, calculateMarubozu, calculateEngulfing } from './services/indicatorService';
 import { DeltaSocketService, TickerUpdate } from './services/deltaSocketService';
-import { getSavedModelPairs, saveModelPair, loadModelPair, deleteModelPair, ModelPair } from './services/storageService';
+import { getSavedModelPairs, saveModelPair, loadModelPair, deleteModelPair, ModelPair, uploadModelPairToGitHub, deleteModelPairFromGitHub, loadModelPairFromGitHub } from './services/storageService';
+import { GitHubConfig } from './services/githubService';
 
 import { Terminal } from './components/Terminal';
 import { logger } from './services/loggerService';
@@ -45,6 +49,12 @@ import { logger } from './services/loggerService';
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
+
+const FEATURE_NAMES = [
+  'Price', 'RSI', 'EMA', 'BB_Upper', 'BB_Lower', 'MACD_Hist', 'Stoch_RSI', 'ATR', 'Secondary_Pred',
+  'EMA9', 'Below', 'Cross', 'OBV', 'MFI', 'Volatility', 'Hour', 'Asia', 'London', 'NY', 'Day',
+  'Harami', 'Marubozu', 'Engulfing'
+];
 
 export default function App() {
   const [candles, setCandles] = useState<Candle[]>([]);
@@ -100,6 +110,12 @@ export default function App() {
     maxDurationHours: 12,
     quantity: 200,
     quantityType: 'LOTS',
+    useSessionTrading: false,
+    asiaStart: 2,
+    asiaEnd: 5,
+    nyStart: 13,
+    nyEnd: 18,
+    useOnlyCompletedCandles: false,
   });
 
   const [isLiveMode, setIsLiveMode] = useState(false);
@@ -115,6 +131,8 @@ export default function App() {
     entryTime: number;
     highestProfitPct: number;
     trailingStopPrice: number | null;
+    prediction: number;
+    features: Record<string, number>;
   } | null>(null);
   const [livePrediction, setLivePrediction] = useState<number | null>(null);
   const [liveParams, setLiveParams] = useState<{
@@ -140,12 +158,85 @@ export default function App() {
 
   const [savedModels, setSavedModels] = useState<ModelPair[]>([]);
   const [newModelName, setNewModelName] = useState('');
+  const [githubConfig, setGithubConfig] = useState<GitHubConfig>({
+    owner: '',
+    repo: '',
+    path: 'models',
+    token: ''
+  });
 
   const windowSize = 20;
 
   useEffect(() => {
     setSavedModels(getSavedModelPairs());
+    // Load GitHub config from localStorage if exists
+    const savedConfig = localStorage.getItem('github_config');
+    if (savedConfig) {
+      setGithubConfig(JSON.parse(savedConfig));
+    }
   }, []);
+
+  const handleSaveGithubConfig = () => {
+    localStorage.setItem('github_config', JSON.stringify(githubConfig));
+    logger.success('GitHub configuration saved.');
+  };
+
+  const handleUploadToGitHub = async (name: string) => {
+    if (!githubConfig.owner || !githubConfig.repo || !githubConfig.token) {
+      logger.error('Please configure GitHub settings first.');
+      return;
+    }
+    try {
+      setLoading(true);
+      setStatus(`Uploading "${name}" to GitHub...`);
+      await uploadModelPairToGitHub(name, githubConfig);
+      setSavedModels(getSavedModelPairs());
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDeleteFromGitHub = async (name: string) => {
+    if (!githubConfig.owner || !githubConfig.repo || !githubConfig.token) {
+      logger.error('Please configure GitHub settings first.');
+      return;
+    }
+    if (window.confirm(`Are you sure you want to delete model "${name}" from GitHub?`)) {
+      try {
+        setLoading(true);
+        setStatus(`Deleting "${name}" from GitHub...`);
+        await deleteModelPairFromGitHub(name, githubConfig);
+        setSavedModels(getSavedModelPairs());
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setLoading(false);
+      }
+    }
+  };
+
+  const handleLoadFromGitHub = async (name: string) => {
+    if (!githubConfig.owner || !githubConfig.repo || !githubConfig.token) {
+      logger.error('Please configure GitHub settings first.');
+      return;
+    }
+    try {
+      setLoading(true);
+      setStatus(`Loading "${name}" from GitHub...`);
+      const { model1h, model4h } = await loadModelPairFromGitHub(name, githubConfig);
+      model1hRef.current = model1h;
+      model4hRef.current = model4h;
+      setStatus(`Model "${name}" loaded from GitHub!`);
+      // Trigger a re-render to update UI buttons
+      setPredictions([]); 
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
     const fetchServerStatus = async () => {
@@ -254,6 +345,25 @@ export default function App() {
   const processLiveUpdate = async (price: number) => {
     if (!model1hRef.current || !model4hRef.current || candles.length < windowSize || candles4h.length < windowSize) return;
 
+    const now = new Date();
+    
+    // 0. Check for completed candle entry if enabled
+    if (settings.useOnlyCompletedCandles && !activeLiveTrade) {
+      const lastCandleTime = candles[candles.length - 1].time;
+      const oneHourInMs = 60 * 60 * 1000;
+      const timeSinceLastCandle = now.getTime() - lastCandleTime;
+      
+      // If we are more than 1 minute into the new candle, it's not the "completion" moment
+      // We want to trigger as close to the start of the new hour as possible.
+      // However, the socket might not fire exactly at the hour.
+      // A better way is to check if the current time has crossed into a new hour compared to the last candle.
+      const currentHourStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours()).getTime();
+      if (currentHourStart <= lastCandleTime) {
+        // Still in the same hour as the last candle
+        return;
+      }
+    }
+
     // 1. Calculate 4h prediction as a feature
     const prices4h = candles4h.map(c => c.close);
     const highs4h = candles4h.map(c => c.high);
@@ -337,7 +447,6 @@ export default function App() {
     const fullHighs1h = [...candles.map(c => c.high), price];
     const fullLows1h = [...candles.map(c => c.low), price];
     const fullVolumes1h = [...candles.map(c => c.volume), 0];
-    const now = new Date();
     const fullHours1h = [...candles.map(c => new Date(c.time).getHours()), now.getHours()];
     const fullDays1h = [...candles.map(c => new Date(c.time).getDay()), now.getDay()];
     
@@ -404,6 +513,30 @@ export default function App() {
       );
     }
 
+    const featureNames = [
+      'Price', 'RSI', 'EMA', 'BB_Upper', 'BB_Lower', 'MACD_Hist', 'Stoch_RSI', 'ATR', 'Secondary_Pred',
+      'EMA9', 'Below', 'Cross', 'OBV', 'MFI', 'Volatility', 'Hour', 'Asia', 'London', 'NY', 'Day',
+      'Harami', 'Marubozu', 'Engulfing'
+    ];
+
+    const currentFeatures: Record<string, number> = {};
+    const last1hFeatures = [
+      np1h[windowSize - 1], nr1h[windowSize - 1], ne1h[windowSize - 1], nu1h[windowSize - 1], nl1h[windowSize - 1],
+      nm1h[windowSize - 1], sWindow1h[windowSize - 1], na1h[windowSize - 1], secondaryPrediction,
+      ne9_1h[windowSize - 1], belowWindow1h[windowSize - 1], crossWindow1h[windowSize - 1],
+      nobv1h[windowSize - 1], mfiWindow1h[windowSize - 1] / 100, nvol1h[windowSize - 1],
+      hourWindow1h[windowSize - 1] / 24, 
+      hourWindow1h[windowSize - 1] >= 0 && hourWindow1h[windowSize - 1] <= 9 ? 1 : 0,
+      hourWindow1h[windowSize - 1] >= 8 && hourWindow1h[windowSize - 1] <= 17 ? 1 : 0,
+      hourWindow1h[windowSize - 1] >= 13 && hourWindow1h[windowSize - 1] <= 22 ? 1 : 0,
+      nday1h[windowSize - 1] / 7,
+      nharami1h[windowSize - 1], nmarubozu1h[windowSize - 1], nengulfing1h[windowSize - 1]
+    ];
+
+    featureNames.forEach((name, idx) => {
+      currentFeatures[name] = last1hFeatures[idx];
+    });
+
     const prediction = model1hRef.current.predict(x1h);
     setLivePrediction(prediction);
     setLivePrice(price);
@@ -426,9 +559,8 @@ export default function App() {
       harami: harami1h[harami1h.length - 1],
       marubozu: marubozu1h[marubozu1h.length - 1],
       engulfing: engulfing1h[engulfing1h.length - 1],
-      session: now.getHours() >= 0 && now.getHours() <= 9 ? 'Asia' : 
-               now.getHours() >= 8 && now.getHours() <= 17 ? 'London' : 
-               now.getHours() >= 13 && now.getHours() <= 22 ? 'New York' : 'Off-Session',
+      session: now.getUTCHours() >= settings.asiaStart && now.getUTCHours() < settings.asiaEnd ? 'Asia' : 
+               now.getUTCHours() >= settings.nyStart && now.getUTCHours() < settings.nyEnd ? 'New York' : 'Off-Session',
       dayOfWeek: now.getDay()
     });
 
@@ -480,7 +612,9 @@ export default function App() {
           exitTime: Date.now(),
           profit,
           profitPct: profitPct * 100,
-          exitReason: reason
+          exitReason: reason,
+          prediction: activeLiveTrade.prediction,
+          features: activeLiveTrade.features
         };
         setLiveTrades(prev => [newTrade, ...prev]);
         setLivePaperBalance(prev => prev + profit);
@@ -500,21 +634,29 @@ export default function App() {
       }
     } else if (prediction > settings.threshold) {
       // Check for session-based trading
-      if (settings.onlyHighVolumeSessions) {
-        const hour = now.getHours();
+      let canTrade = true;
+      const hour = now.getUTCHours();
+
+      if (settings.useSessionTrading) {
+        const isAsia = hour >= settings.asiaStart && hour < settings.asiaEnd;
+        const isNY = hour >= settings.nyStart && hour < settings.nyEnd;
+        canTrade = isAsia || isNY;
+      } else if (settings.onlyHighVolumeSessions) {
         const isAsia = hour >= 0 && hour <= 9;
         const isLondon = hour >= 8 && hour <= 17;
         const isNY = hour >= 13 && hour <= 22;
-        if (!isAsia && !isLondon && !isNY) {
-          return;
-        }
+        canTrade = isAsia || isLondon || isNY;
       }
+
+      if (!canTrade) return;
 
       setActiveLiveTrade({
         entryPrice: price,
         entryTime: Date.now(),
         highestProfitPct: 0,
-        trailingStopPrice: null
+        trailingStopPrice: null,
+        prediction: prediction,
+        features: currentFeatures
       });
       logger.info(`Live Trade Opened: SHORT at $${price.toFixed(2)}`);
       
@@ -986,7 +1128,7 @@ export default function App() {
       
       // Auto-run initial backtest
       logger.info('Running initial backtest...');
-      const result = runBacktest(candles.slice(windowSize), generatedPredictions, settings, 10000, 0, generatedFeatures);
+      const result = runBacktest(candles.slice(windowSize), generatedPredictions, settings, 10000, 0, generatedFeatures, FEATURE_NAMES);
       setBacktestResult(result);
       logger.success('--- Training and Backtest Complete ---');
     } catch (err: any) {
@@ -1085,7 +1227,7 @@ export default function App() {
 
       setStatus('Running High-Resolution Backtest...');
       logger.info(`Running backtest on ${validHighResCandles.length} candles (${(validHighResCandles.length * 5 / 60).toFixed(1)} hours of data)...`);
-      const result = runBacktest(validHighResCandles, alignedPredictions, settings, 10000, 0, alignedFeatures);
+      const result = runBacktest(validHighResCandles, alignedPredictions, settings, 10000, 0, alignedFeatures, FEATURE_NAMES);
       
       setBacktestResult(result);
       setStatus('Backtest complete!');
@@ -1500,17 +1642,47 @@ export default function App() {
                       <label className="text-[10px] text-white/40 uppercase font-bold">Trail Offset %</label>
                       <input type="number" step="0.1" value={settings.trailingStopOffset * 100} onChange={(e) => setSettings({...settings, trailingStopOffset: parseFloat(e.target.value) / 100})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
                     </div>
-                    <div className="flex items-center gap-2 pt-4">
-                      <input 
-                        type="checkbox" 
-                        id="onlyHighVolumeSessionsLive"
-                        checked={settings.onlyHighVolumeSessions} 
-                        onChange={(e) => setSettings({...settings, onlyHighVolumeSessions: e.target.checked})}
-                        className="w-4 h-4 rounded border-white/10 bg-white/5 text-amber-500 focus:ring-amber-500/50"
-                      />
-                      <label htmlFor="onlyHighVolumeSessionsLive" className="text-[10px] text-white/60 uppercase font-bold cursor-pointer">Only High Volume Sessions</label>
+                    <div className="flex flex-col gap-2 pt-2">
+                      <div className="flex items-center gap-2">
+                        <input 
+                          type="checkbox" 
+                          id="useSessionTradingBT"
+                          checked={settings.useSessionTrading} 
+                          onChange={(e) => setSettings({...settings, useSessionTrading: e.target.checked})}
+                          className="w-4 h-4 rounded border-white/10 bg-white/5 text-amber-500 focus:ring-amber-500/50"
+                        />
+                        <label htmlFor="useSessionTradingBT" className="text-[10px] text-white/60 uppercase font-bold cursor-pointer">Session Trading</label>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <input 
+                          type="checkbox" 
+                          id="useOnlyCompletedCandlesBT"
+                          checked={settings.useOnlyCompletedCandles} 
+                          onChange={(e) => setSettings({...settings, useOnlyCompletedCandles: e.target.checked})}
+                          className="w-4 h-4 rounded border-white/10 bg-white/5 text-amber-500 focus:ring-amber-500/50"
+                        />
+                        <label htmlFor="useOnlyCompletedCandlesBT" className="text-[10px] text-white/60 uppercase font-bold cursor-pointer">Completed Candles Only</label>
+                      </div>
                     </div>
                   </div>
+                  {settings.useSessionTrading && (
+                    <div className="grid grid-cols-2 gap-4 pt-2 border-t border-white/5 animate-in fade-in slide-in-from-top-1">
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] text-white/40 uppercase font-bold">Asia (Start-End)</label>
+                        <div className="flex gap-2">
+                          <input type="number" value={settings.asiaStart} onChange={(e) => setSettings({...settings, asiaStart: parseInt(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs outline-none focus:border-amber-500/50" />
+                          <input type="number" value={settings.asiaEnd} onChange={(e) => setSettings({...settings, asiaEnd: parseInt(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs outline-none focus:border-amber-500/50" />
+                        </div>
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] text-white/40 uppercase font-bold">NY (Start-End)</label>
+                        <div className="flex gap-2">
+                          <input type="number" value={settings.nyStart} onChange={(e) => setSettings({...settings, nyStart: parseInt(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs outline-none focus:border-amber-500/50" />
+                          <input type="number" value={settings.nyEnd} onChange={(e) => setSettings({...settings, nyEnd: parseInt(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs outline-none focus:border-amber-500/50" />
+                        </div>
+                      </div>
+                    </div>
+                  )}
                   <button onClick={startBacktest} disabled={loading || training || !model1hRef.current} className={cn("w-full py-3 rounded-xl font-semibold flex items-center justify-center gap-2 transition-all active:scale-95", !model1hRef.current ? "bg-white/5 text-white/50 cursor-not-allowed" : "bg-amber-500 hover:bg-amber-400 text-black shadow-[0_0_20px_rgba(245,158,11,0.2)]")}>
                     <Activity className="w-4 h-4" /> {!model1hRef.current ? 'Train Model First' : 'Run Backtest'}
                   </button>
@@ -1613,11 +1785,11 @@ export default function App() {
                                 View Features at Entry
                               </summary>
                               <div className="mt-2 grid grid-cols-3 gap-x-2 gap-y-1 text-[8px] text-white/40 font-mono bg-black/40 p-2 rounded-lg">
-                                {trade.features.slice(-20).map((f, i) => (
-                                  <div key={i} className="truncate">F{i}: {f.toFixed(4)}</div>
+                                {Object.entries(trade.features).map(([name, val]) => (
+                                  <div key={name} className="truncate">{name}: {(val as number).toFixed(4)}</div>
                                 ))}
                                 <div className="col-span-full mt-1 pt-1 border-t border-white/5 text-[7px] italic opacity-50">
-                                  Showing last 20 normalized features
+                                  Showing entry features
                                 </div>
                               </div>
                             </details>
@@ -1647,6 +1819,62 @@ export default function App() {
             <h2 className="text-xl font-bold tracking-tight">4. Model Library</h2>
           </div>
 
+          {/* GitHub Config */}
+          <div className="bg-[#0D0D0E] border border-white/5 rounded-2xl p-6 shadow-xl mb-6">
+            <div className="flex items-center gap-2 mb-4">
+              <Github className="w-4 h-4 text-white/60" />
+              <h3 className="text-xs font-bold text-white/40 uppercase tracking-wider">GitHub Storage Settings</h3>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4 items-end">
+              <div className="space-y-2">
+                <label className="text-[10px] text-white/40 uppercase">Owner</label>
+                <input 
+                  type="text" 
+                  value={githubConfig.owner}
+                  onChange={(e) => setGithubConfig({ ...githubConfig, owner: e.target.value })}
+                  placeholder="github-username"
+                  className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm focus:border-blue-500/50 outline-none transition-all"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-[10px] text-white/40 uppercase">Repo</label>
+                <input 
+                  type="text" 
+                  value={githubConfig.repo}
+                  onChange={(e) => setGithubConfig({ ...githubConfig, repo: e.target.value })}
+                  placeholder="model-storage"
+                  className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm focus:border-blue-500/50 outline-none transition-all"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-[10px] text-white/40 uppercase">Path</label>
+                <input 
+                  type="text" 
+                  value={githubConfig.path}
+                  onChange={(e) => setGithubConfig({ ...githubConfig, path: e.target.value })}
+                  placeholder="models"
+                  className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm focus:border-blue-500/50 outline-none transition-all"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-[10px] text-white/40 uppercase">Token</label>
+                <input 
+                  type="password" 
+                  value={githubConfig.token}
+                  onChange={(e) => setGithubConfig({ ...githubConfig, token: e.target.value })}
+                  placeholder="ghp_..."
+                  className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm focus:border-blue-500/50 outline-none transition-all"
+                />
+              </div>
+              <button 
+                onClick={handleSaveGithubConfig}
+                className="py-2 bg-white/5 hover:bg-white/10 text-white/60 hover:text-white border border-white/10 rounded-lg text-xs font-bold transition-all"
+              >
+                Save Config
+              </button>
+            </div>
+          </div>
+
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
             {savedModels.length === 0 ? (
               <div className="col-span-full py-12 bg-[#0D0D0E] border border-white/5 rounded-2xl flex flex-col items-center justify-center text-white/20">
@@ -1660,23 +1888,63 @@ export default function App() {
                     <div className="w-10 h-10 bg-blue-500/10 rounded-xl flex items-center justify-center group-hover:bg-blue-500/20 transition-colors">
                       <Target className="w-5 h-5 text-blue-400" />
                     </div>
-                    <button 
-                      onClick={() => handleDeleteModel(pair.name)}
-                      className="p-2 hover:bg-red-500/10 text-white/20 hover:text-red-400 rounded-lg transition-all"
-                    >
-                      <ShieldAlert className="w-4 h-4" />
-                    </button>
+                    <div className="flex gap-1">
+                      <button 
+                        onClick={() => handleUploadToGitHub(pair.name)}
+                        title={pair.onGitHub ? "Update on GitHub" : "Upload to GitHub"}
+                        className={cn(
+                          "p-2 rounded-lg transition-all",
+                          pair.onGitHub 
+                            ? "hover:bg-emerald-500/10 text-emerald-400/40 hover:text-emerald-400" 
+                            : "hover:bg-blue-500/10 text-blue-400/40 hover:text-blue-400"
+                        )}
+                      >
+                        <CloudUpload className="w-4 h-4" />
+                      </button>
+                      
+                      {pair.onGitHub && (
+                        <button 
+                          onClick={() => handleDeleteFromGitHub(pair.name)}
+                          title="Delete from GitHub"
+                          className="p-2 hover:bg-red-500/10 text-red-400/40 hover:text-red-400 rounded-lg transition-all"
+                        >
+                          <CloudOff className="w-4 h-4" />
+                        </button>
+                      )}
+
+                      <button 
+                        onClick={() => handleDeleteModel(pair.name)}
+                        title="Delete Locally"
+                        className="p-2 hover:bg-red-500/10 text-white/20 hover:text-red-400 rounded-lg transition-all"
+                      >
+                        <ShieldAlert className="w-4 h-4" />
+                      </button>
+                    </div>
                   </div>
-                  <h4 className="font-bold text-white/80 mb-1 truncate">{pair.name}</h4>
+                  <div className="flex items-center gap-2 mb-1">
+                    <h4 className="font-bold text-white/80 truncate">{pair.name}</h4>
+                    {pair.onGitHub && <Github className="w-3 h-3 text-emerald-500" />}
+                  </div>
                   <p className="text-[10px] text-white/30 mb-6">Saved: {format(new Date(pair.timestamp), 'MMM dd, HH:mm')}</p>
                   
-                  <button 
-                    onClick={() => handleLoadModel(pair.name)}
-                    disabled={loading || training}
-                    className="w-full py-2 bg-blue-600/10 hover:bg-blue-600 text-blue-400 hover:text-white border border-blue-600/20 rounded-lg text-xs font-bold transition-all"
-                  >
-                    Load Model
-                  </button>
+                  <div className="flex gap-2">
+                    <button 
+                      onClick={() => handleLoadModel(pair.name)}
+                      disabled={loading || training}
+                      className="flex-1 py-2 bg-blue-600/10 hover:bg-blue-600 text-blue-400 hover:text-white border border-blue-600/20 rounded-lg text-xs font-bold transition-all"
+                    >
+                      Load Local
+                    </button>
+                    {pair.onGitHub && (
+                      <button 
+                        onClick={() => handleLoadFromGitHub(pair.name)}
+                        disabled={loading || training}
+                        className="flex-1 py-2 bg-emerald-600/10 hover:bg-emerald-600 text-emerald-400 hover:text-white border border-emerald-600/20 rounded-lg text-xs font-bold transition-all"
+                      >
+                        Load GitHub
+                      </button>
+                    )}
+                  </div>
                 </div>
               ))
             )}
@@ -1775,6 +2043,88 @@ export default function App() {
                       onChange={(e) => setSettings({...settings, trailingStopOffset: parseFloat(e.target.value) / 100})}
                       className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
                     />
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <h3 className="text-xs font-bold text-white/40 uppercase tracking-wider">Session & Candle Settings</h3>
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between p-3 bg-white/5 rounded-xl border border-white/5">
+                    <div className="space-y-0.5">
+                      <div className="text-xs font-bold text-white/80">Session Trading</div>
+                      <div className="text-[10px] text-white/30">Only enter during Asia/NY</div>
+                    </div>
+                    <button 
+                      onClick={() => setSettings({...settings, useSessionTrading: !settings.useSessionTrading})}
+                      className={cn(
+                        "w-10 h-5 rounded-full transition-all relative",
+                        settings.useSessionTrading ? "bg-blue-600" : "bg-white/10"
+                      )}
+                    >
+                      <div className={cn(
+                        "absolute top-1 w-3 h-3 rounded-full bg-white transition-all",
+                        settings.useSessionTrading ? "right-1" : "left-1"
+                      )} />
+                    </button>
+                  </div>
+
+                  {settings.useSessionTrading && (
+                    <div className="grid grid-cols-2 gap-4 animate-in fade-in slide-in-from-top-1 duration-200">
+                      <div className="space-y-1">
+                        <label className="text-[10px] text-white/30 uppercase">Asia (Start-End)</label>
+                        <div className="flex gap-2">
+                          <input 
+                            type="number" min="0" max="23"
+                            value={settings.asiaStart}
+                            onChange={(e) => setSettings({...settings, asiaStart: parseInt(e.target.value)})}
+                            className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-white/80 focus:border-blue-500/50 outline-none"
+                          />
+                          <input 
+                            type="number" min="0" max="23"
+                            value={settings.asiaEnd}
+                            onChange={(e) => setSettings({...settings, asiaEnd: parseInt(e.target.value)})}
+                            className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-white/80 focus:border-blue-500/50 outline-none"
+                          />
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-[10px] text-white/30 uppercase">NY (Start-End)</label>
+                        <div className="flex gap-2">
+                          <input 
+                            type="number" min="0" max="23"
+                            value={settings.nyStart}
+                            onChange={(e) => setSettings({...settings, nyStart: parseInt(e.target.value)})}
+                            className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-white/80 focus:border-blue-500/50 outline-none"
+                          />
+                          <input 
+                            type="number" min="0" max="23"
+                            value={settings.nyEnd}
+                            onChange={(e) => setSettings({...settings, nyEnd: parseInt(e.target.value)})}
+                            className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-white/80 focus:border-blue-500/50 outline-none"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-between p-3 bg-white/5 rounded-xl border border-white/5">
+                    <div className="space-y-0.5">
+                      <div className="text-xs font-bold text-white/80">Completed Candles Only</div>
+                      <div className="text-[10px] text-white/30">Entry only at hour start</div>
+                    </div>
+                    <button 
+                      onClick={() => setSettings({...settings, useOnlyCompletedCandles: !settings.useOnlyCompletedCandles})}
+                      className={cn(
+                        "w-10 h-5 rounded-full transition-all relative",
+                        settings.useOnlyCompletedCandles ? "bg-purple-600" : "bg-white/10"
+                      )}
+                    >
+                      <div className={cn(
+                        "absolute top-1 w-3 h-3 rounded-full bg-white transition-all",
+                        settings.useOnlyCompletedCandles ? "right-1" : "left-1"
+                      )} />
+                    </button>
                   </div>
                 </div>
               </div>
@@ -2034,7 +2384,9 @@ export default function App() {
                             exitTime: Date.now(),
                             profit,
                             profitPct: profitPct * 100,
-                            exitReason: 'MANUAL'
+                            exitReason: 'MANUAL',
+                            prediction: activeLiveTrade.prediction,
+                            features: activeLiveTrade.features
                           };
                           setLiveTrades(prev => [newTrade, ...prev]);
                           setLivePaperBalance(prev => prev + profit);
@@ -2086,6 +2438,24 @@ export default function App() {
                               <div className="text-white/70 font-medium">${trade.exitPrice.toLocaleString()}</div>
                             </div>
                           </div>
+                          
+                          {trade.features && (
+                            <div className="pt-2 border-t border-white/5 space-y-1.5">
+                              <div className="flex items-center justify-between text-[9px] text-white/30 uppercase font-bold">
+                                <span>Entry Features</span>
+                                <span className="text-blue-400">Pred: {(trade.prediction || 0).toFixed(3)}</span>
+                              </div>
+                              <div className="grid grid-cols-3 gap-x-2 gap-y-1 text-[8px] font-mono">
+                                {Object.entries(trade.features).slice(0, 9).map(([name, val]) => (
+                                  <div key={name} className="flex justify-between border-b border-white/5 pb-0.5">
+                                    <span className="text-white/20 truncate mr-1">{name}</span>
+                                    <span className="text-white/60">{(val as number).toFixed(2)}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
                           <div className="pt-2 border-t border-white/5 flex justify-between items-center">
                             <span className="text-[9px] text-white/30 italic">{format(trade.exitTime, 'MMM dd, HH:mm')}</span>
                             <span className={cn("text-[10px] font-bold", trade.profitPct >= 0 ? "text-emerald-500/70" : "text-red-500/70")}>

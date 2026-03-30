@@ -1,9 +1,11 @@
 import { GRUModel } from './modelService';
 import { logger } from './loggerService';
+import { GitHubConfig, uploadToGitHub, deleteFromGitHub, fetchFromGitHub } from './githubService';
 
 export interface ModelPair {
   name: string;
   timestamp: number;
+  onGitHub?: boolean;
 }
 
 const STORAGE_KEY = 'saved_model_pairs';
@@ -25,7 +27,7 @@ export async function saveModelPair(name: string, model1h: GRUModel, model4h: GR
     // Replace if exists
     const existingIdx = pairs.findIndex(p => p.name === name);
     if (existingIdx !== -1) {
-      pairs[existingIdx] = newPair;
+      pairs[existingIdx] = { ...pairs[existingIdx], ...newPair };
     } else {
       pairs.push(newPair);
     }
@@ -34,6 +36,88 @@ export async function saveModelPair(name: string, model1h: GRUModel, model4h: GR
     logger.success(`Model pair "${name}" saved successfully.`);
   } catch (err) {
     logger.error(`Failed to save model pair: ${err}`);
+    throw err;
+  }
+}
+
+export async function uploadModelPairToGitHub(name: string, config: GitHubConfig) {
+  try {
+    const id = name.replace(/\s+/g, '_').toLowerCase();
+    const modelConfig = { ...config, path: `${config.path}/${id}` };
+    
+    const { model1h, model4h } = await loadModelPair(name);
+
+    const artifacts1h = await model1h.getArtifacts();
+    const artifacts4h = await model4h.getArtifacts();
+
+    const metadata1h = localStorage.getItem(`model_pair_${id}_1h_metadata`);
+    const metadata4h = localStorage.getItem(`model_pair_${id}_4h_metadata`);
+
+    await uploadToGitHub(modelConfig, `1h.json`, JSON.stringify(artifacts1h), `Upload model 1h: ${name}`);
+    await uploadToGitHub(modelConfig, `4h.json`, JSON.stringify(artifacts4h), `Upload model 4h: ${name}`);
+    if (metadata1h) await uploadToGitHub(modelConfig, `1h_metadata.json`, metadata1h, `Upload metadata 1h: ${name}`);
+    if (metadata4h) await uploadToGitHub(modelConfig, `4h_metadata.json`, metadata4h, `Upload metadata 4h: ${name}`);
+
+    const pairs = getSavedModelPairs();
+    const idx = pairs.findIndex(p => p.name === name);
+    if (idx !== -1) {
+      pairs[idx].onGitHub = true;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(pairs));
+    }
+
+    logger.success(`Model pair "${name}" uploaded to GitHub.`);
+  } catch (err) {
+    logger.error(`Failed to upload model pair to GitHub: ${err}`);
+    throw err;
+  }
+}
+
+export async function deleteModelPairFromGitHub(name: string, config: GitHubConfig) {
+  try {
+    const id = name.replace(/\s+/g, '_').toLowerCase();
+    const modelConfig = { ...config, path: `${config.path}/${id}` };
+    
+    await deleteFromGitHub(modelConfig, `1h.json`, `Delete model 1h: ${name}`);
+    await deleteFromGitHub(modelConfig, `4h.json`, `Delete model 4h: ${name}`);
+    await deleteFromGitHub(modelConfig, `1h_metadata.json`, `Delete metadata 1h: ${name}`);
+    await deleteFromGitHub(modelConfig, `4h_metadata.json`, `Delete metadata 4h: ${name}`);
+
+    const pairs = getSavedModelPairs();
+    const idx = pairs.findIndex(p => p.name === name);
+    if (idx !== -1) {
+      pairs[idx].onGitHub = false;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(pairs));
+    }
+
+    logger.success(`Model pair "${name}" deleted from GitHub.`);
+  } catch (err) {
+    logger.error(`Failed to delete model pair from GitHub: ${err}`);
+    throw err;
+  }
+}
+
+export async function loadModelPairFromGitHub(name: string, config: GitHubConfig): Promise<{ model1h: GRUModel, model4h: GRUModel }> {
+  try {
+    const id = name.replace(/\s+/g, '_').toLowerCase();
+    const modelConfig = { ...config, path: `${config.path}/${id}` };
+
+    const artifacts1hStr = await fetchFromGitHub(modelConfig, `1h.json`);
+    const artifacts4hStr = await fetchFromGitHub(modelConfig, `4h.json`);
+    const metadata1hStr = await fetchFromGitHub(modelConfig, `1h_metadata.json`);
+    const metadata4hStr = await fetchFromGitHub(modelConfig, `4h_metadata.json`);
+
+    const artifacts1h = JSON.parse(artifacts1hStr);
+    const artifacts4h = JSON.parse(artifacts4hStr);
+    const metadata1h = JSON.parse(metadata1hStr);
+    const metadata4h = JSON.parse(metadata4hStr);
+
+    const model1h = await GRUModel.loadFromArtifacts(artifacts1h, metadata1h);
+    const model4h = await GRUModel.loadFromArtifacts(artifacts4h, metadata4h);
+
+    logger.success(`Model pair "${name}" loaded from GitHub.`);
+    return { model1h, model4h };
+  } catch (err) {
+    logger.error(`Failed to load model pair from GitHub: ${err}`);
     throw err;
   }
 }

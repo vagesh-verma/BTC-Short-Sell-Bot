@@ -10,7 +10,7 @@ export interface Trade {
   profitPct: number;
   exitReason: 'TIME' | 'STOP_LOSS' | 'TAKE_PROFIT' | 'TRAILING_STOP' | 'PREDICTION' | 'MANUAL';
   prediction?: number;
-  features?: number[];
+  features?: Record<string, number>;
 }
 
 export interface BacktestSettings {
@@ -24,6 +24,12 @@ export interface BacktestSettings {
   quantity: number;
   quantityType: 'USD' | 'BTC' | 'LOTS';
   onlyHighVolumeSessions?: boolean;
+  useSessionTrading?: boolean;
+  asiaStart: number;
+  asiaEnd: number;
+  nyStart: number;
+  nyEnd: number;
+  useOnlyCompletedCandles?: boolean;
 }
 
 export interface BacktestResult {
@@ -44,7 +50,8 @@ export function runBacktest(
   settings: BacktestSettings,
   initialBalance: number = 10000,
   windowSize: number = 20,
-  features?: number[][]
+  features?: number[][],
+  featureNames?: string[]
 ): BacktestResult {
   const trades: Trade[] = [];
   let balance = initialBalance;
@@ -58,7 +65,7 @@ export function runBacktest(
     highestProfitPct: number;
     trailingStopPrice: number | null;
     prediction: number;
-    features?: number[];
+    features?: Record<string, number>;
   } | null = null;
 
   for (let i = 0; i < predictions.length; i++) {
@@ -66,6 +73,8 @@ export function runBacktest(
     if (!candle) break;
     
     const prediction = predictions[i];
+    const now = new Date(candle.time);
+    const hour = now.getUTCHours();
 
     // Check for exit first if in trade
     if (activeTrade) {
@@ -150,8 +159,13 @@ export function runBacktest(
     // Check for entry if not in trade
     if (!activeTrade && prediction > settings.threshold) {
       let canTrade = true;
-      if (settings.onlyHighVolumeSessions) {
-        const hour = new Date(candle.time).getUTCHours();
+      const hour = new Date(candle.time).getUTCHours();
+
+      if (settings.useSessionTrading) {
+        const isAsia = hour >= settings.asiaStart && hour < settings.asiaEnd;
+        const isNY = hour >= settings.nyStart && hour < settings.nyEnd;
+        canTrade = isAsia || isNY;
+      } else if (settings.onlyHighVolumeSessions) {
         const isAsia = hour >= 0 && hour <= 9;
         const isLondon = hour >= 8 && hour <= 17;
         const isNY = hour >= 13 && hour <= 22;
@@ -159,13 +173,20 @@ export function runBacktest(
       }
 
       if (canTrade) {
+        const tradeFeatures: Record<string, number> = {};
+        if (features && features[i] && featureNames) {
+          featureNames.forEach((name, idx) => {
+            tradeFeatures[name] = features[i][idx];
+          });
+        }
+
         activeTrade = {
           entryPrice: candle.close,
           entryTime: candle.time,
           highestProfitPct: 0,
           trailingStopPrice: null,
           prediction: prediction,
-          features: features ? features[i] : undefined
+          features: tradeFeatures
         };
       }
     }

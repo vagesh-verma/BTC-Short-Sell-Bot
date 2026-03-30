@@ -106,6 +106,19 @@ export class GRUModel {
     }));
   }
 
+  public async getArtifacts(): Promise<tf.io.ModelArtifacts> {
+    if (!this.model) throw new Error('No model to get artifacts from');
+    let artifacts: tf.io.ModelArtifacts | null = null;
+    await this.model.save({
+      save: (art) => {
+        artifacts = art;
+        return Promise.resolve({ modelArtifactsInfo: { dateSaved: new Date(), modelTopologyType: 'JSON' } });
+      }
+    });
+    if (!artifacts) throw new Error('Failed to capture model artifacts');
+    return artifacts;
+  }
+
   public static async load(name: string): Promise<GRUModel> {
     const metadataStr = localStorage.getItem(`${name}_metadata`);
     if (!metadataStr) throw new Error('Model metadata not found');
@@ -119,6 +132,19 @@ export class GRUModel {
       gru.model = await tf.loadLayersModel(`localstorage://${name}`);
     }
     
+    gru.model.compile({
+      optimizer: tf.train.adam(0.001),
+      loss: 'binaryCrossentropy',
+      metrics: ['accuracy'],
+    });
+    return gru;
+  }
+
+  public static async loadFromArtifacts(artifacts: tf.io.ModelArtifacts, metadata: { windowSize: number, featureCount: number }): Promise<GRUModel> {
+    const gru = new GRUModel(metadata.windowSize, metadata.featureCount);
+    gru.model = await tf.loadLayersModel({
+      load: () => Promise.resolve(artifacts)
+    });
     gru.model.compile({
       optimizer: tf.train.adam(0.001),
       loss: 'binaryCrossentropy',
