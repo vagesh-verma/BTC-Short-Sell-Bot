@@ -40,7 +40,7 @@ import { GRUModel, prepareData } from './services/modelService';
 import { runBacktest, BacktestResult, Trade, BacktestSettings } from './services/backtestService';
 import { calculateEMA, calculateRSI, calculateBollingerBands, calculateMACD, calculateStochasticRSI, calculateATR, calculateEMACross, calculateOBV, calculateMFI, calculateVolatility, calculateBearishHarami, calculateMarubozu, calculateEngulfing } from './services/indicatorService';
 import { DeltaSocketService, TickerUpdate } from './services/deltaSocketService';
-import { getSavedModelPairs, saveModelPair, loadModelPair, deleteModelPair, ModelPair, uploadModelPairToGitHub, deleteModelPairFromGitHub, loadModelPairFromGitHub } from './services/storageService';
+import { getSavedModelPairs, saveModelPair, loadModelPair, deleteModelPair, ModelPair, uploadModelPairToGitHub, deleteModelPairFromGitHub, loadModelPairFromGitHub, syncModelsFromGitHub } from './services/storageService';
 import { GitHubConfig } from './services/githubService';
 
 import { Terminal } from './components/Terminal';
@@ -172,13 +172,36 @@ export default function App() {
     // Load GitHub config from localStorage if exists
     const savedConfig = localStorage.getItem('github_config');
     if (savedConfig) {
-      setGithubConfig(JSON.parse(savedConfig));
+      const config = JSON.parse(savedConfig);
+      setGithubConfig(config);
+      
+      // Auto-sync on load if config is complete
+      if (config.owner && config.repo && config.token) {
+        syncModelsFromGitHub(config).then(updated => {
+          setSavedModels(updated);
+        }).catch(err => {
+          console.error('Initial GitHub sync failed:', err);
+        });
+      }
     }
   }, []);
 
-  const handleSaveGithubConfig = () => {
+  const handleSaveGithubConfig = async () => {
     localStorage.setItem('github_config', JSON.stringify(githubConfig));
     logger.success('GitHub configuration saved.');
+    
+    if (githubConfig.owner && githubConfig.repo && githubConfig.token) {
+      try {
+        setLoading(true);
+        setStatus('Syncing models from GitHub...');
+        const updated = await syncModelsFromGitHub(githubConfig);
+        setSavedModels(updated);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setLoading(false);
+      }
+    }
   };
 
   const handleUploadToGitHub = async (name: string) => {
@@ -1866,12 +1889,36 @@ export default function App() {
                   className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm focus:border-blue-500/50 outline-none transition-all"
                 />
               </div>
-              <button 
-                onClick={handleSaveGithubConfig}
-                className="py-2 bg-white/5 hover:bg-white/10 text-white/60 hover:text-white border border-white/10 rounded-lg text-xs font-bold transition-all"
-              >
-                Save Config
-              </button>
+              <div className="flex gap-2">
+                <button 
+                  onClick={handleSaveGithubConfig}
+                  className="flex-1 py-2 bg-white/5 hover:bg-white/10 text-white/60 hover:text-white border border-white/10 rounded-lg text-xs font-bold transition-all"
+                >
+                  Save & Sync
+                </button>
+                <button 
+                  onClick={async () => {
+                    if (githubConfig.owner && githubConfig.repo && githubConfig.token) {
+                      try {
+                        setLoading(true);
+                        setStatus('Syncing models from GitHub...');
+                        const updated = await syncModelsFromGitHub(githubConfig);
+                        setSavedModels(updated);
+                      } catch (err) {
+                        console.error(err);
+                      } finally {
+                        setLoading(false);
+                      }
+                    } else {
+                      logger.error('Please configure GitHub settings first.');
+                    }
+                  }}
+                  className="p-2 bg-white/5 hover:bg-white/10 text-white/60 hover:text-white border border-white/10 rounded-lg transition-all"
+                  title="Sync Models"
+                >
+                  <RefreshCw className={cn("w-4 h-4", loading && status.includes('Syncing') && "animate-spin")} />
+                </button>
+              </div>
             </div>
           </div>
 

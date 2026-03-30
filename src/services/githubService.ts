@@ -129,3 +129,28 @@ export async function fetchFromGitHub(config: GitHubConfig, fileName: string): P
     throw err;
   }
 }
+
+export async function listFromGitHub(config: GitHubConfig): Promise<any[]> {
+  const { owner, repo, path, token } = config;
+  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        'Authorization': `token ${token}`,
+        'Accept': 'application/vnd.github.v3+json'
+      }
+    });
+
+    if (!response.ok) {
+      if (response.status === 404) return [];
+      const errorData = await response.json();
+      throw new Error(errorData.message || `Failed to list ${path} from GitHub`);
+    }
+
+    return await response.json();
+  } catch (err) {
+    logger.error(`GitHub list error: ${err}`);
+    throw err;
+  }
+}

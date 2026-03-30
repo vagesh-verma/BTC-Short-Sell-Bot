@@ -1,6 +1,6 @@
 import { GRUModel } from './modelService';
 import { logger } from './loggerService';
-import { GitHubConfig, uploadToGitHub, deleteFromGitHub, fetchFromGitHub } from './githubService';
+import { GitHubConfig, uploadToGitHub, deleteFromGitHub, fetchFromGitHub, listFromGitHub } from './githubService';
 
 export interface ModelPair {
   name: string;
@@ -13,6 +13,40 @@ const STORAGE_KEY = 'saved_model_pairs';
 export function getSavedModelPairs(): ModelPair[] {
   const saved = localStorage.getItem(STORAGE_KEY);
   return saved ? JSON.parse(saved) : [];
+}
+
+export async function syncModelsFromGitHub(config: GitHubConfig): Promise<ModelPair[]> {
+  try {
+    const contents = await listFromGitHub(config);
+    const githubDirs = contents.filter(item => item.type === 'dir');
+    
+    const localPairs = getSavedModelPairs();
+    const updatedPairs = [...localPairs];
+
+    for (const dir of githubDirs) {
+      const id = dir.name;
+      // Check if this ID matches any local pair
+      const existingIdx = updatedPairs.findIndex(p => p.name.replace(/\s+/g, '_').toLowerCase() === id);
+      
+      if (existingIdx !== -1) {
+        updatedPairs[existingIdx].onGitHub = true;
+      } else {
+        // Create a new entry for the GitHub-only model
+        updatedPairs.push({
+          name: id.split('_').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' '),
+          timestamp: Date.now(), // We don't know the original timestamp easily
+          onGitHub: true
+        });
+      }
+    }
+
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(updatedPairs));
+    logger.success(`Synced ${githubDirs.length} models from GitHub.`);
+    return updatedPairs;
+  } catch (err) {
+    logger.error(`Failed to sync models from GitHub: ${err}`);
+    throw err;
+  }
 }
 
 export async function saveModelPair(name: string, model1h: GRUModel, model4h: GRUModel) {
