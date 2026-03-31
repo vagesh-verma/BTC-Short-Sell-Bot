@@ -7,23 +7,50 @@ export interface GitHubConfig {
   token: string;
 }
 
+function buildUrl(owner: string, repo: string, path: string, fileName?: string): string {
+  const cleanOwner = encodeURIComponent(owner.trim());
+  const cleanRepo = encodeURIComponent(repo.trim());
+  
+  // Split path into segments and encode each, but preserve '+' as requested by the user.
+  // We don't use decodeURIComponent here because it can convert '+' to ' ' in some contexts,
+  // and we want to be very explicit about what we encode.
+  const segments = path.split('/').filter(Boolean);
+  if (fileName) {
+    segments.push(fileName);
+  }
+  
+  const encodedPath = segments.map(s => {
+    // Encode everything but preserve '+'
+    return encodeURIComponent(s).replace(/%2B/g, '+');
+  }).join('/');
+  
+  const url = `https://api.github.com/repos/${cleanOwner}/${cleanRepo}/contents${encodedPath ? '/' + encodedPath : ''}`;
+  return url;
+}
+
+const GITHUB_HEADERS = (token: string) => ({
+  'Authorization': `token ${token}`,
+  'Accept': 'application/vnd.github.v3+json',
+  'X-GitHub-Api-Version': '2022-11-28' // Standard stable version, or use the one from docs if needed
+});
+
 export async function uploadToGitHub(config: GitHubConfig, fileName: string, content: string, message: string) {
   const { owner, repo, path, token } = config;
-  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}/${fileName}`;
+  const url = buildUrl(owner, repo, path, fileName);
 
   try {
     // Check if file exists to get its SHA (required for updates)
     let sha: string | undefined;
     const getResponse = await fetch(url, {
-      headers: {
-        'Authorization': `token ${token}`,
-        'Accept': 'application/vnd.github.v3+json'
-      }
+      headers: GITHUB_HEADERS(token)
     });
 
     if (getResponse.ok) {
       const data = await getResponse.json();
       sha = data.sha;
+    } else if (getResponse.status === 404) {
+      // 404 on GET is fine, it just means the file doesn't exist yet.
+      // However, if the repo doesn't exist, the subsequent PUT will fail with 404 too.
     }
 
     const body = {
@@ -35,8 +62,7 @@ export async function uploadToGitHub(config: GitHubConfig, fileName: string, con
     const putResponse = await fetch(url, {
       method: 'PUT',
       headers: {
-        'Authorization': `token ${token}`,
-        'Accept': 'application/vnd.github.v3+json',
+        ...GITHUB_HEADERS(token),
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(body)
@@ -44,7 +70,11 @@ export async function uploadToGitHub(config: GitHubConfig, fileName: string, con
 
     if (!putResponse.ok) {
       const errorData = await putResponse.json();
-      throw new Error(errorData.message || 'Failed to upload to GitHub');
+      const errorMsg = errorData.message || 'Failed to upload to GitHub';
+      if (putResponse.status === 404) {
+        throw new Error(`GitHub Repository or Path not found. Please check your Owner ("${owner}") and Repo ("${repo}") settings. (Error: ${errorMsg})`);
+      }
+      throw new Error(errorMsg);
     }
 
     logger.success(`Successfully uploaded ${fileName} to GitHub.`);
@@ -56,15 +86,12 @@ export async function uploadToGitHub(config: GitHubConfig, fileName: string, con
 
 export async function deleteFromGitHub(config: GitHubConfig, fileName: string, message: string) {
   const { owner, repo, path, token } = config;
-  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}/${fileName}`;
+  const url = buildUrl(owner, repo, path, fileName);
 
   try {
     // Must get SHA first
     const getResponse = await fetch(url, {
-      headers: {
-        'Authorization': `token ${token}`,
-        'Accept': 'application/vnd.github.v3+json'
-      }
+      headers: GITHUB_HEADERS(token)
     });
 
     if (!getResponse.ok) {
@@ -82,8 +109,7 @@ export async function deleteFromGitHub(config: GitHubConfig, fileName: string, m
     const deleteResponse = await fetch(url, {
       method: 'DELETE',
       headers: {
-        'Authorization': `token ${token}`,
-        'Accept': 'application/vnd.github.v3+json',
+        ...GITHUB_HEADERS(token),
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
@@ -106,19 +132,21 @@ export async function deleteFromGitHub(config: GitHubConfig, fileName: string, m
 
 export async function fetchFromGitHub(config: GitHubConfig, fileName: string): Promise<string> {
   const { owner, repo, path, token } = config;
-  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}/${fileName}`;
+  const url = buildUrl(owner, repo, path, fileName);
+  logger.info(`Fetching from GitHub: ${url}`);
 
   try {
     const response = await fetch(url, {
-      headers: {
-        'Authorization': `token ${token}`,
-        'Accept': 'application/vnd.github.v3+json'
-      }
+      headers: GITHUB_HEADERS(token)
     });
 
     if (!response.ok) {
       const errorData = await response.json();
-      throw new Error(errorData.message || `Failed to fetch ${fileName} from GitHub`);
+      const errorMsg = errorData.message || `Failed to fetch ${fileName}`;
+      if (response.status === 404) {
+        throw new Error(`File "${fileName}" not found in GitHub path "${path}". (Error: ${errorMsg})`);
+      }
+      throw new Error(errorMsg);
     }
 
     const data = await response.json();
@@ -132,18 +160,20 @@ export async function fetchFromGitHub(config: GitHubConfig, fileName: string): P
 
 export async function listFromGitHub(config: GitHubConfig): Promise<any[]> {
   const { owner, repo, path, token } = config;
-  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+  const url = buildUrl(owner, repo, path);
 
   try {
     const response = await fetch(url, {
-      headers: {
-        'Authorization': `token ${token}`,
-        'Accept': 'application/vnd.github.v3+json'
-      }
+      headers: GITHUB_HEADERS(token)
     });
 
     if (!response.ok) {
-      if (response.status === 404) return [];
+      if (response.status === 404) {
+        // If it's a 404, it could be that the path doesn't exist yet, OR the repo is wrong.
+        // We'll return an empty array but log a warning if it might be a repo issue.
+        logger.info(`GitHub path "${path}" not found or repository "${owner}/${repo}" is inaccessible.`);
+        return [];
+      }
       const errorData = await response.json();
       throw new Error(errorData.message || `Failed to list ${path} from GitHub`);
     }

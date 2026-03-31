@@ -12,6 +12,7 @@ import {
 } from 'recharts';
 import { 
   TrendingDown, 
+  Trash2,
   Activity, 
   BarChart3, 
   Play, 
@@ -71,6 +72,7 @@ export default function App() {
   const [trainingStats4h, setTrainingStats4h] = useState<{total: number, positive: number, negative: number} | null>(null);
   const [predictions, setPredictions] = useState<number[]>([]);
   const [predictionStats, setPredictionStats] = useState<{total: number, aboveThreshold: number} | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<{ name: string, type: 'local' | 'github' | 'complete' } | null>(null);
   
   const model1hRef = useRef<GRUModel | null>(null);
   const model4hRef = useRef<GRUModel | null>(null);
@@ -226,17 +228,20 @@ export default function App() {
       logger.error('Please configure GitHub settings first.');
       return;
     }
-    if (window.confirm(`Are you sure you want to delete model "${name}" from GitHub?`)) {
-      try {
-        setLoading(true);
-        setStatus(`Deleting "${name}" from GitHub...`);
-        await deleteModelPairFromGitHub(name, githubConfig);
-        setSavedModels(getSavedModelPairs());
-      } catch (err) {
-        console.error(err);
-      } finally {
-        setLoading(false);
-      }
+    setConfirmDelete({ name, type: 'github' });
+  };
+
+  const executeDeleteFromGitHub = async (name: string) => {
+    try {
+      setLoading(true);
+      setStatus(`Deleting "${name}" from GitHub...`);
+      await deleteModelPairFromGitHub(name, githubConfig);
+      setSavedModels(getSavedModelPairs());
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+      setConfirmDelete(null);
     }
   };
 
@@ -729,11 +734,41 @@ export default function App() {
   };
 
   const handleDeleteModel = async (name: string) => {
-    // Note: confirm() is used here but discouraged in iframe environments.
-    // Keeping it for now as the app seems to rely on it, but making it async.
-    if (window.confirm(`Are you sure you want to delete model "${name}"?`)) {
+    setConfirmDelete({ name, type: 'local' });
+  };
+
+  const executeDeleteModel = async (name: string) => {
+    await deleteModelPair(name);
+    setSavedModels(getSavedModelPairs());
+    setConfirmDelete(null);
+  };
+
+  const handleDeleteCompletely = async (name: string) => {
+    setConfirmDelete({ name, type: 'complete' });
+  };
+
+  const executeDeleteCompletely = async (name: string) => {
+    const pair = savedModels.find(p => p.name === name);
+    if (!pair) return;
+
+    try {
+      setLoading(true);
+      if (pair.onGitHub) {
+        setStatus(`Deleting "${name}" from GitHub...`);
+        await deleteModelPairFromGitHub(name, githubConfig);
+      }
+      
+      setStatus(`Deleting "${name}" locally...`);
       await deleteModelPair(name);
+      
       setSavedModels(getSavedModelPairs());
+      logger.success(`Model "${name}" deleted completely.`);
+    } catch (err) {
+      console.error(err);
+      logger.error(`Failed to delete model completely: ${err}`);
+    } finally {
+      setLoading(false);
+      setConfirmDelete(null);
     }
   };
 
@@ -1282,6 +1317,40 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-black text-white font-sans selection:bg-emerald-500/30">
+      {/* Confirmation Modal */}
+      {confirmDelete && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="bg-[#0D0D0E] border border-white/10 rounded-2xl p-6 max-w-md w-full shadow-2xl">
+            <div className="flex items-center gap-3 mb-4 text-red-400">
+              <ShieldAlert className="w-6 h-6" />
+              <h3 className="text-xl font-bold">Confirm Deletion</h3>
+            </div>
+            <p className="text-white/60 mb-6">
+              {confirmDelete.type === 'github' && `Are you sure you want to delete model "${confirmDelete.name}" from GitHub?`}
+              {confirmDelete.type === 'local' && `Are you sure you want to delete model "${confirmDelete.name}" locally?`}
+              {confirmDelete.type === 'complete' && `Are you sure you want to delete model "${confirmDelete.name}" COMPLETELY from both Local and GitHub?`}
+            </p>
+            <div className="flex gap-3">
+              <button 
+                onClick={() => setConfirmDelete(null)}
+                className="flex-1 py-3 bg-white/5 hover:bg-white/10 text-white font-bold rounded-xl transition-all"
+              >
+                Cancel
+              </button>
+              <button 
+                onClick={() => {
+                  if (confirmDelete.type === 'github') executeDeleteFromGitHub(confirmDelete.name);
+                  else if (confirmDelete.type === 'local') executeDeleteModel(confirmDelete.name);
+                  else if (confirmDelete.type === 'complete') executeDeleteCompletely(confirmDelete.name);
+                }}
+                className="flex-1 py-3 bg-red-600 hover:bg-red-500 text-white font-bold rounded-xl transition-all"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {/* Server Status Bar */}
       {serverStatus && (
         <div className="bg-white/5 border-b border-white/5 px-6 py-2 flex flex-wrap items-center gap-6 text-[10px] uppercase tracking-widest font-bold text-white/40">
@@ -1965,6 +2034,14 @@ export default function App() {
                         className="p-2 hover:bg-red-500/10 text-white/20 hover:text-red-400 rounded-lg transition-all"
                       >
                         <ShieldAlert className="w-4 h-4" />
+                      </button>
+
+                      <button 
+                        onClick={() => handleDeleteCompletely(pair.name)}
+                        title="Delete Completely (Local + GitHub)"
+                        className="p-2 hover:bg-red-600/20 text-red-500/40 hover:text-red-500 rounded-lg transition-all"
+                      >
+                        <Trash2 className="w-4 h-4" />
                       </button>
                     </div>
                   </div>
