@@ -187,8 +187,19 @@ async function logServerInfo() {
 }
 
 async function startServer() {
-  await logServerInfo();
-  await fetchProducts();
+  // Start listening immediately to satisfy Cloud Run startup probes
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+
+  // Perform initialization tasks
+  try {
+    await logServerInfo();
+    await fetchProducts();
+  } catch (err) {
+    console.error("[Server] Initialization failed:", err);
+  }
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -202,10 +213,6 @@ async function startServer() {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
-
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
 }
 
 startServer();
