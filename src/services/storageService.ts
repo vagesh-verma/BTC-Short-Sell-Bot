@@ -245,8 +245,8 @@ export async function loadModelPairFromGitHub(name: string, config: GitHubConfig
       const metadata1h = JSON.parse(metadata1hStr);
       const metadata4h = JSON.parse(metadata4hStr);
 
-      const model1h = await GRUModel.loadFromArtifacts(artifacts1h, metadata1h);
-      const model4h = await GRUModel.loadFromArtifacts(artifacts4h, metadata4h);
+      const model1h = await GRUModel.loadFromArtifacts(artifacts1h, metadata1h, `model_pair_${id}_1h`);
+      const model4h = await GRUModel.loadFromArtifacts(artifacts4h, metadata4h, `model_pair_${id}_4h`);
 
       logger.success(`Model pair "${name}" loaded from GitHub (Subfolder).`);
       return { model1h, model4h };
@@ -266,8 +266,8 @@ export async function loadModelPairFromGitHub(name: string, config: GitHubConfig
         const metadata1h = JSON.parse(metadata1hStr);
         const metadata4h = JSON.parse(metadata4hStr);
 
-        const model1h = await GRUModel.loadFromArtifacts(artifacts1h, metadata1h);
-        const model4h = await GRUModel.loadFromArtifacts(artifacts4h, metadata4h);
+        const model1h = await GRUModel.loadFromArtifacts(artifacts1h, metadata1h, `model_pair_${id}_1h`);
+        const model4h = await GRUModel.loadFromArtifacts(artifacts4h, metadata4h, `model_pair_${id}_4h`);
 
         logger.success(`Model pair "${name}" loaded from GitHub (Direct Path).`);
         return { model1h, model4h };
@@ -286,8 +286,8 @@ export async function loadModelPairFromGitHub(name: string, config: GitHubConfig
         const metadata1h = JSON.parse(metadata1hStr);
         const metadata4h = JSON.parse(metadata4hStr);
 
-        const model1h = await GRUModel.loadFromArtifacts(artifacts1h, metadata1h);
-        const model4h = await GRUModel.loadFromArtifacts(artifacts4h, metadata4h);
+        const model1h = await GRUModel.loadFromArtifacts(artifacts1h, metadata1h, `model_pair_${id}_1h`);
+        const model4h = await GRUModel.loadFromArtifacts(artifacts4h, metadata4h, `model_pair_${id}_4h`);
 
         logger.success(`Model pair "${name}" loaded from GitHub (Flat).`);
         return { model1h, model4h };

@@ -5,10 +5,12 @@ export class GRUModel {
   private model: tf.LayersModel | null = null;
   private windowSize: number;
   private featureCount: number;
+  public name: string = 'unnamed';
 
-  constructor(windowSize: number = 20, featureCount: number = 12) {
+  constructor(windowSize: number = 20, featureCount: number = 12, name: string = 'unnamed') {
     this.windowSize = windowSize;
     this.featureCount = featureCount;
+    this.name = name;
   }
 
   public async buildModel(
@@ -124,7 +126,7 @@ export class GRUModel {
     if (!metadataStr) throw new Error('Model metadata not found');
     const metadata = JSON.parse(metadataStr);
     
-    const gru = new GRUModel(metadata.windowSize, metadata.featureCount);
+    const gru = new GRUModel(metadata.windowSize, metadata.featureCount, name);
     try {
       gru.model = await tf.loadLayersModel(`indexeddb://${name}`);
     } catch (err) {
@@ -140,8 +142,8 @@ export class GRUModel {
     return gru;
   }
 
-  public static async loadFromArtifacts(artifacts: tf.io.ModelArtifacts, metadata: { windowSize: number, featureCount: number }): Promise<GRUModel> {
-    const gru = new GRUModel(metadata.windowSize, metadata.featureCount);
+  public static async loadFromArtifacts(artifacts: tf.io.ModelArtifacts, metadata: { windowSize: number, featureCount: number }, name: string = 'unnamed'): Promise<GRUModel> {
+    const gru = new GRUModel(metadata.windowSize, metadata.featureCount, name);
     gru.model = await tf.loadLayersModel({
       load: () => Promise.resolve(artifacts)
     });

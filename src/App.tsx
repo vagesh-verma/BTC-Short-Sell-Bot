@@ -304,8 +304,25 @@ export default function App() {
       const model1hArtifacts = await model1hRef.current.getArtifacts();
       const model4hArtifacts = await model4hRef.current.getArtifacts();
       
-      const metadata1h = JSON.parse(localStorage.getItem(`${model1hRef.current['name']}_metadata`) || '{"windowSize":20,"featureCount":23}');
-      const metadata4h = JSON.parse(localStorage.getItem(`${model4hRef.current['name']}_metadata`) || '{"windowSize":20,"featureCount":22}');
+      // Convert ArrayBuffer to Base64 for JSON serialization
+      const arrayBufferToBase64 = (buffer: ArrayBuffer) => {
+        const bytes = new Uint8Array(buffer);
+        let binary = '';
+        for (let i = 0; i < bytes.byteLength; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        return window.btoa(binary);
+      };
+
+      if (model1hArtifacts.weightData instanceof ArrayBuffer) {
+        (model1hArtifacts as any).weightData = arrayBufferToBase64(model1hArtifacts.weightData);
+      }
+      if (model4hArtifacts.weightData instanceof ArrayBuffer) {
+        (model4hArtifacts as any).weightData = arrayBufferToBase64(model4hArtifacts.weightData);
+      }
+
+      const metadata1h = JSON.parse(localStorage.getItem(`${model1hRef.current.name}_metadata`) || '{"windowSize":20,"featureCount":23}');
+      const metadata4h = JSON.parse(localStorage.getItem(`${model4hRef.current.name}_metadata`) || '{"windowSize":20,"featureCount":22}');
 
       const res = await fetch('/api/trading/sync-model', {
         method: 'POST',
@@ -1092,7 +1109,8 @@ export default function App() {
         harami4h, marubozu4h, engulfing4h
       );
       setTrainingStats4h(data4h.stats);
-      const model4h = new GRUModel(windowSize, 22); // Updated feature count (19 + 3)
+      const model4h = new GRUModel(windowSize, 22, 'temp_4h'); // Updated feature count (19 + 3)
+      localStorage.setItem('temp_4h_metadata', JSON.stringify({ windowSize, featureCount: 22 }));
       await model4h.buildModel(modelHyperparams.units, modelHyperparams.dropout, modelHyperparams.learningRate);
       
       await model4h.train(data4h.xs, data4h.ys, epochs, modelHyperparams.units, modelHyperparams.dropout, modelHyperparams.learningRate, (epoch, logs) => {
@@ -1224,7 +1242,8 @@ export default function App() {
       setTrainingStats1h(data1h.stats);
       
       const featureCount1h = 23; // Updated feature count (20 + 3)
-      const model1h = new GRUModel(windowSize, featureCount1h);
+      const model1h = new GRUModel(windowSize, featureCount1h, 'temp_1h');
+      localStorage.setItem('temp_1h_metadata', JSON.stringify({ windowSize, featureCount: featureCount1h }));
       setStatus(`Building Deep GRU Architecture (${featureCount1h} Features)...`);
       await model1h.buildModel(modelHyperparams.units, modelHyperparams.dropout, modelHyperparams.learningRate);
       

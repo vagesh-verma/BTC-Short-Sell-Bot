@@ -25,6 +25,13 @@ export class GRUModel {
 
   public static async loadFromArtifacts(artifacts: any, metadata: { windowSize: number, featureCount: number }): Promise<GRUModel> {
     const gru = new GRUModel(metadata.windowSize, metadata.featureCount);
+    
+    // If weightData is a string (base64 from client), convert it back to ArrayBuffer
+    if (typeof artifacts.weightData === 'string') {
+      const buffer = Buffer.from(artifacts.weightData, 'base64');
+      artifacts.weightData = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+    }
+
     gru.model = await tf.loadLayersModel({
       load: () => Promise.resolve(artifacts)
     });
