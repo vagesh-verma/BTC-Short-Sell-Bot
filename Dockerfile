@@ -36,11 +36,11 @@ COPY --from=builder /app/src ./src
 RUN npm install -g tsx
 
 # Expose the port the app runs on
-EXPOSE 3000
+EXPOSE 8080
 
 # Set environment variables
 ENV NODE_ENV=production
-ENV PORT=3000
+ENV PORT=8080
 
 # Command to run the application
 CMD ["tsx", "server.ts"]
