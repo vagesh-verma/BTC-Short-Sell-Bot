@@ -7,7 +7,7 @@ WORKDIR /app
 # Copy package.json and package-lock.json
 COPY package*.json ./
 
-# Install dependencies
+# Install all dependencies (including devDependencies for build)
 RUN npm install
 
 # Copy the rest of the application code
@@ -29,6 +29,8 @@ RUN npm install --production
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server.ts ./
 COPY --from=builder /app/tsconfig.json ./
+# Copy src for tsx to work correctly if it references any src files
+COPY --from=builder /app/src ./src
 
 # Install tsx to run the server
 RUN npm install -g tsx
