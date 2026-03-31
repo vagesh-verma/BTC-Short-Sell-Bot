@@ -4,13 +4,44 @@ import path from "path";
 import crypto from "crypto";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
+import { tradingService } from "./server/tradingService";
+import { GRUModel } from "./server/modelService";
 
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+
+// Trading API Endpoints
+app.post("/api/trading/start", async (req, res) => {
+  const { settings, isReal } = req.body;
+  await tradingService.start(settings, isReal);
+  res.json({ success: true });
+});
+
+app.post("/api/trading/stop", (req, res) => {
+  tradingService.stop();
+  res.json({ success: true });
+});
+
+app.get("/api/trading/status", (req, res) => {
+  res.json(tradingService.getStatus());
+});
+
+app.post("/api/trading/sync-model", async (req, res) => {
+  try {
+    const { model1hArtifacts, model4hArtifacts, metadata1h, metadata4h } = req.body;
+    const model1h = await GRUModel.loadFromArtifacts(model1hArtifacts, metadata1h);
+    const model4h = await GRUModel.loadFromArtifacts(model4hArtifacts, metadata4h);
+    tradingService.setModels(model1h, model4h);
+    res.json({ success: true });
+  } catch (err: any) {
+    console.error("Model sync failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 const DELTA_BASE_URL = "https://api.india.delta.exchange";
 let productMap: Record<string, number> = { 'BTCUSD': 1 };

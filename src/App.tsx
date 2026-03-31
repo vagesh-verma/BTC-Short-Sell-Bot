@@ -122,6 +122,8 @@ export default function App() {
 
   const [isLiveMode, setIsLiveMode] = useState(false);
   const [isRealTrading, setIsRealTrading] = useState(false);
+  const [serverTradingStatus, setServerTradingStatus] = useState<any>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [livePrice, setLivePrice] = useState<number | null>(null);
   const [lastLiveUpdate, setLastLiveUpdate] = useState<Date | null>(null);
   const [livePaperBalance, setLivePaperBalance] = useState(10000);
@@ -267,35 +269,99 @@ export default function App() {
   };
 
   useEffect(() => {
-    const fetchServerStatus = async () => {
+    let interval: NodeJS.Timeout;
+    const fetchStatus = async () => {
       try {
-        const res = await fetch('/api/status');
+        const res = await fetch('/api/trading/status');
         if (res.ok) {
           const data = await res.json();
-          setServerStatus(data);
+          setServerTradingStatus(data);
+          setIsLiveMode(data.isRunning);
+          setIsRealTrading(data.isRealTrading);
+          if (data.lastPrice) setLivePrice(data.lastPrice);
+          if (data.lastUpdate) setLastLiveUpdate(new Date(data.lastUpdate));
         }
       } catch (e) {
-        console.error('Failed to fetch server status');
+        console.error('Failed to fetch trading status');
       }
     };
-    fetchServerStatus();
+
+    fetchStatus();
+    interval = setInterval(fetchStatus, 5000);
+    return () => clearInterval(interval);
   }, []);
+
+  const syncModelToServer = async () => {
+    if (!model1hRef.current || !model4hRef.current) {
+      logger.error('No models loaded to sync.');
+      return;
+    }
+
+    try {
+      setIsSyncing(true);
+      setStatus('Syncing models to server...');
+      
+      const model1hArtifacts = await model1hRef.current.getArtifacts();
+      const model4hArtifacts = await model4hRef.current.getArtifacts();
+      
+      const metadata1h = JSON.parse(localStorage.getItem(`${model1hRef.current['name']}_metadata`) || '{"windowSize":20,"featureCount":23}');
+      const metadata4h = JSON.parse(localStorage.getItem(`${model4hRef.current['name']}_metadata`) || '{"windowSize":20,"featureCount":22}');
+
+      const res = await fetch('/api/trading/sync-model', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model1hArtifacts,
+          model4hArtifacts,
+          metadata1h,
+          metadata4h
+        })
+      });
+
+      if (res.ok) {
+        logger.success('Models synced to server successfully!');
+      } else {
+        const data = await res.json();
+        logger.error(`Sync failed: ${data.error}`);
+      }
+    } catch (err) {
+      console.error(err);
+      logger.error('Error syncing models to server.');
+    } finally {
+      setIsSyncing(false);
+      setStatus('Ready');
+    }
+  };
+
+  const toggleServerTrading = async () => {
+    try {
+      if (isLiveMode) {
+        await fetch('/api/trading/stop', { method: 'POST' });
+        logger.info('Server-side trading stopped.');
+      } else {
+        if (!serverTradingStatus?.hasModels) {
+          logger.error('Please sync models to server first.');
+          return;
+        }
+        await fetch('/api/trading/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ settings, isReal: isRealTrading })
+        });
+        logger.success('Server-side trading started!');
+      }
+    } catch (err) {
+      logger.error('Failed to toggle server trading.');
+    }
+  };
 
   useEffect(() => {
     loadData();
   }, [trainingRange]);
 
   useEffect(() => {
-    if (isLiveMode && model1hRef.current && model4hRef.current) {
-      const socket = new DeltaSocketService('BTCUSD', (update: TickerUpdate) => {
-        setLivePrice(update.price);
-        if (processLiveUpdateRef.current) {
-          processLiveUpdateRef.current(update.price);
-        }
-      });
-      socket.connect();
-      return () => socket.disconnect();
-    }
+    // Server-side trading handles the WebSocket and predictions
+    return;
   }, [isLiveMode]);
 
   useEffect(() => {
@@ -1383,7 +1449,21 @@ export default function App() {
           
           <div className="flex items-center gap-4">
             <button
-              onClick={() => setIsLiveMode(!isLiveMode)}
+              onClick={syncModelToServer}
+              disabled={!model1hRef.current || isSyncing}
+              className={cn(
+                "flex items-center gap-2 px-4 py-2 rounded-full border transition-all font-bold text-[10px] uppercase tracking-widest",
+                serverTradingStatus?.hasModels
+                  ? "bg-blue-500/20 border-blue-500/50 text-blue-400"
+                  : "bg-white/5 border-white/10 text-white/40 hover:border-white/20"
+              )}
+            >
+              <CloudUpload className={cn("w-3 h-3", isSyncing && "animate-bounce")} />
+              {isSyncing ? 'Syncing...' : (serverTradingStatus?.hasModels ? 'Models Synced' : 'Sync to Server')}
+            </button>
+
+            <button
+              onClick={toggleServerTrading}
               disabled={!model1hRef.current}
               className={cn(
                 "flex items-center gap-2 px-4 py-2 rounded-full border transition-all font-bold text-[10px] uppercase tracking-widest",
@@ -2617,7 +2697,7 @@ export default function App() {
           background: rgba(255, 255, 255, 0.2);
         }
       `}} />
-      <Terminal />
+      <Terminal serverLogs={serverTradingStatus?.logs} />
     </div>
   );
 }

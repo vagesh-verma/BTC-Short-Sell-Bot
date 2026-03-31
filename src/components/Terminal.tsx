@@ -2,7 +2,11 @@ import React, { useEffect, useState, useRef } from 'react';
 import { logger } from '../services/loggerService';
 import { Terminal as TerminalIcon, X, Trash2, ChevronDown, ChevronUp } from 'lucide-react';
 
-export const Terminal: React.FC = () => {
+interface TerminalProps {
+  serverLogs?: { timestamp: number; type: string; message: string }[];
+}
+
+export const Terminal: React.FC<TerminalProps> = ({ serverLogs = [] }) => {
   const [logs, setLogs] = useState(logger.getLogs());
   const [isOpen, setIsOpen] = useState(true);
   const [isMinimized, setIsMinimized] = useState(false);
@@ -15,11 +19,13 @@ export const Terminal: React.FC = () => {
     return unsubscribe;
   }, []);
 
+  const allLogs = [...logs, ...serverLogs].sort((a, b) => a.timestamp - b.timestamp);
+
   useEffect(() => {
     if (scrollRef.current && !isMinimized) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [logs, isMinimized]);
+  }, [allLogs, isMinimized]);
 
   if (!isOpen) return null;
 
@@ -60,10 +66,10 @@ export const Terminal: React.FC = () => {
           ref={scrollRef}
           className="flex-1 overflow-y-auto p-4 font-mono text-[11px] space-y-1.5 scrollbar-thin scrollbar-thumb-white/10"
         >
-          {logs.length === 0 ? (
+          {allLogs.length === 0 ? (
             <div className="text-white/20 italic text-center py-10">No activity logged yet...</div>
           ) : (
-            logs.map((log, i) => (
+            allLogs.map((log, i) => (
               <div key={i} className="flex gap-2 animate-in fade-in slide-in-from-left-1 duration-300">
                 <span className="text-white/20 shrink-0">[{new Date(log.timestamp).toLocaleTimeString([], { hour12: false })}]</span>
                 <span className={
