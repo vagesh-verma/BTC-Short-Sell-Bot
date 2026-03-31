@@ -120,8 +120,9 @@ export default function App() {
     useOnlyCompletedCandles: false,
   });
 
-  const [isLiveMode, setIsLiveMode] = useState(false);
   const [isRealTrading, setIsRealTrading] = useState(false);
+  const [isLiveMode, setIsLiveMode] = useState(false);
+  const [isTogglingTrading, setIsTogglingTrading] = useState(false);
   const [serverTradingStatus, setServerTradingStatus] = useState<any>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [livePrice, setLivePrice] = useState<number | null>(null);
@@ -286,27 +287,31 @@ export default function App() {
     fetchServerStatus();
   }, []);
 
+  const fetchStatus = async () => {
+    try {
+      const res = await fetch('/api/trading/status');
+      if (res.ok) {
+        const data = await res.json();
+        setServerTradingStatus(data);
+        setIsLiveMode(data.isRunning);
+        // Only sync isRealTrading from server if the bot is actually running
+        // This prevents the UI from resetting to "Paper Only" while the bot is stopped
+        if (data.isRunning) {
+          setIsRealTrading(data.isRealTrading);
+        }
+        if (data.lastPrice) setLivePrice(data.lastPrice);
+        if (data.lastPrediction !== null) setLivePrediction(data.lastPrediction);
+        if (data.lastParams) setLiveParams(data.lastParams);
+        if (data.lastUpdate) setLastLiveUpdate(new Date(data.lastUpdate));
+        if (data.closedTrades) setLiveTrades(data.closedTrades);
+      }
+    } catch (e) {
+      console.error('Failed to fetch trading status');
+    }
+  };
+
   useEffect(() => {
     let interval: NodeJS.Timeout;
-    const fetchStatus = async () => {
-      try {
-        const res = await fetch('/api/trading/status');
-        if (res.ok) {
-          const data = await res.json();
-          setServerTradingStatus(data);
-          setIsLiveMode(data.isRunning);
-          setIsRealTrading(data.isRealTrading);
-          if (data.lastPrice) setLivePrice(data.lastPrice);
-          if (data.lastPrediction !== null) setLivePrediction(data.lastPrediction);
-          if (data.lastParams) setLiveParams(data.lastParams);
-          if (data.lastUpdate) setLastLiveUpdate(new Date(data.lastUpdate));
-          if (data.closedTrades) setLiveTrades(data.closedTrades);
-        }
-      } catch (e) {
-        console.error('Failed to fetch trading status');
-      }
-    };
-
     fetchStatus();
     interval = setInterval(fetchStatus, 5000);
     return () => clearInterval(interval);
@@ -372,7 +377,9 @@ export default function App() {
   };
 
   const toggleServerTrading = async () => {
+    if (isTogglingTrading) return;
     try {
+      setIsTogglingTrading(true);
       if (isLiveMode) {
         await fetch('/api/trading/stop', { method: 'POST' });
         logger.info('Server-side trading stopped.');
@@ -384,12 +391,15 @@ export default function App() {
         await fetch('/api/trading/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ settings, isReal: isRealTrading })
+          body: JSON.stringify({ settings, isRealTrading })
         });
         logger.success('Server-side trading started!');
       }
+      await fetchStatus();
     } catch (err) {
       logger.error('Failed to toggle server trading.');
+    } finally {
+      setIsTogglingTrading(false);
     }
   };
 
@@ -1530,21 +1540,37 @@ export default function App() {
 
             <button
               onClick={toggleServerTrading}
-              disabled={!model1hRef.current}
+              disabled={!model1hRef.current || isTogglingTrading}
               className={cn(
                 "flex items-center gap-2 px-4 py-2 rounded-full border transition-all font-bold text-[10px] uppercase tracking-widest",
                 isLiveMode 
                   ? "bg-emerald-500/20 border-emerald-500/50 text-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.2)]" 
-                  : "bg-white/5 border-white/10 text-white/40 hover:border-white/20"
+                  : "bg-white/5 border-white/10 text-white/40 hover:border-white/20",
+                isTogglingTrading && "opacity-50 cursor-not-allowed"
               )}
             >
-              <Zap className={cn("w-3 h-3", isLiveMode && "fill-emerald-400")} />
-              {isLiveMode ? 'Live Mode ON' : 'Live Mode OFF'}
+              <Zap className={cn("w-3 h-3", isLiveMode && "fill-emerald-400", isTogglingTrading && "animate-pulse")} />
+              {isTogglingTrading ? 'Processing...' : (isLiveMode ? 'Live Mode ON' : 'Live Mode OFF')}
             </button>
 
             {isLiveMode && (
               <button
-                onClick={() => setIsRealTrading(!isRealTrading)}
+                onClick={async () => {
+                  const nextMode = !isRealTrading;
+                  setIsRealTrading(nextMode);
+                  if (isLiveMode) {
+                    try {
+                      await fetch('/api/trading/mode', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ isRealTrading: nextMode })
+                      });
+                      logger.warning(`Trading mode switched to: ${nextMode ? 'REAL' : 'PAPER'}`);
+                    } catch (err) {
+                      logger.error('Failed to switch trading mode on server.');
+                    }
+                  }
+                }}
                 className={cn(
                   "flex items-center gap-2 px-4 py-2 rounded-full border transition-all font-bold text-[10px] uppercase tracking-widest",
                   isRealTrading 
@@ -2575,6 +2601,52 @@ export default function App() {
                     </div>
                   </div>
                 </div>
+
+                {/* Active Server Settings */}
+                {serverTradingStatus?.settings && (
+                  <div className="bg-[#0D0D0E] border border-white/5 rounded-2xl p-6 shadow-xl">
+                    <div className="flex items-center gap-2 mb-4">
+                      <Settings className="w-3 h-3 text-white/40" />
+                      <h3 className="text-xs font-bold text-white/40 uppercase tracking-wider">Active Server Settings</h3>
+                    </div>
+                    <div className="space-y-2">
+                      <div className="flex justify-between items-center">
+                        <span className="text-[10px] text-white/30 uppercase">Threshold</span>
+                        <span className="text-[10px] font-mono text-white/60">{serverTradingStatus.settings.threshold}</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-[10px] text-white/30 uppercase">Exit Thr.</span>
+                        <span className="text-[10px] font-mono text-white/60">{serverTradingStatus.settings.exitThreshold}</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-[10px] text-white/30 uppercase">Stop Loss</span>
+                        <span className="text-[10px] font-mono text-red-400">{(serverTradingStatus.settings.stopLoss * 100).toFixed(1)}%</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-[10px] text-white/30 uppercase">Take Profit</span>
+                        <span className="text-[10px] font-mono text-emerald-400">{(serverTradingStatus.settings.takeProfit * 100).toFixed(1)}%</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-[10px] text-white/30 uppercase">TS Activation</span>
+                        <span className="text-[10px] font-mono text-white/60">{(serverTradingStatus.settings.trailingStopActivation * 100).toFixed(1)}%</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-[10px] text-white/30 uppercase">TS Offset</span>
+                        <span className="text-[10px] font-mono text-white/60">{(serverTradingStatus.settings.trailingStopOffset * 100).toFixed(1)}%</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-[10px] text-white/30 uppercase">Quantity</span>
+                        <span className="text-[10px] font-mono text-white/60">{serverTradingStatus.settings.quantity} {serverTradingStatus.settings.quantityType}</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-[10px] text-white/30 uppercase">Session Trading</span>
+                        <span className={cn("text-[10px] font-mono", serverTradingStatus.settings.useSessionTrading ? "text-emerald-400" : "text-white/40")}>
+                          {serverTradingStatus.settings.useSessionTrading ? 'ON' : 'OFF'}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div className="lg:col-span-3 space-y-6">

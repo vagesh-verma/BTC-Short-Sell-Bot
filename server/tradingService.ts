@@ -72,6 +72,8 @@ export class TradingService {
   private lastUpdate: Date | null = null;
   private logs: LogEntry[] = [];
   private tickerCount: number = 0;
+  private lastProcessTime: number = 0;
+  private processInterval: number = 5000; // Process at most once every 5 seconds
 
   private apiKey: string = process.env.DELTA_API_KEY || '';
   private apiSecret: string = process.env.DELTA_API_SECRET || '';
@@ -88,17 +90,17 @@ export class TradingService {
     if (this.logs.length > 100) this.logs.pop();
   }
 
-  public async start(settings: TradingSettings, isReal: boolean) {
+  public async start(settings: TradingSettings, isRealTrading: boolean = false) {
     if (this.isRunning) {
       this.settings = settings;
-      this.isRealTrading = isReal;
+      this.isRealTrading = isRealTrading;
       this.log('Settings updated while running', 'info');
       return;
     }
     this.settings = settings;
-    this.isRealTrading = isReal;
+    this.isRealTrading = isRealTrading;
     this.isRunning = true;
-    this.log(`Starting Live Trading (Real: ${isReal})`, 'success');
+    this.log(`Starting Live Trading (Real: ${this.isRealTrading})`, 'success');
     
     await this.fetchInitialData();
     this.connectWebSocket();
@@ -107,6 +109,11 @@ export class TradingService {
   public updateSettings(settings: TradingSettings) {
     this.settings = settings;
     this.log('Trading settings synchronized', 'info');
+  }
+
+  public setTradingMode(isRealTrading: boolean) {
+    this.isRealTrading = isRealTrading;
+    this.log(`Trading mode switched to: ${isRealTrading ? 'REAL' : 'PAPER'}`, 'warning');
   }
 
   public stop() {
@@ -136,7 +143,8 @@ export class TradingService {
       lastParams: this.lastParams,
       lastUpdate: this.lastUpdate,
       logs: this.logs.slice(0, 20),
-      hasModels: !!(this.model1h && this.model4h)
+      hasModels: !!(this.model1h && this.model4h),
+      settings: this.settings
     };
   }
 
@@ -206,8 +214,8 @@ export class TradingService {
           this.log('WebSocket Subscriptions Confirmed', 'success');
         } else if (msg.type === 'error') {
           this.log(`WebSocket Server Error: ${msg.message}`, 'error');
-        } else if (msg.type === 'heartbeat') {
-          // Ignore heartbeat
+        } else if (msg.type === 'heartbeat' || msg.type === 'ping') {
+          if (msg.type === 'ping') this.ws?.send(JSON.stringify({ type: 'pong' }));
         } else {
           // Log unknown message types to debug
           if (msg.type !== 'ping' && msg.type !== 'pong') {
@@ -237,19 +245,32 @@ export class TradingService {
   }
 
   private async processPriceUpdate(price: number) {
+    if (!this.isRunning) return;
+    
+    const nowMs = Date.now();
+    if (nowMs - this.lastProcessTime < this.processInterval) {
+      return;
+    }
+    this.lastProcessTime = nowMs;
+
     if (this.lastPrice === null) {
       this.log(`First price received: $${price}`, 'success');
     }
     this.lastPrice = price;
     this.lastUpdate = new Date();
 
-    if (!this.model1h || !this.model4h || !this.settings) return;
+    if (!this.model1h || !this.model4h || !this.settings) {
+      if (this.tickerCount % 100 === 0) {
+        this.log(`Waiting for models/settings. Models: ${!!this.model1h}/${!!this.model4h}, Settings: ${!!this.settings}`, 'warning');
+      }
+      return;
+    }
 
     // Check if we need to update candles (every hour)
-    const now = new Date();
+    const nowDate = new Date();
     if (this.candles.length > 0) {
       const lastCandleTime = this.candles[this.candles.length - 1].time * 1000;
-      if (now.getTime() - lastCandleTime >= 60 * 60 * 1000) {
+      if (nowDate.getTime() - lastCandleTime >= 60 * 60 * 1000) {
         this.log('New hour detected, refreshing candles...');
         await this.fetchInitialData();
       }
@@ -288,7 +309,9 @@ export class TradingService {
     const windowSize = 20;
     const last4hIdx = prices4h.length - 1;
     if (last4hIdx < windowSize) {
-      this.log(`Insufficient 4h data: ${prices4h.length} candles`, 'warning');
+      if (this.tickerCount % 100 === 0) {
+        this.log(`Insufficient 4h data: ${prices4h.length} candles (need ${windowSize})`, 'warning');
+      }
       return;
     }
     const windowIndices4h = Array.from({ length: windowSize }, (_, k) => last4hIdx - windowSize + 1 + k);
@@ -348,8 +371,8 @@ export class TradingService {
     const fullHighs1h = [...this.candles.map(c => c.high), price];
     const fullLows1h = [...this.candles.map(c => c.low), price];
     const fullVolumes1h = [...this.candles.map(c => c.volume), 0];
-    const fullHours1h = [...this.candles.map(c => new Date(c.time * 1000).getHours()), now.getHours()];
-    const fullDays1h = [...this.candles.map(c => new Date(c.time * 1000).getDay()), now.getDay()];
+    const fullHours1h = [...this.candles.map(c => new Date(c.time * 1000).getHours()), nowDate.getHours()];
+    const fullDays1h = [...this.candles.map(c => new Date(c.time * 1000).getDay()), nowDate.getDay()];
 
     const rsi1h = indicators.calculateRSI(fullPrices1h);
     const ema1h = indicators.calculateEMA(fullPrices1h, 20);
@@ -369,7 +392,9 @@ export class TradingService {
 
     const last1hIdx = fullPrices1h.length - 1;
     if (last1hIdx < windowSize) {
-      this.log(`Insufficient 1h data: ${fullPrices1h.length} candles`, 'warning');
+      if (this.tickerCount % 100 === 0) {
+        this.log(`Insufficient 1h data: ${fullPrices1h.length} candles (need ${windowSize})`, 'warning');
+      }
       return;
     }
     const windowIndices1h = Array.from({ length: windowSize }, (_, k) => last1hIdx - windowSize + 1 + k);
@@ -467,9 +492,9 @@ export class TradingService {
       harami: harami1h[harami1h.length - 1],
       marubozu: marubozu1h[marubozu1h.length - 1],
       engulfing: engulfing1h[engulfing1h.length - 1],
-      session: now.getUTCHours() >= this.settings.asiaStart && now.getUTCHours() < this.settings.asiaEnd ? 'Asia' : 
-               now.getUTCHours() >= this.settings.nyStart && now.getUTCHours() < this.settings.nyEnd ? 'New York' : 'Off-Session',
-      dayOfWeek: now.getDay()
+      session: nowDate.getUTCHours() >= this.settings.asiaStart && nowDate.getUTCHours() < this.settings.asiaEnd ? 'Asia' : 
+               nowDate.getUTCHours() >= this.settings.nyStart && nowDate.getUTCHours() < this.settings.nyEnd ? 'New York' : 'Off-Session',
+      dayOfWeek: nowDate.getDay()
     };
 
     // 3. Trading Logic
@@ -531,7 +556,7 @@ export class TradingService {
       }
 
       if (shouldExit) {
-        this.log(`Closing Trade: ${reason} at $${price} | Profit: ${(profitPct * 100).toFixed(2)}%`, profitPct >= 0 ? 'success' : 'error');
+        this.log(`Closing Trade: ${reason} at $${price} | Prediction: ${prediction.toFixed(4)} | Profit: ${(profitPct * 100).toFixed(2)}%`, profitPct >= 0 ? 'success' : 'warning');
         
         const btcQuantity = this.settings.quantityType === 'LOTS' ? this.settings.quantity * 0.001 : this.settings.quantity;
         const profit = this.settings.quantityType === 'USD'
@@ -564,7 +589,7 @@ export class TradingService {
     } else if (prediction > this.settings.threshold) {
       // Session check
       let canTrade = true;
-      const hour = now.getUTCHours();
+      const hour = nowDate.getUTCHours();
       if (this.settings.useSessionTrading) {
         const isAsia = hour >= this.settings.asiaStart && hour < this.settings.asiaEnd;
         const isNY = hour >= this.settings.nyStart && hour < this.settings.nyEnd;
