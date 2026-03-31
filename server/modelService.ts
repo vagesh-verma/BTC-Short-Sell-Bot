@@ -13,7 +13,17 @@ export class GRUModel {
   public predict(input: number[]): number {
     if (!this.model) return 0;
     
-    const inputTensor = tf.tensor3d(input, [1, this.windowSize, this.featureCount]);
+    // Slice input to match expected shape if necessary
+    const expectedSize = this.windowSize * this.featureCount;
+    let finalInput = input;
+    if (input.length > expectedSize) {
+      finalInput = input.slice(0, expectedSize);
+    } else if (input.length < expectedSize) {
+      // Pad with zeros if too small
+      finalInput = [...input, ...new Array(expectedSize - input.length).fill(0)];
+    }
+
+    const inputTensor = tf.tensor3d(finalInput, [1, this.windowSize, this.featureCount]);
     const prediction = this.model.predict(inputTensor) as tf.Tensor;
     const result = prediction.dataSync()[0];
     
@@ -21,6 +31,14 @@ export class GRUModel {
     prediction.dispose();
     
     return result;
+  }
+
+  public getWindowSize(): number {
+    return this.windowSize;
+  }
+
+  public getFeatureCount(): number {
+    return this.featureCount;
   }
 
   public static async loadFromArtifacts(artifacts: any, metadata: { windowSize: number, featureCount: number }): Promise<GRUModel> {

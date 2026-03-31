@@ -4,6 +4,7 @@ import path from "path";
 import crypto from "crypto";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
+import { deltaRequest, generateSignature } from "./server/deltaApi";
 import { tradingService } from "./server/tradingService";
 import { GRUModel } from "./server/modelService";
 
@@ -23,6 +24,12 @@ app.post("/api/trading/start", async (req, res) => {
 
 app.post("/api/trading/stop", (req, res) => {
   tradingService.stop();
+  res.json({ success: true });
+});
+
+app.post("/api/trading/settings", (req, res) => {
+  const { settings } = req.body;
+  tradingService.updateSettings(settings);
   res.json({ success: true });
 });
 
@@ -67,63 +74,6 @@ function getCredentials() {
     throw new Error("Delta API credentials missing. Please set DELTA_API_KEY and DELTA_API_SECRET in Settings.");
   }
   return { apiKey, apiSecret };
-}
-
-function generateSignature(secret: string, method: string, nonce: string, endpoint: string, body: string = "") {
-  const payload = method + nonce + endpoint + body;
-  return crypto.createHmac("sha256", secret).update(payload).digest("hex");
-}
-
-let lastRestNonce = 0;
-function getNextRestNonce() {
-  let now = Date.now();
-  if (now <= lastRestNonce) {
-    now = lastRestNonce + 1;
-  }
-  lastRestNonce = now;
-  return now.toString();
-}
-
-async function deltaRequest(method: string, endpoint: string, data: any = null) {
-  const { apiKey, apiSecret } = getCredentials();
-
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-  
-  // Ensure the body is stringified ONCE and used for both signature and request
-  const body = data ? JSON.stringify(data) : "";
-  
-  const signaturePayload = method + timestamp + endpoint + body;
-  const signature = crypto.createHmac("sha256", apiSecret).update(signaturePayload).digest("hex");
-
-  console.log(`[Delta] Request: ${method} ${endpoint}`);
-  console.log(`[Delta] Payload: ${signaturePayload}`);
-
-  const headers = {
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-    "api-key": apiKey,
-    "signature": signature,
-    "timestamp": timestamp,
-    "User-Agent": "node-js-client"
-  };
-
-  const options: any = {
-    method,
-    headers,
-    body: data ? body : undefined
-  };
-
-  console.log(`[Delta] Headers:`, JSON.stringify({ ...headers, "api-key": "MASKED" }, null, 2));
-
-  const response = await fetch(`${DELTA_BASE_URL}${endpoint}`, options);
-  const result = await response.json() as any;
-
-  if (!response.ok) {
-    console.error(`Delta API Error (${method} ${endpoint}):`, JSON.stringify(result, null, 2));
-    throw new Error(JSON.stringify(result.error || result));
-  }
-
-  return result;
 }
 
 // API Routes
@@ -237,8 +187,16 @@ async function startServer() {
   }
 
   // Start listening at the end to ensure all middleware is ready
-  app.listen(PORT, "0.0.0.0", () => {
+  const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
+  });
+
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  });
+
+  process.on('uncaughtException', (err) => {
+    console.error('Uncaught Exception:', err);
   });
 }
 

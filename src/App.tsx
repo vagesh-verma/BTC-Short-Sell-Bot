@@ -137,6 +137,9 @@ export default function App() {
     trailingStopPrice: number | null;
     prediction: number;
     features: Record<string, number>;
+    pnl?: number;
+    pnlPct?: number;
+    size?: number;
   } | null>(null);
   const [livePrediction, setLivePrediction] = useState<number | null>(null);
   const [liveParams, setLiveParams] = useState<{
@@ -269,6 +272,21 @@ export default function App() {
   };
 
   useEffect(() => {
+    const fetchServerStatus = async () => {
+      try {
+        const res = await fetch('/api/status');
+        if (res.ok) {
+          const data = await res.json();
+          setServerStatus(data);
+        }
+      } catch (e) {
+        console.error('Failed to fetch server status');
+      }
+    };
+    fetchServerStatus();
+  }, []);
+
+  useEffect(() => {
     let interval: NodeJS.Timeout;
     const fetchStatus = async () => {
       try {
@@ -279,7 +297,10 @@ export default function App() {
           setIsLiveMode(data.isRunning);
           setIsRealTrading(data.isRealTrading);
           if (data.lastPrice) setLivePrice(data.lastPrice);
+          if (data.lastPrediction !== null) setLivePrediction(data.lastPrediction);
+          if (data.lastParams) setLiveParams(data.lastParams);
           if (data.lastUpdate) setLastLiveUpdate(new Date(data.lastUpdate));
+          if (data.closedTrades) setLiveTrades(data.closedTrades);
         }
       } catch (e) {
         console.error('Failed to fetch trading status');
@@ -371,6 +392,24 @@ export default function App() {
       logger.error('Failed to toggle server trading.');
     }
   };
+
+  useEffect(() => {
+    if (isLiveMode) {
+      fetch('/api/trading/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ settings })
+      }).catch(err => console.error('Failed to sync settings:', err));
+    }
+  }, [settings, isLiveMode]);
+
+  useEffect(() => {
+    if (serverTradingStatus?.activeTrade) {
+      setActiveLiveTrade(serverTradingStatus.activeTrade);
+    } else {
+      setActiveLiveTrade(null);
+    }
+  }, [serverTradingStatus?.activeTrade]);
 
   useEffect(() => {
     loadData();
@@ -1467,6 +1506,14 @@ export default function App() {
           </div>
           
           <div className="flex items-center gap-4">
+            {serverStatus?.serverIp && (
+              <div className="flex items-center gap-2 px-3 py-1.5 bg-white/5 rounded-full border border-white/10">
+                <ShieldAlert className="w-3 h-3 text-blue-400" />
+                <span className="text-[10px] font-bold text-white/40 uppercase tracking-widest">Server IP:</span>
+                <span className="text-xs font-mono text-blue-400/70">{serverStatus.serverIp}</span>
+              </div>
+            )}
+
             <button
               onClick={syncModelToServer}
               disabled={!model1hRef.current || isSyncing}
@@ -2547,13 +2594,30 @@ export default function App() {
                       <div className="text-right">
                         <div className={cn(
                           "text-2xl font-bold",
-                          ((activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice) >= 0 ? "text-emerald-400" : "text-red-400"
+                          (activeLiveTrade.pnlPct !== undefined ? activeLiveTrade.pnlPct >= 0 : ((activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice) >= 0) ? "text-emerald-400" : "text-red-400"
                         )}>
-                          {((activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice * 100).toFixed(2)}%
+                          {activeLiveTrade.pnlPct !== undefined ? activeLiveTrade.pnlPct.toFixed(2) : ((activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice * 100).toFixed(2)}%
                         </div>
                         <div className="text-[10px] text-white/30">Live P&L</div>
                       </div>
                     </div>
+
+                    {activeLiveTrade.features && (
+                      <div className="mb-6 p-4 bg-white/5 rounded-xl border border-white/5">
+                        <div className="flex items-center justify-between mb-3">
+                          <span className="text-[10px] text-white/30 uppercase font-bold tracking-wider">Entry Features</span>
+                          <span className="text-[10px] text-blue-400 font-mono">Pred: {activeLiveTrade.prediction.toFixed(3)}</span>
+                        </div>
+                        <div className="grid grid-cols-4 gap-4">
+                          {Object.entries(activeLiveTrade.features).slice(0, 12).map(([name, val]) => (
+                            <div key={name} className="space-y-1">
+                              <div className="text-[8px] text-white/20 uppercase truncate">{name}</div>
+                              <div className="text-[10px] font-mono text-white/60">{(val as number).toFixed(2)}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
 
                     <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
                       <div className="space-y-1">
@@ -2580,14 +2644,17 @@ export default function App() {
                           <span className="text-[9px] text-white/30 uppercase">Unrealized P&L</span>
                           <div className={cn(
                             "text-sm font-bold",
-                            ((activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice) >= 0 ? "text-emerald-400" : "text-red-400"
+                            (activeLiveTrade.pnlPct !== undefined ? activeLiveTrade.pnlPct >= 0 : ((activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice) >= 0) ? "text-emerald-400" : "text-red-400"
                           )}>
-                            ${(settings.quantityType === 'USD' 
-                              ? (settings.quantity * (activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice)
-                              : (settings.quantityType === 'LOTS'
-                                ? (settings.quantity * 0.001 * (activeLiveTrade.entryPrice - livePrice))
-                                : (settings.quantity * (activeLiveTrade.entryPrice - livePrice)))
-                            ).toFixed(2)}
+                            {activeLiveTrade.pnl !== undefined 
+                              ? `$${activeLiveTrade.pnl.toFixed(2)} (${activeLiveTrade.pnlPct?.toFixed(2)}%)`
+                              : `$${(settings.quantityType === 'USD' 
+                                  ? (settings.quantity * (activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice)
+                                  : (settings.quantityType === 'LOTS'
+                                    ? (settings.quantity * 0.001 * (activeLiveTrade.entryPrice - livePrice))
+                                    : (settings.quantity * (activeLiveTrade.entryPrice - livePrice)))
+                                ).toFixed(2)} (${((activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice * 100).toFixed(2)}%)`
+                            }
                           </div>
                         </div>
                       </div>
