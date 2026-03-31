@@ -10,7 +10,7 @@ import { GRUModel } from "./server/modelService";
 dotenv.config();
 
 const app = express();
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 
 app.use(express.json({ limit: '50mb' }));
 
@@ -218,18 +218,9 @@ async function logServerInfo() {
 }
 
 async function startServer() {
-  // Start listening immediately to satisfy Cloud Run startup probes
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
-
-  // Perform initialization tasks
-  try {
-    await logServerInfo();
-    await fetchProducts();
-  } catch (err) {
-    console.error("[Server] Initialization failed:", err);
-  }
+  // Perform initialization tasks asynchronously
+  logServerInfo().catch(err => console.warn("[Server] Info fetch failed:", err));
+  fetchProducts().catch(err => console.warn("[Server] Product fetch failed:", err));
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -244,6 +235,11 @@ async function startServer() {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
+
+  // Start listening at the end to ensure all middleware is ready
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  });
 }
 
 startServer();

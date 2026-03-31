@@ -28,12 +28,8 @@ RUN npm install --production
 # Copy the built frontend and the server code
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server.ts ./
+COPY --from=builder /app/server ./server
 COPY --from=builder /app/tsconfig.json ./
-# Copy src for tsx to work correctly if it references any src files
-COPY --from=builder /app/src ./src
-
-# Install tsx to run the server
-RUN npm install -g tsx
 
 # Expose the port the app runs on
 EXPOSE 8080
@@ -43,4 +39,4 @@ ENV NODE_ENV=production
 ENV PORT=8080
 
 # Command to run the application
-CMD ["tsx", "server.ts"]
+CMD ["npx", "tsx", "server.ts"]
