@@ -4,7 +4,7 @@ import path from "path";
 import crypto from "crypto";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
-import { deltaRequest, generateSignature } from "./server/deltaApi";
+import { deltaRequest, generateSignature, productMap, fetchProducts } from "./server/deltaApi";
 import { tradingService } from "./server/tradingService";
 import { GRUModel } from "./server/modelService";
 
@@ -33,9 +33,14 @@ app.post("/api/trading/settings", (req, res) => {
   res.json({ success: true });
 });
 
-app.post("/api/trading/mode", (req, res) => {
+app.post("/api/trading/close", async (req, res) => {
+  await tradingService.closeActiveTrade();
+  res.json({ success: true });
+});
+
+app.post("/api/trading/mode", async (req, res) => {
   const { isRealTrading } = req.body;
-  tradingService.setTradingMode(isRealTrading);
+  await tradingService.setTradingMode(isRealTrading);
   res.json({ success: true });
 });
 
@@ -57,21 +62,6 @@ app.post("/api/trading/sync-model", async (req, res) => {
 });
 
 const DELTA_BASE_URL = "https://api.india.delta.exchange";
-let productMap: Record<string, number> = { 'BTCUSD': 1 };
-
-async function fetchProducts() {
-  try {
-    const result = await deltaRequest("GET", "/v2/products") as any;
-    if (result.success && Array.isArray(result.result)) {
-      result.result.forEach((p: any) => {
-        productMap[p.symbol] = p.id;
-      });
-      console.log(`[Delta] Loaded ${result.result.length} products.`);
-    }
-  } catch (error: any) {
-    console.warn("[Delta] Could not fetch products:", error.message);
-  }
-}
 
 function getCredentials() {
   const apiKey = process.env.DELTA_API_KEY?.trim();

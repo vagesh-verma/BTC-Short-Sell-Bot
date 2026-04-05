@@ -27,6 +27,7 @@ import {
   ShieldAlert,
   Target,
   Zap,
+  Save,
   ChevronDown,
   CloudUpload,
   CloudOff,
@@ -143,6 +144,7 @@ export default function App() {
     size?: number;
   } | null>(null);
   const [livePrediction, setLivePrediction] = useState<number | null>(null);
+  const hasSyncedFromServer = useRef(false);
   const [liveParams, setLiveParams] = useState<{
     rsi: number;
     ema: number;
@@ -304,6 +306,13 @@ export default function App() {
         if (data.lastParams) setLiveParams(data.lastParams);
         if (data.lastUpdate) setLastLiveUpdate(new Date(data.lastUpdate));
         if (data.closedTrades) setLiveTrades(data.closedTrades);
+        
+        // Sync settings from server on first successful load
+        if (!hasSyncedFromServer.current && data.settings) {
+          setSettings(prev => ({ ...prev, ...data.settings }));
+          hasSyncedFromServer.current = true;
+          logger.info('Trading settings synchronized from server');
+        }
       }
     } catch (e) {
       console.error('Failed to fetch trading status');
@@ -316,6 +325,23 @@ export default function App() {
     interval = setInterval(fetchStatus, 5000);
     return () => clearInterval(interval);
   }, []);
+
+  const pushSettingsToServer = async () => {
+    try {
+      const res = await fetch('/api/trading/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ settings })
+      });
+      if (res.ok) {
+        logger.success('Settings pushed to server and persisted');
+      } else {
+        logger.error('Failed to push settings to server');
+      }
+    } catch (e) {
+      logger.error('Failed to push settings to server');
+    }
+  };
 
   const syncModelToServer = async () => {
     if (!model1hRef.current || !model4hRef.current) {
@@ -402,16 +428,6 @@ export default function App() {
       setIsTogglingTrading(false);
     }
   };
-
-  useEffect(() => {
-    if (isLiveMode) {
-      fetch('/api/trading/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ settings })
-      }).catch(err => console.error('Failed to sync settings:', err));
-    }
-  }, [settings, isLiveMode]);
 
   useEffect(() => {
     if (serverTradingStatus?.activeTrade) {
@@ -2293,8 +2309,8 @@ export default function App() {
                     <label className="text-[10px] text-white/30 uppercase">Stop Loss (%)</label>
                     <input 
                       type="number" step="0.1"
-                      value={settings.stopLoss * 100}
-                      onChange={(e) => setSettings({...settings, stopLoss: parseFloat(e.target.value) / 100})}
+                      value={isNaN(settings.stopLoss) ? '' : settings.stopLoss * 100}
+                      onChange={(e) => setSettings({...settings, stopLoss: (parseFloat(e.target.value) || 0) / 100})}
                       className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
                     />
                   </div>
@@ -2302,8 +2318,8 @@ export default function App() {
                     <label className="text-[10px] text-white/30 uppercase">Take Profit (%)</label>
                     <input 
                       type="number" step="0.1"
-                      value={settings.takeProfit * 100}
-                      onChange={(e) => setSettings({...settings, takeProfit: parseFloat(e.target.value) / 100})}
+                      value={isNaN(settings.takeProfit) ? '' : settings.takeProfit * 100}
+                      onChange={(e) => setSettings({...settings, takeProfit: (parseFloat(e.target.value) || 0) / 100})}
                       className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
                     />
                   </div>
@@ -2312,8 +2328,8 @@ export default function App() {
                   <label className="text-[10px] text-white/30 uppercase">Max Duration (Hours)</label>
                   <input 
                     type="number"
-                    value={settings.maxDurationHours}
-                    onChange={(e) => setSettings({...settings, maxDurationHours: parseInt(e.target.value)})}
+                    value={isNaN(settings.maxDurationHours) ? '' : settings.maxDurationHours}
+                    onChange={(e) => setSettings({...settings, maxDurationHours: parseInt(e.target.value) || 0})}
                     className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
                   />
                 </div>
@@ -2326,8 +2342,8 @@ export default function App() {
                     <label className="text-[10px] text-white/30 uppercase">Activation (%)</label>
                     <input 
                       type="number" step="0.1"
-                      value={settings.trailingStopActivation * 100}
-                      onChange={(e) => setSettings({...settings, trailingStopActivation: parseFloat(e.target.value) / 100})}
+                      value={isNaN(settings.trailingStopActivation) ? '' : settings.trailingStopActivation * 100}
+                      onChange={(e) => setSettings({...settings, trailingStopActivation: (parseFloat(e.target.value) || 0) / 100})}
                       className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
                     />
                   </div>
@@ -2335,8 +2351,8 @@ export default function App() {
                     <label className="text-[10px] text-white/30 uppercase">Offset (%)</label>
                     <input 
                       type="number" step="0.1"
-                      value={settings.trailingStopOffset * 100}
-                      onChange={(e) => setSettings({...settings, trailingStopOffset: parseFloat(e.target.value) / 100})}
+                      value={isNaN(settings.trailingStopOffset) ? '' : settings.trailingStopOffset * 100}
+                      onChange={(e) => setSettings({...settings, trailingStopOffset: (parseFloat(e.target.value) || 0) / 100})}
                       className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
                     />
                   </div>
@@ -2372,14 +2388,14 @@ export default function App() {
                         <div className="flex gap-2">
                           <input 
                             type="number" min="0" max="23"
-                            value={settings.asiaStart}
-                            onChange={(e) => setSettings({...settings, asiaStart: parseInt(e.target.value)})}
+                            value={isNaN(settings.asiaStart) ? '' : settings.asiaStart}
+                            onChange={(e) => setSettings({...settings, asiaStart: parseInt(e.target.value) || 0})}
                             className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-white/80 focus:border-blue-500/50 outline-none"
                           />
                           <input 
                             type="number" min="0" max="23"
-                            value={settings.asiaEnd}
-                            onChange={(e) => setSettings({...settings, asiaEnd: parseInt(e.target.value)})}
+                            value={isNaN(settings.asiaEnd) ? '' : settings.asiaEnd}
+                            onChange={(e) => setSettings({...settings, asiaEnd: parseInt(e.target.value) || 0})}
                             className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-white/80 focus:border-blue-500/50 outline-none"
                           />
                         </div>
@@ -2389,14 +2405,14 @@ export default function App() {
                         <div className="flex gap-2">
                           <input 
                             type="number" min="0" max="23"
-                            value={settings.nyStart}
-                            onChange={(e) => setSettings({...settings, nyStart: parseInt(e.target.value)})}
+                            value={isNaN(settings.nyStart) ? '' : settings.nyStart}
+                            onChange={(e) => setSettings({...settings, nyStart: parseInt(e.target.value) || 0})}
                             className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-white/80 focus:border-blue-500/50 outline-none"
                           />
                           <input 
                             type="number" min="0" max="23"
-                            value={settings.nyEnd}
-                            onChange={(e) => setSettings({...settings, nyEnd: parseInt(e.target.value)})}
+                            value={isNaN(settings.nyEnd) ? '' : settings.nyEnd}
+                            onChange={(e) => setSettings({...settings, nyEnd: parseInt(e.target.value) || 0})}
                             className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-white/80 focus:border-blue-500/50 outline-none"
                           />
                         </div>
@@ -2444,12 +2460,22 @@ export default function App() {
                     <label className="text-[10px] text-white/30 uppercase">Quantity</label>
                     <input 
                       type="number" step="0.01"
-                      value={settings.quantity}
-                      onChange={(e) => setSettings({...settings, quantity: parseFloat(e.target.value)})}
+                      value={isNaN(settings.quantity) ? '' : settings.quantity}
+                      onChange={(e) => setSettings({...settings, quantity: parseFloat(e.target.value) || 0})}
                       className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
                     />
                   </div>
                 </div>
+              </div>
+
+              <div className="mt-8 pt-6 border-t border-white/5 flex justify-end">
+                <button
+                  onClick={pushSettingsToServer}
+                  className="flex items-center gap-2 px-6 py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-semibold transition-all active:scale-95 shadow-[0_0_20px_rgba(37,99,235,0.2)]"
+                >
+                  <Save className="w-4 h-4" />
+                  Push Settings to Server
+                </button>
               </div>
             </div>
           </div>
@@ -2753,7 +2779,11 @@ export default function App() {
                           setLiveTrades(prev => [newTrade, ...prev]);
                           setLivePaperBalance(prev => prev + profit);
                           setActiveLiveTrade(null);
-                          if (isRealTrading) placeRealOrder('buy', settings.quantity);
+                          
+                          // Call server to close trade and start cooldown
+                          fetch('/api/trading/close', { method: 'POST' })
+                            .then(() => logger.success('Manual close request sent to server'))
+                            .catch(err => logger.error('Failed to send manual close request'));
                         }}
                         className="px-4 py-2 bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white border border-red-500/20 rounded-lg text-xs font-bold transition-all"
                       >

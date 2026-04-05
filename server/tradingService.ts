@@ -3,7 +3,9 @@ import { GRUModel } from './modelService';
 import * as indicators from './indicatorService';
 import fetch from 'node-fetch';
 import crypto from 'crypto';
-import { deltaRequest } from './deltaApi';
+import { deltaRequest, productMap } from './deltaApi';
+import fs from 'fs';
+import path from 'path';
 
 interface TradingSettings {
   threshold: number;
@@ -24,6 +26,7 @@ interface TradingSettings {
 }
 
 interface ActiveTrade {
+  type: 'LONG' | 'SHORT';
   entryPrice: number;
   entryTime: number;
   highestProfitPct: number;
@@ -33,10 +36,11 @@ interface ActiveTrade {
   pnlPct?: number;
   size?: number;
   features?: Record<string, number>;
+  orderId?: string;
 }
 
 interface ClosedTrade {
-  type: 'SHORT';
+  type: 'LONG' | 'SHORT';
   entryPrice: number;
   exitPrice: number;
   entryTime: number;
@@ -46,6 +50,7 @@ interface ClosedTrade {
   exitReason: string;
   prediction: number;
   features: Record<string, number>;
+  orderId?: string;
 }
 
 interface LogEntry {
@@ -73,13 +78,81 @@ export class TradingService {
   private logs: LogEntry[] = [];
   private tickerCount: number = 0;
   private lastProcessTime: number = 0;
+  private lastTradeCloseTime: number = 0;
   private processInterval: number = 5000; // Process at most once every 5 seconds
 
   private apiKey: string = process.env.DELTA_API_KEY || '';
   private apiSecret: string = process.env.DELTA_API_SECRET || '';
+  private settingsPath: string = path.join(process.cwd(), 'server', 'trading-settings.json');
+  private statePath: string = path.join(process.cwd(), 'server', 'trading-state.json');
 
   constructor() {
     this.log('Trading Service Initialized');
+    this.loadSettings();
+    this.loadState();
+  }
+
+  private loadSettings() {
+    try {
+      if (fs.existsSync(this.settingsPath)) {
+        const data = fs.readFileSync(this.settingsPath, 'utf8');
+        this.settings = JSON.parse(data);
+        this.log('Trading settings loaded from disk', 'success');
+      }
+    } catch (err) {
+      this.log(`Error loading settings: ${err}`, 'error');
+    }
+  }
+
+  private loadState() {
+    try {
+      if (fs.existsSync(this.statePath)) {
+        const data = fs.readFileSync(this.statePath, 'utf8');
+        const state = JSON.parse(data);
+        this.activeTrade = state.activeTrade || null;
+        if (this.activeTrade && !this.activeTrade.type) {
+          this.activeTrade.type = 'SHORT';
+        }
+        this.closedTrades = state.closedTrades || [];
+        this.isRunning = state.isRunning || false;
+        this.isRealTrading = state.isRealTrading || false;
+        this.log('Trading state loaded from disk', 'success');
+        
+        if (this.isRunning) {
+          this.log('Resuming trading session...', 'info');
+          this.fetchInitialData().then(() => this.connectWebSocket());
+        }
+      }
+    } catch (err) {
+      this.log(`Error loading state: ${err}`, 'error');
+    }
+  }
+
+  private saveState() {
+    try {
+      const state = {
+        activeTrade: this.activeTrade,
+        closedTrades: this.closedTrades,
+        isRunning: this.isRunning,
+        isRealTrading: this.isRealTrading
+      };
+      fs.writeFileSync(this.statePath, JSON.stringify(state, null, 2));
+    } catch (err) {
+      console.error('Error saving state:', err);
+    }
+  }
+
+  private saveSettings() {
+    try {
+      if (this.settings) {
+        const dir = path.dirname(this.settingsPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(this.settingsPath, JSON.stringify(this.settings, null, 2));
+        this.log('Trading settings saved to disk', 'info');
+      }
+    } catch (err) {
+      this.log(`Error saving settings: ${err}`, 'error');
+    }
   }
 
   private log(message: string, type: LogEntry['type'] = 'info') {
@@ -94,12 +167,15 @@ export class TradingService {
     if (this.isRunning) {
       this.settings = settings;
       this.isRealTrading = isRealTrading;
+      this.saveSettings();
       this.log('Settings updated while running', 'info');
       return;
     }
     this.settings = settings;
     this.isRealTrading = isRealTrading;
     this.isRunning = true;
+    this.saveSettings();
+    this.saveState();
     this.log(`Starting Live Trading (Real: ${this.isRealTrading})`, 'success');
     
     await this.fetchInitialData();
@@ -108,11 +184,41 @@ export class TradingService {
 
   public updateSettings(settings: TradingSettings) {
     this.settings = settings;
+    this.saveSettings();
+    this.saveState();
     this.log('Trading settings synchronized', 'info');
   }
 
-  public setTradingMode(isRealTrading: boolean) {
+  public async closeActiveTrade() {
+    try {
+      if (!this.activeTrade) {
+        this.log('No active trade to close', 'warning');
+        return;
+      }
+
+      this.log('Manual trade closure requested via API', 'info');
+      
+      if (this.isRealTrading) {
+        const side = this.activeTrade.type === 'SHORT' ? 'buy' : 'sell';
+        await this.placeRealOrder(side, this.settings?.quantity || 1, true);
+      }
+
+      this.activeTrade = null;
+      this.lastTradeCloseTime = Date.now();
+      this.saveState();
+      this.log('Active trade cleared and cooldown started', 'success');
+    } catch (err) {
+      this.log(`Error closing active trade: ${err}`, 'error');
+    }
+  }
+
+  public async setTradingMode(isRealTrading: boolean) {
+    if( this.isRealTrading != isRealTrading) {
+      await this.closeActiveTrade();
+    }
+
     this.isRealTrading = isRealTrading;
+    this.saveState();
     this.log(`Trading mode switched to: ${isRealTrading ? 'REAL' : 'PAPER'}`, 'warning');
   }
 
@@ -122,6 +228,7 @@ export class TradingService {
       this.ws.close();
       this.ws = null;
     }
+    this.saveState();
     this.log('Stopped Live Trading', 'warning');
   }
 
@@ -187,10 +294,34 @@ export class TradingService {
     
     this.ws.on('open', () => {
       this.log('WebSocket Connected to Delta Exchange', 'success');
+      
+      // 1. Authenticate if real trading is enabled
+      if (this.isRealTrading && this.apiKey && this.apiSecret) {
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const signature = crypto.createHmac('sha256', this.apiSecret)
+          .update('GET' + timestamp + '/v2/websocket')
+          .digest('hex');
+          
+        this.ws?.send(JSON.stringify({
+          type: 'auth',
+          payload: {
+            api_key: this.apiKey,
+            signature: signature,
+            timestamp: timestamp
+          }
+        }));
+      }
+
+      // 2. Subscribe to channels
+      const channels: any[] = [{ name: 'v2/ticker', symbols: ['BTCUSD', 'BTCUSD_P'] }];
+      if (this.isRealTrading) {
+        channels.push({ name: 'positions', symbols: ['BTCUSD', 'BTCUSD_P'] });
+      }
+
       this.ws?.send(JSON.stringify({
         type: 'subscribe',
         payload: {
-          channels: [{ name: 'v2/ticker', symbols: ['BTCUSD', 'BTCUSD_P'] }]
+          channels: channels
         }
       }));
     });
@@ -210,8 +341,31 @@ export class TradingService {
               this.processPriceUpdate(price);
             }
           }
+        } else if (msg.type === 'positions') {
+          const pos = Array.isArray(msg.result) ? msg.result[0] : msg;
+          if (pos && (pos.symbol === 'BTCUSD' || pos.symbol === 'BTCUSD_P')) {
+            const entry = parseFloat(pos.entry_price || pos.avg_entry_price);
+            const size = parseFloat(pos.size);
+            
+            if (this.activeTrade && size !== 0 && entry > 0) {
+              this.activeTrade.entryPrice = entry;
+              this.activeTrade.size = size;
+              this.saveState();
+            } else if (this.activeTrade && size === 0) {
+              this.log('Position closed on exchange. Clearing active trade.', 'info');
+              this.activeTrade = null;
+              this.lastTradeCloseTime = Date.now();
+              this.saveState();
+            }
+          }
         } else if (msg.type === 'subscriptions') {
           this.log('WebSocket Subscriptions Confirmed', 'success');
+        } else if (msg.type === 'auth') {
+          if (msg.success) {
+            this.log('WebSocket Authentication Successful', 'success');
+          } else {
+            this.log(`WebSocket Authentication Failed: ${msg.error}`, 'error');
+          }
         } else if (msg.type === 'error') {
           this.log(`WebSocket Server Error: ${msg.message}`, 'error');
         } else if (msg.type === 'heartbeat' || msg.type === 'ping') {
@@ -252,6 +406,9 @@ export class TradingService {
       return;
     }
     this.lastProcessTime = nowMs;
+
+    // Reload settings to ensure we use the latest threshold
+    this.loadSettings();
 
     if (this.lastPrice === null) {
       this.log(`First price received: $${price}`, 'success');
@@ -499,32 +656,57 @@ export class TradingService {
 
     // 3. Trading Logic
     if (this.activeTrade) {
-      let profitPct = (this.activeTrade.entryPrice - price) / this.activeTrade.entryPrice;
+      let profitPct = 0;
       
-      // If real trading, try to get actual PNL from exchange
       if (this.isRealTrading) {
-        try {
-          const positions = await deltaRequest('GET', '/v2/positions');
-          if (positions.success && Array.isArray(positions.result)) {
-            const btcPos = positions.result.find((p: any) => p.symbol === 'BTCUSD' || p.symbol === 'BTCUSD_P');
-            if (btcPos) {
-              // Delta returns PNL in quote currency or base depending on contract
-              // For inverse contracts it's different. 
-              // We'll use their reported unrealized_pnl and entry_price
-              this.activeTrade.pnl = parseFloat(btcPos.unrealized_pnl);
-              this.activeTrade.size = parseFloat(btcPos.size);
-              // Calculate PNL % based on their margin or entry
-              // For simplicity, we'll stick to our calculation for trailing stop but show their PNL
-              this.activeTrade.pnlPct = (this.activeTrade.pnl / (Math.abs(this.activeTrade.size) * this.activeTrade.entryPrice)) * 100;
-            }
+        // Use the latest price from ticker and position data from WS/REST
+        const entry = this.activeTrade.entryPrice;
+        const size = this.activeTrade.size || 0;
+        
+        if (size !== 0 && entry > 0) {
+          // PNL Calculation logic from user script: (Entry - Mark) * Size * 0.001 (for SHORT)
+          // For BTCUSD, contract_value is 0.001
+          const contractValue = 0.001;
+          let pnl = 0;
+          if (this.activeTrade.type === 'SHORT') {
+            pnl = (entry - price) * Math.abs(size) * contractValue;
+          } else {
+            pnl = (price - entry) * Math.abs(size) * contractValue;
           }
-        } catch (err) {
-          this.log(`Failed to fetch exchange position: ${err}`, 'error');
+          
+          const initialValueUSD = Math.abs(size) * contractValue * entry;
+          profitPct = pnl / initialValueUSD;
+          
+          this.activeTrade.pnl = pnl;
+          this.activeTrade.pnlPct = profitPct * 100;
+          
+          // Periodically sync with REST as backup
+          if (Date.now() - this.lastProcessTime > 30000) {
+            this.syncPositionWithRest();
+          }
+        } else {
+          // Fallback to local calculation if size/entry not yet synced
+          if (this.activeTrade.type === 'SHORT') {
+            profitPct = (this.activeTrade.entryPrice - price) / this.activeTrade.entryPrice;
+          } else {
+            profitPct = (price - this.activeTrade.entryPrice) / this.activeTrade.entryPrice;
+          }
+        }
+      } else {
+        // Paper trading logic
+        if (this.activeTrade.type === 'SHORT') {
+          profitPct = (this.activeTrade.entryPrice - price) / this.activeTrade.entryPrice;
+        } else {
+          profitPct = (price - this.activeTrade.entryPrice) / this.activeTrade.entryPrice;
         }
       }
 
-      const stopLossPrice = this.activeTrade.entryPrice * (1 + this.settings.stopLoss);
-      const takeProfitPrice = this.activeTrade.entryPrice * (1 - this.settings.takeProfit);
+      const stopLossPrice = this.activeTrade.type === 'SHORT'
+        ? this.activeTrade.entryPrice * (1 + this.settings.stopLoss)
+        : this.activeTrade.entryPrice * (1 - this.settings.stopLoss);
+      const takeProfitPrice = this.activeTrade.type === 'SHORT'
+        ? this.activeTrade.entryPrice * (1 - this.settings.takeProfit)
+        : this.activeTrade.entryPrice * (1 + this.settings.takeProfit);
 
       let currentTrailingStop = this.activeTrade.trailingStopPrice;
       let highestProfit = this.activeTrade.highestProfitPct;
@@ -533,7 +715,11 @@ export class TradingService {
         highestProfit = profitPct;
         this.activeTrade.highestProfitPct = highestProfit;
         if (profitPct >= this.settings.trailingStopActivation) {
-          currentTrailingStop = price * (1 + this.settings.trailingStopOffset);
+          if (this.activeTrade.type === 'SHORT') {
+            currentTrailingStop = price * (1 + this.settings.trailingStopOffset);
+          } else {
+            currentTrailingStop = price * (1 - this.settings.trailingStopOffset);
+          }
           this.activeTrade.trailingStopPrice = currentTrailingStop;
         }
       }
@@ -541,18 +727,35 @@ export class TradingService {
       let shouldExit = false;
       let reason = '';
 
-      if (price >= stopLossPrice) {
-        shouldExit = true;
-        reason = 'STOP_LOSS';
-      } else if (price <= takeProfitPrice) {
-        shouldExit = true;
-        reason = 'TAKE_PROFIT';
-      } else if (currentTrailingStop && price >= currentTrailingStop) {
-        shouldExit = true;
-        reason = 'TRAILING_STOP';
-      } else if (prediction < this.settings.exitThreshold) {
-        shouldExit = true;
-        reason = 'PREDICTION';
+      if (this.activeTrade.type === 'SHORT') {
+        if (price >= stopLossPrice) {
+          shouldExit = true;
+          reason = 'STOP_LOSS';
+        } else if (price <= takeProfitPrice) {
+          shouldExit = true;
+          reason = 'TAKE_PROFIT';
+        } else if (currentTrailingStop && price >= currentTrailingStop) {
+          shouldExit = true;
+          reason = 'TRAILING_STOP';
+        } else if (prediction < this.settings.exitThreshold) {
+          shouldExit = true;
+          reason = 'PREDICTION';
+        }
+      } else {
+        // LONG
+        if (price <= stopLossPrice) {
+          shouldExit = true;
+          reason = 'STOP_LOSS';
+        } else if (price >= takeProfitPrice) {
+          shouldExit = true;
+          reason = 'TAKE_PROFIT';
+        } else if (currentTrailingStop && price <= currentTrailingStop) {
+          shouldExit = true;
+          reason = 'TRAILING_STOP';
+        } else if (prediction > -this.settings.exitThreshold) {
+          shouldExit = true;
+          reason = 'PREDICTION';
+        }
       }
 
       if (shouldExit) {
@@ -561,10 +764,10 @@ export class TradingService {
         const btcQuantity = this.settings.quantityType === 'LOTS' ? this.settings.quantity * 0.001 : this.settings.quantity;
         const profit = this.settings.quantityType === 'USD'
           ? this.settings.quantity * profitPct
-          : btcQuantity * (this.activeTrade.entryPrice - price);
+          : btcQuantity * (this.activeTrade.type === 'SHORT' ? (this.activeTrade.entryPrice - price) : (price - this.activeTrade.entryPrice));
 
         const closedTrade: ClosedTrade = {
-          type: 'SHORT',
+          type: this.activeTrade.type,
           entryPrice: this.activeTrade.entryPrice,
           exitPrice: price,
           entryTime: this.activeTrade.entryTime,
@@ -573,20 +776,33 @@ export class TradingService {
           profitPct: profitPct * 100,
           exitReason: reason,
           prediction: this.activeTrade.prediction,
-          features: this.activeTrade.features || {}
+          features: this.activeTrade.features || {},
+          orderId: this.activeTrade.orderId
         };
         this.closedTrades.unshift(closedTrade);
         if (this.closedTrades.length > 100) this.closedTrades.pop();
 
         if (this.isRealTrading) {
-          await this.placeRealOrder('buy', this.settings.quantity);
+          await this.placeRealOrder(this.activeTrade.type === 'SHORT' ? 'buy' : 'sell', this.settings.quantity, true);
         }
         this.activeTrade = null;
+        this.lastTradeCloseTime = Date.now();
+        this.saveState();
       } else {
         this.activeTrade.highestProfitPct = highestProfit;
         this.activeTrade.trailingStopPrice = currentTrailingStop;
+        this.saveState();
       }
     } else if (prediction > this.settings.threshold) {
+      // Cooldown check: don't re-open within 5 minutes of closing a trade
+      const cooldownMs = 10 * 1000;
+      if (Date.now() - this.lastTradeCloseTime < cooldownMs) {
+        if (this.tickerCount % 100 === 0) {
+          this.log(`Signal detected but in cooldown period (${Math.ceil((cooldownMs - (Date.now() - this.lastTradeCloseTime)) / 1000)}s remaining)`, 'info');
+        }
+        return;
+      }
+
       // Session check
       let canTrade = true;
       const hour = nowDate.getUTCHours();
@@ -599,6 +815,7 @@ export class TradingService {
       if (canTrade) {
         this.log(`Opening SHORT at $${price} | Prediction: ${prediction.toFixed(4)}`, 'success');
         this.activeTrade = {
+          type: 'SHORT',
           entryPrice: price,
           entryTime: Date.now(),
           highestProfitPct: 0,
@@ -607,19 +824,43 @@ export class TradingService {
           features: currentFeatures
         };
         if (this.isRealTrading) {
-          await this.placeRealOrder('sell', this.settings.quantity);
+          this.placeRealOrder('sell', this.settings.quantity, false).then(orderId => {
+            if (orderId && this.activeTrade) {
+              this.activeTrade.orderId = orderId;
+              this.saveState();
+              // Try to sync position immediately after market order
+              setTimeout(() => this.syncPositionWithRest(), 1000);
+            }
+          });
         }
+        this.saveState();
       }
     }
   }
 
-  private async placeRealOrder(side: 'buy' | 'sell', quantity: number) {
+  private async syncPositionWithRest() {
+    if (!this.isRealTrading || !this.activeTrade) return;
     try {
-      if (!this.apiKey || !this.apiSecret) {
-        this.log('API Keys missing, cannot place real order');
-        return;
+      const positions = await deltaRequest('GET', '/v2/positions?underlying_asset_symbol=BTC');
+      if (positions.success && Array.isArray(positions.result)) {
+        const btcPos = positions.result.find((p: any) => p.symbol === 'BTCUSD' || p.symbol === 'BTCUSD_P');
+        if (btcPos) {
+          const entry = parseFloat(btcPos.avg_entry_price);
+          const size = parseFloat(btcPos.size);
+          if (size !== 0 && entry > 0) {
+            this.activeTrade.entryPrice = entry;
+            this.activeTrade.size = size;
+            this.saveState();
+          }
+        }
       }
+    } catch (err) {
+      // Silent catch
+    }
+  }
 
+  private async placeRealOrder(side: 'buy' | 'sell', quantity: number, isClose: boolean = false): Promise<string | null> {
+    try {
       let lots = quantity;
       if (this.settings?.quantityType === 'BTC') lots = quantity * 1000;
       else if (this.settings?.quantityType === 'USD' && this.lastPrice) {
@@ -627,39 +868,47 @@ export class TradingService {
       }
       const finalSize = Math.max(1, Math.floor(lots));
 
-      const timestamp = Math.floor(Date.now() / 1000);
-      const method = 'POST';
-      const path = '/v2/orders';
-      const body = JSON.stringify({
-        symbol: 'BTCUSD',
-        side,
-        order_type: 'limit_order',
-        size: finalSize,
-        limit_price: this.lastPrice
-      });
-
-      const signatureData = method + timestamp + path + body;
-      const signature = crypto.createHmac('sha256', this.apiSecret).update(signatureData).digest('hex');
-
-      const response = await fetch('https://api.delta.exchange' + path, {
-        method,
-        headers: {
-          'Content-Type': 'application/json',
-          'api-key': this.apiKey,
-          'signature': signature,
-          'timestamp': timestamp.toString()
-        },
-        body
-      });
-
-      const data = await response.json() as any;
-      if (data.result) {
-        this.log(`Real order successful: ${side} ${finalSize} lots`, 'success');
-      } else {
-        this.log(`Real order failed: ${data.error || 'Unknown error'}`, 'error');
+      if (!this.lastPrice) {
+        this.log('Cannot place order: last price unknown', 'error');
+        return null;
       }
-    } catch (err) {
-      this.log(`Error placing real order: ${err}`, 'error');
+
+      const productId = productMap['BTCUSD'] || 1;
+
+      const orderData: any = {
+        product_id: productId,
+        side,
+        order_type: 'market_order',
+        size: finalSize
+      };
+
+      if (isClose) {
+        orderData.reduce_only = true;
+      }
+
+      this.log(`Placing real market order: ${side} ${finalSize} lots | Close: ${isClose}`, 'info');
+      
+      const result = await deltaRequest('POST', '/v2/orders', orderData);
+      
+      if (result.success || result.result) {
+        const orderId = result.result?.id || result.result?.order_id;
+        this.log(`Real order successful: ${side} ${finalSize} lots | Order ID: ${orderId}`, 'success');
+        return orderId ? String(orderId) : null;
+      } else {
+        this.log(`Real order failed: ${JSON.stringify(result.error || result)}`, 'error');
+        return null;
+      }
+    } catch (err: any) {
+      // deltaRequest throws stringified error, let's try to parse it for better logging if possible
+      let errorMessage = err.message || String(err);
+      try {
+        const parsed = JSON.parse(err.message);
+        errorMessage = JSON.stringify(parsed);
+      } catch (e) {
+        // Not JSON, keep original
+      }
+      this.log(`Error placing real order: ${errorMessage}`, 'error');
+      return null;
     }
   }
 }

@@ -3,6 +3,22 @@ import crypto from 'crypto';
 
 const DELTA_BASE_URL = "https://api.india.delta.exchange";
 
+export let productMap: Record<string, number> = { 'BTCUSD': 1 };
+
+export async function fetchProducts() {
+  try {
+    const result = await deltaRequest("GET", "/v2/products") as any;
+    if (result.success && Array.isArray(result.result)) {
+      result.result.forEach((p: any) => {
+        productMap[p.symbol] = p.id;
+      });
+      console.log(`[Delta] Loaded ${result.result.length} products.`);
+    }
+  } catch (error: any) {
+    console.warn("[Delta] Could not fetch products:", error.message);
+  }
+}
+
 function getCredentials() {
   const apiKey = process.env.DELTA_API_KEY?.trim();
   const apiSecret = process.env.DELTA_API_SECRET?.trim();
