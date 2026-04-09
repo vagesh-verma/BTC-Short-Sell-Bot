@@ -1040,17 +1040,30 @@ export class TradingService {
       const day = tomorrow.getUTCDate();
       const month = tomorrow.getUTCMonth() + 1;
       const year = tomorrow.getUTCFullYear();
-      const expiryStr = `${day}-${month}-${year}`;
+      
+      const d = day.toString();
+      const dd = day < 10 ? `0${day}` : d;
+      const m = month.toString();
+      const mm = month < 10 ? `0${month}` : m;
+      const y = year.toString();
+
+      const formats = [
+        `${d}-${m}-${y}`,
+        `${dd}-${m}-${y}`,
+        `${dd}-${mm}-${y}`,
+        `${d}-${mm}-${y}`
+      ];
 
       const tomorrowOptions = productsResult.result.filter((p: any) => {
         const isCorrectType = isCall ? p.contract_type === 'call_options' : p.contract_type === 'put_options';
         const isBTC = p.underlying_asset && p.underlying_asset.symbol === 'BTC';
-        const isTomorrow = p.description && p.description.includes(expiryStr);
+        const desc = p.description || "";
+        const isTomorrow = formats.some(f => desc.includes(f));
         return isCorrectType && isBTC && isTomorrow;
       });
 
       if (tomorrowOptions.length === 0) {
-        this.log(`No BTC ${isCall ? 'call' : 'put'} options found for expiry ${expiryStr}`, 'warning');
+        this.log(`No BTC ${isCall ? 'call' : 'put'} options found for expiry ${d}-${m}-${y}`, 'warning');
         return null;
       }
 
@@ -1059,25 +1072,44 @@ export class TradingService {
 
       this.log(`Checking ${tomorrowOptions.length} options for delta ${targetDelta}...`, 'info');
 
-      for (const opt of tomorrowOptions) {
-        try {
-          const tickerResult = await deltaRequest("GET", `/v2/tickers/${opt.symbol}`);
-          if (tickerResult.success && tickerResult.result.greeks) {
-            const delta = Math.abs(parseFloat(tickerResult.result.greeks.delta));
-            const diff = Math.abs(delta - targetDelta);
-            if (diff < minDeltaDiff) {
-              minDeltaDiff = diff;
-              bestOption = {
-                symbol: opt.symbol,
-                id: opt.id,
-                delta: delta,
-                mark_price: parseFloat(tickerResult.result.mark_price),
-                best_bid: parseFloat(tickerResult.result.quotes.best_bid),
-                best_ask: parseFloat(tickerResult.result.quotes.best_ask)
-              };
-            }
+      // Fetch tickers in parallel with concurrency limit to avoid hanging on large /v2/tickers call
+      const tickers: any[] = [];
+      const batchSize = 10;
+      for (let i = 0; i < tomorrowOptions.length; i += batchSize) {
+        const batch = tomorrowOptions.slice(i, i + batchSize);
+        const results = await Promise.all(batch.map(async (opt: any) => {
+          try {
+            const res = await deltaRequest("GET", `/v2/tickers/${opt.symbol}`);
+            return res.success ? { opt, ticker: res.result } : null;
+          } catch (e) {
+            return null;
           }
-        } catch (e) { }
+        }));
+        tickers.push(...results.filter((r: any) => r !== null));
+      }
+
+      for (const item of tickers) {
+        const { opt, ticker } = item;
+        if (ticker && ticker.greeks) {
+          const delta = Math.abs(parseFloat(ticker.greeks.delta));
+          const diff = Math.abs(delta - targetDelta);
+          if (diff < minDeltaDiff) {
+            minDeltaDiff = diff;
+            bestOption = {
+              symbol: opt.symbol,
+              id: opt.id,
+              delta: delta,
+              mark_price: parseFloat(ticker.mark_price),
+              best_bid: parseFloat(ticker.quotes.best_bid),
+              best_ask: parseFloat(ticker.quotes.best_ask)
+            };
+          }
+        }
+      }
+      if (bestOption) {
+        this.log(`Found best option: ${bestOption.symbol} with delta ${bestOption.delta.toFixed(3)}`, 'success');
+      } else {
+        this.log(`No option found with greeks for delta ${targetDelta}`, 'warning');
       }
       return bestOption;
     } catch (err) {
