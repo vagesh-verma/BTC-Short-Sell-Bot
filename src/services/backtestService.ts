@@ -36,6 +36,8 @@ export interface BacktestSettings {
   strategyType?: 'SHORT_BTC' | 'CALL_SPREAD';
   shortCallDelta?: number;
   longCallDelta?: number;
+  dailyProfitLimit?: number;
+  dailyLossLimit?: number;
 }
 
 export interface BacktestResult {

@@ -125,6 +125,8 @@ export default function App() {
     strategyType: 'SHORT_BTC',
     shortCallDelta: 0.3,
     longCallDelta: 0.1,
+    dailyProfitLimit: 0,
+    dailyLossLimit: 0,
   });
 
   const [isRealTrading, setIsRealTrading] = useState(false);
@@ -2411,6 +2413,26 @@ export default function App() {
                     className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
                   />
                 </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-white/30 uppercase">Daily Profit Limit ($)</label>
+                    <input 
+                      type="number" step="1"
+                      value={settings.dailyProfitLimit || 0}
+                      onChange={(e) => setSettings({...settings, dailyProfitLimit: parseFloat(e.target.value) || 0})}
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-white/30 uppercase">Daily Loss Limit ($)</label>
+                    <input 
+                      type="number" step="1"
+                      value={settings.dailyLossLimit || 0}
+                      onChange={(e) => setSettings({...settings, dailyLossLimit: parseFloat(e.target.value) || 0})}
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
+                    />
+                  </div>
+                </div>
               </div>
 
               <div className="space-y-4">
@@ -2666,7 +2688,15 @@ export default function App() {
                   )}>
                     ${(isRealTrading ? (realBalance || 0) : livePaperBalance).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </div>
-                  <div className="mt-2 text-[10px] text-white/30">{isRealTrading ? 'Connected to Delta Exchange' : 'Starting: $10,000.00'}</div>
+                  <div className="mt-2 flex justify-between items-center">
+                    <div className="text-[10px] text-white/30">{isRealTrading ? 'Connected to Delta Exchange' : 'Starting: $10,000.00'}</div>
+                    <div className={cn(
+                      "text-[10px] font-bold",
+                      (serverTradingStatus?.dailyProfit || 0) >= 0 ? "text-emerald-500" : "text-red-500"
+                    )}>
+                      Daily: ${(serverTradingStatus?.dailyProfit || 0).toFixed(2)}
+                    </div>
+                  </div>
                 </div>
 
                 <div className="bg-[#0D0D0E] border border-white/5 rounded-2xl p-6 shadow-xl">

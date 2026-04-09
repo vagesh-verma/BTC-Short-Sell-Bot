@@ -29,6 +29,8 @@ interface TradingSettings {
   strategyType: 'SHORT_BTC' | 'CALL_SPREAD';
   shortCallDelta: number;
   longCallDelta: number;
+  dailyProfitLimit: number;
+  dailyLossLimit: number;
 }
 
 interface ActiveTrade {
@@ -92,6 +94,8 @@ export class TradingService {
   private tickerCount: number = 0;
   private lastProcessTime: number = 0;
   private lastTradeCloseTime: number = 0;
+  private dailyProfit: number = 0;
+  private lastDailyReset: number = 0;
   private processInterval: number = 5000; // Process at most once every 5 seconds
 
   private apiKey: string = process.env.DELTA_API_KEY || '';
@@ -119,6 +123,8 @@ export class TradingService {
           if (this.settings.strategyType === undefined) this.settings.strategyType = 'SHORT_BTC';
           if (this.settings.shortCallDelta === undefined) this.settings.shortCallDelta = 0.3;
           if (this.settings.longCallDelta === undefined) this.settings.longCallDelta = 0.1;
+          if (this.settings.dailyProfitLimit === undefined) this.settings.dailyProfitLimit = 0;
+          if (this.settings.dailyLossLimit === undefined) this.settings.dailyLossLimit = 0;
         }
         
         this.log('Trading settings loaded from disk', 'success');
@@ -140,6 +146,8 @@ export class TradingService {
         this.closedTrades = state.closedTrades || [];
         this.isRunning = state.isRunning || false;
         this.isRealTrading = state.isRealTrading || false;
+        this.dailyProfit = state.dailyProfit || 0;
+        this.lastDailyReset = state.lastDailyReset || 0;
         this.log('Trading state loaded from disk', 'success');
         
         if (this.isRunning) {
@@ -158,7 +166,9 @@ export class TradingService {
         activeTrade: this.activeTrade,
         closedTrades: this.closedTrades,
         isRunning: this.isRunning,
-        isRealTrading: this.isRealTrading
+        isRealTrading: this.isRealTrading,
+        dailyProfit: this.dailyProfit,
+        lastDailyReset: this.lastDailyReset
       };
       fs.writeFileSync(this.statePath, JSON.stringify(state, null, 2));
     } catch (err) {
@@ -282,8 +292,20 @@ export class TradingService {
       lastUpdate: this.lastUpdate,
       logs: this.logs.slice(0, 20),
       hasModels: !!(this.model1h && this.model4h),
-      settings: this.settings
+      settings: this.settings,
+      dailyProfit: this.dailyProfit
     };
+  }
+
+  private checkDailyReset() {
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    if (this.lastDailyReset < today) {
+      this.dailyProfit = 0;
+      this.lastDailyReset = today;
+      this.log('Daily profit/loss reset for the new day', 'info');
+      this.saveState();
+    }
   }
 
   private async fetchInitialData() {
@@ -440,6 +462,7 @@ export class TradingService {
 
     // Reload settings to ensure we use the latest threshold
     this.loadSettings();
+    this.checkDailyReset();
 
     if (this.lastPrice === null) {
       this.log(`First price received: $${price}`, 'success');
@@ -749,10 +772,10 @@ export class TradingService {
         }
       }
 
-      const stopLossPrice = this.activeTrade.type === 'SHORT'
+      const stopLossPrice = (this.activeTrade.type === 'SHORT' || this.activeTrade.type === 'CALL_SPREAD')
         ? this.activeTrade.entryPrice * (1 + this.settings.stopLoss)
         : this.activeTrade.entryPrice * (1 - this.settings.stopLoss);
-      const takeProfitPrice = this.activeTrade.type === 'SHORT'
+      const takeProfitPrice = (this.activeTrade.type === 'SHORT' || this.activeTrade.type === 'CALL_SPREAD')
         ? this.activeTrade.entryPrice * (1 - this.settings.takeProfit)
         : this.activeTrade.entryPrice * (1 + this.settings.takeProfit);
 
@@ -763,7 +786,7 @@ export class TradingService {
         highestProfit = profitPct;
         this.activeTrade.highestProfitPct = highestProfit;
         if (profitPct >= this.settings.trailingStopActivation) {
-          if (this.activeTrade.type === 'SHORT') {
+          if (this.activeTrade.type === 'SHORT' || this.activeTrade.type === 'CALL_SPREAD') {
             currentTrailingStop = price * (1 + this.settings.trailingStopOffset);
           } else {
             currentTrailingStop = price * (1 - this.settings.trailingStopOffset);
@@ -775,7 +798,7 @@ export class TradingService {
       let shouldExit = false;
       let reason = '';
 
-      if (this.activeTrade.type === 'SHORT') {
+      if (this.activeTrade.type === 'SHORT' || this.activeTrade.type === 'CALL_SPREAD') {
         if (price >= stopLossPrice) {
           shouldExit = true;
           reason = 'STOP_LOSS';
@@ -830,6 +853,8 @@ export class TradingService {
         this.closedTrades.unshift(closedTrade);
         if (this.closedTrades.length > 100) this.closedTrades.pop();
 
+        this.dailyProfit += profit;
+
         if (this.isRealTrading) {
           if (this.activeTrade.type === 'CALL_SPREAD' && this.activeTrade.legs) {
             for (const leg of this.activeTrade.legs) {
@@ -877,7 +902,22 @@ export class TradingService {
       // Session check
       let canTrade = true;
       const hour = nowDate.getUTCHours();
-      if (this.settings.useSessionTrading) {
+
+      // Daily Limits check
+      if (this.settings.dailyProfitLimit > 0 && this.dailyProfit >= this.settings.dailyProfitLimit) {
+        if (this.tickerCount % 100 === 0) {
+          this.log(`Daily profit limit reached: $${this.dailyProfit.toFixed(2)} >= $${this.settings.dailyProfitLimit}`, 'warning');
+        }
+        canTrade = false;
+      }
+      if (this.settings.dailyLossLimit > 0 && this.dailyProfit <= -this.settings.dailyLossLimit) {
+        if (this.tickerCount % 100 === 0) {
+          this.log(`Daily loss limit reached: $${this.dailyProfit.toFixed(2)} <= -$${this.settings.dailyLossLimit}`, 'warning');
+        }
+        canTrade = false;
+      }
+
+      if (this.settings.useSessionTrading && canTrade) {
         const isAsia = hour >= this.settings.asiaStart && hour < this.settings.asiaEnd;
         const isNY = hour >= this.settings.nyStart && hour < this.settings.nyEnd;
         canTrade = isAsia || isNY;
@@ -996,15 +1036,21 @@ export class TradingService {
       const now = new Date();
       const tomorrow = new Date(now);
       tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
-      tomorrow.setUTCHours(12, 0, 0, 0);
-      const tomorrowStr = tomorrow.toISOString().split('T')[0];
+      
+      const day = tomorrow.getUTCDate();
+      const month = tomorrow.getUTCMonth() + 1;
+      const year = tomorrow.getUTCFullYear();
+      const expiryStr = `${day}-${month}-${year}`;
 
       const tomorrowOptions = productsResult.result.filter((p: any) => {
-        return p.is_call === isCall && p.underlying_asset === 'BTC' && p.expiry_datetime.startsWith(tomorrowStr);
+        const isCorrectType = isCall ? p.contract_type === 'call_options' : p.contract_type === 'put_options';
+        const isBTC = p.underlying_asset && p.underlying_asset.symbol === 'BTC';
+        const isTomorrow = p.description && p.description.includes(expiryStr);
+        return isCorrectType && isBTC && isTomorrow;
       });
 
       if (tomorrowOptions.length === 0) {
-        this.log(`No BTC ${isCall ? 'call' : 'put'} options found for expiry ${tomorrowStr}`, 'warning');
+        this.log(`No BTC ${isCall ? 'call' : 'put'} options found for expiry ${expiryStr}`, 'warning');
         return null;
       }
 
