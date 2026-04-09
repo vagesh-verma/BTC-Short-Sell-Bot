@@ -50,6 +50,8 @@ interface ActiveTrade {
     side: 'buy' | 'sell';
     entryPrice: number;
     size: number;
+    pnl?: number;
+    markPrice?: number;
   }[];
 }
 
@@ -76,6 +78,7 @@ interface LogEntry {
 export class TradingService {
   private isRunning: boolean = false;
   private isRealTrading: boolean = false;
+  private isOpeningTrade: boolean = false;
   private settings: TradingSettings | null = null;
   private model1h: GRUModel | null = null;
   private model4h: GRUModel | null = null;
@@ -730,10 +733,21 @@ export class TradingService {
         const size = this.activeTrade.size || 0;
         
         if (this.activeTrade.type === 'CALL_SPREAD' && this.activeTrade.legs) {
-          // For options spread, we'd need to fetch current mark prices of legs
-          // For now, we'll use a simplified underlying-based profit or just 0 until we fetch leg prices
-          // Let's try to fetch mark prices for legs if it's been a while
-          profitPct = (this.activeTrade.entryPrice - price) / this.activeTrade.entryPrice;
+          // Use real PNL from syncPositionWithRest if available
+          if (this.activeTrade.pnl !== undefined) {
+            // Estimate initial value for profit percentage
+            const initialValueUSD = this.activeTrade.legs.reduce((acc, leg) => acc + (leg.entryPrice * Math.abs(leg.size) * 0.001), 0);
+            profitPct = this.activeTrade.pnl / Math.max(1, Math.abs(initialValueUSD));
+            this.activeTrade.pnlPct = profitPct * 100;
+          } else {
+            // Fallback to underlying price movement
+            profitPct = (this.activeTrade.entryPrice - price) / this.activeTrade.entryPrice;
+          }
+          
+          // Sync positions periodically
+          if (Date.now() - this.lastProcessTime > 15000) {
+            this.syncPositionWithRest();
+          }
         } else if (size !== 0 && entry > 0) {
           // PNL Calculation logic from user script: (Entry - Mark) * Size * 0.001 (for SHORT)
           // For BTCUSD, contract_value is 0.001
@@ -923,31 +937,36 @@ export class TradingService {
         canTrade = isAsia || isNY;
       }
 
-      if (canTrade) {
-        if (this.settings.strategyType === 'CALL_SPREAD') {
-          await this.executeCallSpread(price, prediction, currentFeatures);
-        } else {
-          this.log(`Opening SHORT at $${price} | Prediction: ${prediction.toFixed(4)}`, 'success');
-          this.activeTrade = {
-            type: 'SHORT',
-            entryPrice: price,
-            entryTime: Date.now(),
-            highestProfitPct: 0,
-            trailingStopPrice: null,
-            prediction: prediction,
-            features: currentFeatures
-          };
-          if (this.isRealTrading) {
-            this.placeRealOrder('sell', this.settings.quantity, false).then(orderId => {
-              if (orderId && this.activeTrade) {
-                this.activeTrade.orderId = orderId;
-                this.saveState();
-                // Try to sync position immediately after market order
-                setTimeout(() => this.syncPositionWithRest(), 1000);
-              }
-            });
+      if (canTrade && !this.activeTrade && !this.isOpeningTrade) {
+        this.isOpeningTrade = true;
+        try {
+          if (this.settings.strategyType === 'CALL_SPREAD') {
+            await this.executeCallSpread(price, prediction, currentFeatures);
+          } else {
+            this.log(`Opening SHORT at $${price} | Prediction: ${prediction.toFixed(4)}`, 'success');
+            this.activeTrade = {
+              type: 'SHORT',
+              entryPrice: price,
+              entryTime: Date.now(),
+              highestProfitPct: 0,
+              trailingStopPrice: null,
+              prediction: prediction,
+              features: currentFeatures
+            };
+            if (this.isRealTrading) {
+              this.placeRealOrder('sell', this.settings.quantity, false).then(orderId => {
+                if (orderId && this.activeTrade) {
+                  this.activeTrade.orderId = orderId;
+                  this.saveState();
+                  // Try to sync position immediately after market order
+                  setTimeout(() => this.syncPositionWithRest(), 1000);
+                }
+              });
+            }
+            this.saveState();
           }
-          this.saveState();
+        } finally {
+          this.isOpeningTrade = false;
         }
       }
     }
@@ -958,14 +977,33 @@ export class TradingService {
     try {
       const positions = await deltaRequest('GET', '/v2/positions?underlying_asset_symbol=BTC');
       if (positions.success && Array.isArray(positions.result)) {
-        const btcPos = positions.result.find((p: any) => p.symbol === 'BTCUSD' || p.symbol === 'BTCUSD_P');
-        if (btcPos) {
-          const entry = parseFloat(btcPos.avg_entry_price);
-          const size = parseFloat(btcPos.size);
-          if (size !== 0 && entry > 0) {
-            this.activeTrade.entryPrice = entry;
-            this.activeTrade.size = size;
-            this.saveState();
+        if (this.activeTrade.type === 'CALL_SPREAD' && this.activeTrade.legs) {
+          let totalPnl = 0;
+          for (const leg of this.activeTrade.legs) {
+            const legPos = positions.result.find((p: any) => p.symbol === leg.symbol);
+            if (legPos) {
+              leg.entryPrice = parseFloat(legPos.avg_entry_price);
+              leg.size = parseFloat(legPos.size);
+              leg.pnl = parseFloat(legPos.unrealized_pnl);
+              leg.markPrice = parseFloat(legPos.mark_price);
+              totalPnl += leg.pnl;
+            }
+          }
+          this.activeTrade.pnl = totalPnl;
+          // For profitPct of a spread, it's complex, but we can use totalPnl / totalInitialMargin if we had it.
+          // For now, let's just update pnl.
+          this.saveState();
+        } else {
+          const btcPos = positions.result.find((p: any) => p.symbol === 'BTCUSD' || p.symbol === 'BTCUSD_P');
+          if (btcPos) {
+            const entry = parseFloat(btcPos.avg_entry_price);
+            const size = parseFloat(btcPos.size);
+            if (size !== 0 && entry > 0) {
+              this.activeTrade.entryPrice = entry;
+              this.activeTrade.size = size;
+              this.activeTrade.pnl = parseFloat(btcPos.unrealized_pnl);
+              this.saveState();
+            }
           }
         }
       }
@@ -1131,17 +1169,13 @@ export class TradingService {
         return null;
       }
 
-      // For options, quantity is usually in units of underlying (BTC)
-      // If quantityType is LOTS (0.001 BTC), we convert
-      let size = quantity;
-      if (this.settings?.quantityType === 'LOTS') size = quantity * 0.001;
+      // For options, size must be an integer (number of lots/contracts)
+      let lots = quantity;
+      if (this.settings?.quantityType === 'BTC') lots = quantity * 1000;
       else if (this.settings?.quantityType === 'USD' && this.lastPrice) {
-        size = quantity / this.lastPrice;
+        lots = (quantity / this.lastPrice) / 0.001;
       }
-      
-      // Delta options usually have a minimum size (e.g. 0.01 BTC)
-      // We'll just use the calculated size
-      const finalSize = size;
+      const finalSize = Math.max(1, Math.floor(lots));
 
       const orderData = {
         product_id: finalProductId,
@@ -1200,6 +1234,8 @@ export class TradingService {
         };
         this.saveState();
         this.log(`Real Call Spread opened: Sell ${shortLeg.symbol} | Buy ${longLeg.symbol}`, 'success');
+        // Sync positions after a short delay to allow exchange to process
+        setTimeout(() => this.syncPositionWithRest(), 2000);
       }
     } else {
       this.activeTrade = {

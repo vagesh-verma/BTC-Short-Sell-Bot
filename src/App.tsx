@@ -2812,11 +2812,21 @@ export default function App() {
                       <div className="pt-4 border-t border-white/5 space-y-2">
                         <div className="text-[10px] text-white/40 font-bold uppercase tracking-wider">Spread Legs</div>
                         {activeLiveTrade.legs.map((leg: any, idx: number) => (
-                          <div key={idx} className="flex justify-between items-center text-[10px]">
-                            <span className={cn(leg.side === 'sell' ? "text-red-400" : "text-emerald-400")}>
-                              {leg.side.toUpperCase()} {leg.symbol}
-                            </span>
-                            <span className="text-white/60 font-mono">${leg.entryPrice.toFixed(2)}</span>
+                          <div key={idx} className="space-y-1 pb-1 border-b border-white/5 last:border-0">
+                            <div className="flex justify-between items-center text-[10px]">
+                              <span className={cn(leg.side === 'sell' ? "text-red-400" : "text-emerald-400")}>
+                                {leg.side.toUpperCase()} {leg.symbol}
+                              </span>
+                              <span className="text-white/60 font-mono">${leg.entryPrice.toFixed(2)}</span>
+                            </div>
+                            {leg.pnl !== undefined && (
+                              <div className="flex justify-between items-center text-[9px]">
+                                <span className="text-white/30 uppercase">PNL</span>
+                                <span className={cn("font-mono font-bold", leg.pnl >= 0 ? "text-emerald-400" : "text-red-400")}>
+                                  {leg.pnl >= 0 ? '+' : ''}{leg.pnl.toFixed(4)} USDT
+                                </span>
+                              </div>
+                            )}
                           </div>
                         ))}
                       </div>
