@@ -30,6 +30,12 @@ export interface BacktestSettings {
   nyStart: number;
   nyEnd: number;
   useOnlyCompletedCandles?: boolean;
+  minSignalVelocity?: number;
+  mcPasses?: number;
+  maxUncertainty?: number;
+  strategyType?: 'SHORT_BTC' | 'CALL_SPREAD';
+  shortCallDelta?: number;
+  longCallDelta?: number;
 }
 
 export interface BacktestResult {
@@ -42,6 +48,8 @@ export interface BacktestResult {
   avgLoss: number;
   maxProfit: number;
   maxLoss: number;
+  candles: Candle[];
+  predictions: number[];
 }
 
 export function runBacktest(
@@ -51,7 +59,8 @@ export function runBacktest(
   initialBalance: number = 10000,
   windowSize: number = 20,
   features?: number[][],
-  featureNames?: string[]
+  featureNames?: string[],
+  uncertainties?: number[]
 ): BacktestResult {
   const trades: Trade[] = [];
   let balance = initialBalance;
@@ -73,6 +82,7 @@ export function runBacktest(
     if (!candle) break;
     
     const prediction = predictions[i];
+    const uncertainty = uncertainties ? uncertainties[i] : 0;
     const now = new Date(candle.time);
     const hour = now.getUTCHours();
 
@@ -157,7 +167,14 @@ export function runBacktest(
     }
 
     // Check for entry if not in trade
-    if (!activeTrade && prediction > settings.threshold) {
+    const velocity = i > 0 ? (prediction - predictions[i - 1]) : 0;
+    const minVelocity = settings.minSignalVelocity || 0;
+    const maxUncertainty = settings.maxUncertainty || 1;
+    const mcPasses = settings.mcPasses || 1;
+
+    const passesFilter = mcPasses <= 1 || uncertainty <= maxUncertainty;
+
+    if (!activeTrade && prediction > settings.threshold && velocity >= minVelocity && passesFilter) {
       let canTrade = true;
       const hour = new Date(candle.time).getUTCHours();
 
@@ -223,6 +240,8 @@ export function runBacktest(
     avgProfit,
     avgLoss,
     maxProfit,
-    maxLoss
+    maxLoss,
+    candles: candles.slice(windowSize),
+    predictions
   };
 }

@@ -3,7 +3,7 @@ import { GRUModel } from './modelService';
 import * as indicators from './indicatorService';
 import fetch from 'node-fetch';
 import crypto from 'crypto';
-import { deltaRequest, productMap } from './deltaApi';
+import { deltaRequest, productMap, fetchProducts } from './deltaApi';
 import fs from 'fs';
 import path from 'path';
 
@@ -23,10 +23,16 @@ interface TradingSettings {
   nyStart: number;
   nyEnd: number;
   useOnlyCompletedCandles: boolean;
+  mcPasses: number;
+  maxUncertainty: number;
+  minSignalVelocity: number;
+  strategyType: 'SHORT_BTC' | 'CALL_SPREAD';
+  shortCallDelta: number;
+  longCallDelta: number;
 }
 
 interface ActiveTrade {
-  type: 'LONG' | 'SHORT';
+  type: 'LONG' | 'SHORT' | 'CALL_SPREAD';
   entryPrice: number;
   entryTime: number;
   highestProfitPct: number;
@@ -37,10 +43,16 @@ interface ActiveTrade {
   size?: number;
   features?: Record<string, number>;
   orderId?: string;
+  legs?: {
+    symbol: string;
+    side: 'buy' | 'sell';
+    entryPrice: number;
+    size: number;
+  }[];
 }
 
 interface ClosedTrade {
-  type: 'LONG' | 'SHORT';
+  type: 'LONG' | 'SHORT' | 'CALL_SPREAD';
   entryPrice: number;
   exitPrice: number;
   entryTime: number;
@@ -71,6 +83,7 @@ export class TradingService {
   private activeTrade: ActiveTrade | null = null;
   private closedTrades: ClosedTrade[] = [];
   private lastPrediction: number | null = null;
+  private previousPrediction: number | null = null;
   private lastPrice: number | null = null;
   private lastFeatures: Record<string, number> | null = null;
   private lastParams: any = null;
@@ -97,6 +110,17 @@ export class TradingService {
       if (fs.existsSync(this.settingsPath)) {
         const data = fs.readFileSync(this.settingsPath, 'utf8');
         this.settings = JSON.parse(data);
+        
+        // Ensure defaults for new settings
+        if (this.settings) {
+          if (this.settings.mcPasses === undefined) this.settings.mcPasses = 1;
+          if (this.settings.maxUncertainty === undefined) this.settings.maxUncertainty = 0.1;
+          if (this.settings.minSignalVelocity === undefined) this.settings.minSignalVelocity = 0.1;
+          if (this.settings.strategyType === undefined) this.settings.strategyType = 'SHORT_BTC';
+          if (this.settings.shortCallDelta === undefined) this.settings.shortCallDelta = 0.3;
+          if (this.settings.longCallDelta === undefined) this.settings.longCallDelta = 0.1;
+        }
+        
         this.log('Trading settings loaded from disk', 'success');
       }
     } catch (err) {
@@ -199,8 +223,15 @@ export class TradingService {
       this.log('Manual trade closure requested via API', 'info');
       
       if (this.isRealTrading) {
-        const side = this.activeTrade.type === 'SHORT' ? 'buy' : 'sell';
-        await this.placeRealOrder(side, this.settings?.quantity || 1, true);
+        if (this.activeTrade.type === 'CALL_SPREAD' && this.activeTrade.legs) {
+          for (const leg of this.activeTrade.legs) {
+            const exitSide = leg.side === 'sell' ? 'buy' : 'sell';
+            await this.placeOptionOrder(leg.symbol, exitSide, leg.size);
+          }
+        } else {
+          const side = this.activeTrade.type === 'SHORT' ? 'buy' : 'sell';
+          await this.placeRealOrder(side, this.settings?.quantity || 1, true);
+        }
       }
 
       this.activeTrade = null;
@@ -625,14 +656,24 @@ export class TradingService {
     });
 
     let prediction = 0;
+    let uncertainty = 0;
     try {
-      prediction = this.model1h.predict(x1h);
+      const mcPasses = this.settings?.mcPasses || 1;
+      const result = this.model1h.predictMultiple(x1h, mcPasses);
+      prediction = result.mean;
+      uncertainty = result.std;
     } catch (err: any) {
       this.log(`1h Prediction failed: ${err.message}`, 'error');
     }
+    
+    // Calculate Signal Velocity (Temporal Delta)
+    const velocity = this.previousPrediction !== null ? (prediction - this.previousPrediction) : 0;
+    
+    this.previousPrediction = this.lastPrediction;
     this.lastPrediction = prediction;
     this.lastFeatures = currentFeatures;
     this.lastParams = {
+      ...this.lastParams, // Keep existing if any
       rsi: rsi1h[rsi1h.length - 1],
       ema: ema1h[ema1h.length - 1],
       ema9: ema9_1h[ema9_1h.length - 1],
@@ -648,6 +689,8 @@ export class TradingService {
       volatility: vol1h[vol1h.length - 1],
       harami: harami1h[harami1h.length - 1],
       marubozu: marubozu1h[marubozu1h.length - 1],
+      uncertainty: uncertainty,
+      velocity: velocity,
       engulfing: engulfing1h[engulfing1h.length - 1],
       session: nowDate.getUTCHours() >= this.settings.asiaStart && nowDate.getUTCHours() < this.settings.asiaEnd ? 'Asia' : 
                nowDate.getUTCHours() >= this.settings.nyStart && nowDate.getUTCHours() < this.settings.nyEnd ? 'New York' : 'Off-Session',
@@ -663,7 +706,12 @@ export class TradingService {
         const entry = this.activeTrade.entryPrice;
         const size = this.activeTrade.size || 0;
         
-        if (size !== 0 && entry > 0) {
+        if (this.activeTrade.type === 'CALL_SPREAD' && this.activeTrade.legs) {
+          // For options spread, we'd need to fetch current mark prices of legs
+          // For now, we'll use a simplified underlying-based profit or just 0 until we fetch leg prices
+          // Let's try to fetch mark prices for legs if it's been a while
+          profitPct = (this.activeTrade.entryPrice - price) / this.activeTrade.entryPrice;
+        } else if (size !== 0 && entry > 0) {
           // PNL Calculation logic from user script: (Entry - Mark) * Size * 0.001 (for SHORT)
           // For BTCUSD, contract_value is 0.001
           const contractValue = 0.001;
@@ -783,7 +831,14 @@ export class TradingService {
         if (this.closedTrades.length > 100) this.closedTrades.pop();
 
         if (this.isRealTrading) {
-          await this.placeRealOrder(this.activeTrade.type === 'SHORT' ? 'buy' : 'sell', this.settings.quantity, true);
+          if (this.activeTrade.type === 'CALL_SPREAD' && this.activeTrade.legs) {
+            for (const leg of this.activeTrade.legs) {
+              const exitSide = leg.side === 'sell' ? 'buy' : 'sell';
+              await this.placeOptionOrder(leg.symbol, exitSide, leg.size);
+            }
+          } else {
+            await this.placeRealOrder(this.activeTrade.type === 'SHORT' ? 'buy' : 'sell', this.settings.quantity, true);
+          }
         }
         this.activeTrade = null;
         this.lastTradeCloseTime = Date.now();
@@ -794,6 +849,22 @@ export class TradingService {
         this.saveState();
       }
     } else if (prediction > this.settings.threshold) {
+      // 1. Uncertainty Filter (MC Dropout)
+      if (this.settings.mcPasses > 1 && uncertainty > this.settings.maxUncertainty) {
+        if (this.tickerCount % 100 === 0) {
+          this.log(`Signal detected but uncertainty too high: ${uncertainty.toFixed(4)} > ${this.settings.maxUncertainty}`, 'info');
+        }
+        return;
+      }
+
+      // 2. Signal Velocity Filter (Temporal Delta)
+      if (velocity < this.settings.minSignalVelocity) {
+        if (this.tickerCount % 100 === 0) {
+          this.log(`Signal detected but velocity too low: ${velocity.toFixed(4)} < ${this.settings.minSignalVelocity}`, 'info');
+        }
+        return;
+      }
+
       // Cooldown check: don't re-open within 5 minutes of closing a trade
       const cooldownMs = 10 * 1000;
       if (Date.now() - this.lastTradeCloseTime < cooldownMs) {
@@ -813,27 +884,31 @@ export class TradingService {
       }
 
       if (canTrade) {
-        this.log(`Opening SHORT at $${price} | Prediction: ${prediction.toFixed(4)}`, 'success');
-        this.activeTrade = {
-          type: 'SHORT',
-          entryPrice: price,
-          entryTime: Date.now(),
-          highestProfitPct: 0,
-          trailingStopPrice: null,
-          prediction: prediction,
-          features: currentFeatures
-        };
-        if (this.isRealTrading) {
-          this.placeRealOrder('sell', this.settings.quantity, false).then(orderId => {
-            if (orderId && this.activeTrade) {
-              this.activeTrade.orderId = orderId;
-              this.saveState();
-              // Try to sync position immediately after market order
-              setTimeout(() => this.syncPositionWithRest(), 1000);
-            }
-          });
+        if (this.settings.strategyType === 'CALL_SPREAD') {
+          await this.executeCallSpread(price, prediction, currentFeatures);
+        } else {
+          this.log(`Opening SHORT at $${price} | Prediction: ${prediction.toFixed(4)}`, 'success');
+          this.activeTrade = {
+            type: 'SHORT',
+            entryPrice: price,
+            entryTime: Date.now(),
+            highestProfitPct: 0,
+            trailingStopPrice: null,
+            prediction: prediction,
+            features: currentFeatures
+          };
+          if (this.isRealTrading) {
+            this.placeRealOrder('sell', this.settings.quantity, false).then(orderId => {
+              if (orderId && this.activeTrade) {
+                this.activeTrade.orderId = orderId;
+                this.saveState();
+                // Try to sync position immediately after market order
+                setTimeout(() => this.syncPositionWithRest(), 1000);
+              }
+            });
+          }
+          this.saveState();
         }
-        this.saveState();
       }
     }
   }
@@ -909,6 +984,161 @@ export class TradingService {
       }
       this.log(`Error placing real order: ${errorMessage}`, 'error');
       return null;
+    }
+  }
+
+  private async findOptionByDelta(isCall: boolean, targetDelta: number): Promise<any> {
+    try {
+      const query = isCall ? "C-BTC" : "P-BTC";
+      const productsResult = await deltaRequest("GET", `/v2/products?query=${query}`);
+      if (!productsResult.success) return null;
+
+      const now = new Date();
+      const tomorrow = new Date(now);
+      tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+      tomorrow.setUTCHours(12, 0, 0, 0);
+      const tomorrowStr = tomorrow.toISOString().split('T')[0];
+
+      const tomorrowOptions = productsResult.result.filter((p: any) => {
+        return p.is_call === isCall && p.underlying_asset === 'BTC' && p.expiry_datetime.startsWith(tomorrowStr);
+      });
+
+      if (tomorrowOptions.length === 0) {
+        this.log(`No BTC ${isCall ? 'call' : 'put'} options found for expiry ${tomorrowStr}`, 'warning');
+        return null;
+      }
+
+      let bestOption = null;
+      let minDeltaDiff = Infinity;
+
+      this.log(`Checking ${tomorrowOptions.length} options for delta ${targetDelta}...`, 'info');
+
+      for (const opt of tomorrowOptions) {
+        try {
+          const tickerResult = await deltaRequest("GET", `/v2/tickers/${opt.symbol}`);
+          if (tickerResult.success && tickerResult.result.greeks) {
+            const delta = Math.abs(parseFloat(tickerResult.result.greeks.delta));
+            const diff = Math.abs(delta - targetDelta);
+            if (diff < minDeltaDiff) {
+              minDeltaDiff = diff;
+              bestOption = {
+                symbol: opt.symbol,
+                id: opt.id,
+                delta: delta,
+                mark_price: parseFloat(tickerResult.result.mark_price),
+                best_bid: parseFloat(tickerResult.result.quotes.best_bid),
+                best_ask: parseFloat(tickerResult.result.quotes.best_ask)
+              };
+            }
+          }
+        } catch (e) { }
+      }
+      return bestOption;
+    } catch (err) {
+      this.log(`Error finding options by delta: ${err}`, 'error');
+      return null;
+    }
+  }
+
+  private async placeOptionOrder(symbol: string, side: 'buy' | 'sell', quantity: number): Promise<string | null> {
+    try {
+      const productId = productMap[symbol];
+      if (!productId) {
+        // Try to fetch products again if not found
+        await fetchProducts();
+      }
+      const finalProductId = productMap[symbol];
+      if (!finalProductId) {
+        this.log(`Product ID not found for ${symbol}`, 'error');
+        return null;
+      }
+
+      // For options, quantity is usually in units of underlying (BTC)
+      // If quantityType is LOTS (0.001 BTC), we convert
+      let size = quantity;
+      if (this.settings?.quantityType === 'LOTS') size = quantity * 0.001;
+      else if (this.settings?.quantityType === 'USD' && this.lastPrice) {
+        size = quantity / this.lastPrice;
+      }
+      
+      // Delta options usually have a minimum size (e.g. 0.01 BTC)
+      // We'll just use the calculated size
+      const finalSize = size;
+
+      const orderData = {
+        product_id: finalProductId,
+        side,
+        order_type: 'market_order',
+        size: finalSize
+      };
+
+      this.log(`Placing option market order: ${side} ${finalSize} ${symbol}`, 'info');
+      const result = await deltaRequest('POST', '/v2/orders', orderData);
+      
+      if (result.success || result.result) {
+        return String(result.result?.id || result.result?.order_id);
+      }
+      return null;
+    } catch (err) {
+      this.log(`Error placing option order: ${err}`, 'error');
+      return null;
+    }
+  }
+
+  private async executeCallSpread(price: number, prediction: number, features: any) {
+    if (!this.settings) return;
+    this.log(`Executing Call Spread strategy...`, 'info');
+
+    const shortLeg = await this.findOptionByDelta(true, this.settings.shortCallDelta);
+    const longLeg = await this.findOptionByDelta(true, this.settings.longCallDelta);
+
+    if (!shortLeg || !longLeg) {
+      this.log('Failed to find suitable option legs for call spread', 'error');
+      return;
+    }
+
+    if (shortLeg.symbol === longLeg.symbol) {
+      this.log('Short and long legs are the same option. Check delta settings.', 'warning');
+      return;
+    }
+
+    if (this.isRealTrading) {
+      const shortOrderId = await this.placeOptionOrder(shortLeg.symbol, 'sell', this.settings.quantity);
+      const longOrderId = await this.placeOptionOrder(longLeg.symbol, 'buy', this.settings.quantity);
+
+      if (shortOrderId && longOrderId) {
+        this.activeTrade = {
+          type: 'CALL_SPREAD',
+          entryPrice: price,
+          entryTime: Date.now(),
+          highestProfitPct: 0,
+          trailingStopPrice: null,
+          prediction: prediction,
+          features: features,
+          legs: [
+            { symbol: shortLeg.symbol, side: 'sell', entryPrice: shortLeg.best_bid, size: this.settings.quantity },
+            { symbol: longLeg.symbol, side: 'buy', entryPrice: longLeg.best_ask, size: this.settings.quantity }
+          ]
+        };
+        this.saveState();
+        this.log(`Real Call Spread opened: Sell ${shortLeg.symbol} | Buy ${longLeg.symbol}`, 'success');
+      }
+    } else {
+      this.activeTrade = {
+        type: 'CALL_SPREAD',
+        entryPrice: price,
+        entryTime: Date.now(),
+        highestProfitPct: 0,
+        trailingStopPrice: null,
+        prediction: prediction,
+        features: features,
+        legs: [
+          { symbol: shortLeg.symbol, side: 'sell', entryPrice: shortLeg.mark_price, size: this.settings.quantity },
+          { symbol: longLeg.symbol, side: 'buy', entryPrice: longLeg.mark_price, size: this.settings.quantity }
+        ]
+      };
+      this.saveState();
+      this.log(`Paper Call Spread opened: Sell ${shortLeg.symbol} @ ${shortLeg.mark_price} | Buy ${longLeg.symbol} @ ${longLeg.mark_price}`, 'success');
     }
   }
 }

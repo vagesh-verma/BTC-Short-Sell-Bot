@@ -109,6 +109,37 @@ export class GRUModel {
     return result;
   }
 
+  public predictMultiple(input: number[], passes: number = 10): { mean: number, std: number } {
+    if (!this.model) return { mean: 0, std: 0 };
+    if (passes <= 1) return { mean: this.predict(input), std: 0 };
+
+    const expectedSize = this.windowSize * this.featureCount;
+    let finalInput = input;
+    if (input.length > expectedSize) {
+      finalInput = input.slice(0, expectedSize);
+    } else if (input.length < expectedSize) {
+      finalInput = [...input, ...new Array(expectedSize - input.length).fill(0)];
+    }
+
+    const inputTensor = tf.tensor3d(finalInput, [1, this.windowSize, this.featureCount]);
+    const predictions: number[] = [];
+
+    for (let i = 0; i < passes; i++) {
+      // Use training: true to enable dropout during inference
+      const prediction = this.model.apply(inputTensor, { training: true }) as tf.Tensor;
+      predictions.push(prediction.dataSync()[0]);
+      prediction.dispose();
+    }
+
+    inputTensor.dispose();
+
+    const mean = predictions.reduce((a, b) => a + b, 0) / passes;
+    const variance = predictions.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / passes;
+    const std = Math.sqrt(variance);
+
+    return { mean, std };
+  }
+
   public getWindowSize(): number {
     return this.windowSize;
   }

@@ -119,6 +119,12 @@ export default function App() {
     nyStart: 13,
     nyEnd: 18,
     useOnlyCompletedCandles: false,
+    minSignalVelocity: 0.1,
+    mcPasses: 1,
+    maxUncertainty: 0.1,
+    strategyType: 'SHORT_BTC',
+    shortCallDelta: 0.3,
+    longCallDelta: 0.1,
   });
 
   const [isRealTrading, setIsRealTrading] = useState(false);
@@ -948,8 +954,8 @@ export default function App() {
     }
   };
 
-  const getPredictionsForRange = async (candles1h: Candle[], candles4h: Candle[], m1h: GRUModel, m4h: GRUModel) => {
-    logger.info('Generating predictions for provided range...');
+  const getPredictionsForRange = async (candles1h: Candle[], candles4h: Candle[], m1h: GRUModel, m4h: GRUModel, mcPasses: number = 1) => {
+    logger.info(`Generating predictions for provided range (MC Passes: ${mcPasses})...`);
     const prices4h = candles4h.map(c => c.close);
     const highs4h = candles4h.map(c => c.high);
     const lows4h = candles4h.map(c => c.low);
@@ -1060,6 +1066,7 @@ export default function App() {
     const engulfing1h = calculateEngulfing(opens1h, prices1h);
 
     const generatedPredictions: number[] = [];
+    const generatedUncertainties: number[] = [];
     const generatedFeatures: number[][] = [];
     for (let i = windowSize; i < prices1h.length; i++) {
       const windowIndices = Array.from({ length: windowSize }, (_, k) => i - windowSize + k);
@@ -1109,10 +1116,12 @@ export default function App() {
           normHarami[j], normMarubozu[j], normEngulfing[j]
         );
       }
-      generatedPredictions.push(m1h.predict(input));
+      const result = m1h.predictMultiple(input, mcPasses);
+      generatedPredictions.push(result.mean);
+      generatedUncertainties.push(result.std);
       generatedFeatures.push(input);
     }
-    return { predictions: generatedPredictions, features: generatedFeatures };
+    return { predictions: generatedPredictions, uncertainties: generatedUncertainties, features: generatedFeatures };
   };
 
   const startTraining = async () => {
@@ -1326,7 +1335,7 @@ export default function App() {
       model1hRef.current = model1h;
       
       setStatus('Generating Final Predictions...');
-      const { predictions: generatedPredictions, features: generatedFeatures } = await getPredictionsForRange(candles, candles4h, model1h, model4h);
+      const { predictions: generatedPredictions, features: generatedFeatures } = await getPredictionsForRange(candles, candles4h, model1h, model4h, settings.mcPasses);
       
       setPredictions(generatedPredictions);
       const above = generatedPredictions.filter(p => p > settings.threshold).length;
@@ -1380,7 +1389,11 @@ export default function App() {
       }
 
       setStatus('Generating predictions for backtest range...');
-      const { predictions: btPredictions, features: btFeatures } = await getPredictionsForRange(btCandles1h, btCandles4h, model1hRef.current, model4hRef.current);
+      const { 
+        predictions: btPredictions, 
+        uncertainties: btUncertainties,
+        features: btFeatures 
+      } = await getPredictionsForRange(btCandles1h, btCandles4h, model1hRef.current, model4hRef.current, settings.mcPasses);
       logger.info(`Generated ${btPredictions.length} predictions.`);
 
       // 2. Fetch 5m data for high-res backtest
@@ -1394,17 +1407,22 @@ export default function App() {
 
       setStatus('Aligning predictions with 5m candles...');
       
-      const predictionMap = new Map<number, { val: number, features: number[] }>();
+      const predictionMap = new Map<number, { val: number, uncertainty: number, features: number[] }>();
       btPredictions.forEach((val, i) => {
         // btPredictions[i] corresponds to btCandles1h[i + windowSize]
         const candleIndex = i + windowSize;
         if (btCandles1h[candleIndex]) {
           const time = btCandles1h[candleIndex].time;
-          predictionMap.set(time, { val, features: btFeatures[i] });
+          predictionMap.set(time, { 
+            val, 
+            uncertainty: btUncertainties[i],
+            features: btFeatures[i] 
+          });
         }
       });
 
       const alignedPredictions: number[] = [];
+      const alignedUncertainties: number[] = [];
       const alignedFeatures: number[][] = [];
       const validHighResCandles: Candle[] = [];
 
@@ -1416,6 +1434,7 @@ export default function App() {
         if (predictionData !== undefined) {
           // Carry the prediction for the entire hour
           alignedPredictions.push(predictionData.val);
+          alignedUncertainties.push(predictionData.uncertainty);
           alignedFeatures.push(predictionData.features);
           validHighResCandles.push(c);
         }
@@ -1435,7 +1454,7 @@ export default function App() {
 
       setStatus('Running High-Resolution Backtest...');
       logger.info(`Running backtest on ${validHighResCandles.length} candles (${(validHighResCandles.length * 5 / 60).toFixed(1)} hours of data)...`);
-      const result = runBacktest(validHighResCandles, alignedPredictions, settings, 10000, 0, alignedFeatures, FEATURE_NAMES);
+      const result = runBacktest(validHighResCandles, alignedPredictions, settings, 10000, windowSize, alignedFeatures, FEATURE_NAMES, alignedUncertainties);
       
       setBacktestResult(result);
       setStatus('Backtest complete!');
@@ -1462,6 +1481,15 @@ export default function App() {
     return backtestResult.equityCurve.map(e => ({
       time: format(new Date(e.time), 'MM/dd HH:mm'),
       balance: parseFloat(e.balance.toFixed(2)),
+    }));
+  }, [backtestResult]);
+
+  const backtestChartData = useMemo(() => {
+    if (!backtestResult) return [];
+    return backtestResult.candles.map((c, i) => ({
+      time: format(new Date(c.time), 'MM/dd HH:mm'),
+      price: c.close,
+      prediction: parseFloat((backtestResult.predictions[i] * 100).toFixed(2)),
     }));
   }, [backtestResult]);
 
@@ -1922,7 +1950,22 @@ export default function App() {
                       <label className="text-[10px] text-white/40 uppercase font-bold">Trail Offset %</label>
                       <input type="number" step="0.1" value={settings.trailingStopOffset * 100} onChange={(e) => setSettings({...settings, trailingStopOffset: parseFloat(e.target.value) / 100})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
                     </div>
-                    <div className="flex flex-col gap-2 pt-2">
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-white/40 uppercase font-bold">Min Velocity</label>
+                      <input type="number" step="0.01" value={settings.minSignalVelocity} onChange={(e) => setSettings({...settings, minSignalVelocity: parseFloat(e.target.value) || 0})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4 pt-2 border-t border-white/5">
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-white/40 uppercase font-bold">MC Passes</label>
+                      <input type="number" min="1" max="50" value={settings.mcPasses} onChange={(e) => setSettings({...settings, mcPasses: parseInt(e.target.value) || 1})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-white/40 uppercase font-bold">Max Uncertainty</label>
+                      <input type="number" step="0.01" value={settings.maxUncertainty} onChange={(e) => setSettings({...settings, maxUncertainty: parseFloat(e.target.value) || 0})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-2 pt-2 border-t border-white/5">
                       <div className="flex items-center gap-2">
                         <input 
                           type="checkbox" 
@@ -1968,7 +2011,6 @@ export default function App() {
                   </button>
                 </div>
               </div>
-            </div>
 
             {/* Results & Equity */}
             <div className="lg:col-span-3 space-y-6">
@@ -1983,6 +2025,42 @@ export default function App() {
                 <MetricCard title="Max Profit" value={backtestResult ? `$${backtestResult.maxProfit.toFixed(2)}` : '---'} color="text-emerald-600" />
                 <MetricCard title="Max Loss" value={backtestResult ? `$${backtestResult.maxLoss.toFixed(2)}` : '---'} color="text-red-600" />
               </div>
+
+              {/* Price & Prediction Chart */}
+              {backtestResult && (
+                <div className="bg-[#0D0D0E] border border-white/5 rounded-2xl p-6 shadow-xl">
+                  <h3 className="font-medium mb-6 flex items-center gap-2 text-blue-400">
+                    <Activity className="w-5 h-5" />
+                    Price & Prediction
+                  </h3>
+                  <div className="h-[300px] w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={backtestChartData}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#ffffff05" vertical={false} />
+                        <XAxis dataKey="time" stroke="#ffffff30" fontSize={10} tickLine={false} axisLine={false} />
+                        <YAxis yAxisId="left" domain={['auto', 'auto']} stroke="#ffffff30" fontSize={10} tickLine={false} axisLine={false} />
+                        <YAxis yAxisId="right" orientation="right" domain={[0, 100]} stroke="#ffffff30" fontSize={10} tickLine={false} axisLine={false} />
+                        <Tooltip 
+                          contentStyle={{ backgroundColor: '#0D0D0E', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px' }}
+                          itemStyle={{ fontSize: '12px' }}
+                        />
+                        <Line yAxisId="left" type="monotone" dataKey="price" stroke="#3b82f6" dot={false} strokeWidth={2} />
+                        <Line yAxisId="right" type="monotone" dataKey="prediction" stroke="#f59e0b" dot={false} strokeWidth={1.5} strokeDasharray="5 5" />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="flex justify-center gap-6 mt-4">
+                    <div className="flex items-center gap-2">
+                      <div className="w-3 h-0.5 bg-[#3b82f6]"></div>
+                      <span className="text-[10px] text-white/40 uppercase">Price (USD)</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="w-3 h-0.5 bg-[#f59e0b] border-t border-dashed"></div>
+                      <span className="text-[10px] text-white/40 uppercase">Prediction (%)</span>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Equity Curve */}
               {backtestResult && (
@@ -2360,6 +2438,78 @@ export default function App() {
               </div>
 
               <div className="space-y-4">
+                <h3 className="text-xs font-bold text-white/40 uppercase tracking-wider">Accuracy & Momentum</h3>
+                <div className="space-y-4">
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-white/30 uppercase">MC Dropout Passes</label>
+                    <input 
+                      type="number" min="1" max="50"
+                      value={settings.mcPasses || 1}
+                      onChange={(e) => setSettings({...settings, mcPasses: parseInt(e.target.value) || 1})}
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-white/30 uppercase">Max Uncertainty (Std Dev)</label>
+                    <input 
+                      type="number" step="0.01"
+                      value={settings.maxUncertainty || 0}
+                      onChange={(e) => setSettings({...settings, maxUncertainty: parseFloat(e.target.value) || 0})}
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-white/30 uppercase">Min Signal Velocity (Delta)</label>
+                    <input 
+                      type="number" step="0.01"
+                      value={settings.minSignalVelocity || 0}
+                      onChange={(e) => setSettings({...settings, minSignalVelocity: parseFloat(e.target.value) || 0})}
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <h3 className="text-xs font-bold text-white/40 uppercase tracking-wider">Strategy & Options</h3>
+                <div className="space-y-4">
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-white/30 uppercase">Strategy Type</label>
+                    <select 
+                      value={settings.strategyType || 'SHORT_BTC'}
+                      onChange={(e) => setSettings({...settings, strategyType: e.target.value as any})}
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
+                    >
+                      <option value="SHORT_BTC">Short BTC Futures</option>
+                      <option value="CALL_SPREAD">Sell Call Spread (Tomorrow)</option>
+                    </select>
+                  </div>
+                  {settings.strategyType === 'CALL_SPREAD' && (
+                    <div className="grid grid-cols-2 gap-4 animate-in fade-in slide-in-from-top-1 duration-200">
+                      <div className="space-y-1">
+                        <label className="text-[10px] text-white/30 uppercase">Short Call Delta</label>
+                        <input 
+                          type="number" step="0.01" min="0" max="1"
+                          value={settings.shortCallDelta || 0.3}
+                          onChange={(e) => setSettings({...settings, shortCallDelta: parseFloat(e.target.value) || 0})}
+                          className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-[10px] text-white/30 uppercase">Long Call Delta</label>
+                        <input 
+                          type="number" step="0.01" min="0" max="1"
+                          value={settings.longCallDelta || 0.1}
+                          onChange={(e) => setSettings({...settings, longCallDelta: parseFloat(e.target.value) || 0})}
+                          className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="space-y-4">
                 <h3 className="text-xs font-bold text-white/40 uppercase tracking-wider">Session & Candle Settings</h3>
                 <div className="space-y-4">
                   <div className="flex items-center justify-between p-3 bg-white/5 rounded-xl border border-white/5">
@@ -2609,10 +2759,36 @@ export default function App() {
                           <span className="text-[10px] text-white/30 uppercase">Session</span>
                           <span className="text-[10px] font-mono text-amber-400">{liveParams.session}</span>
                         </div>
+                        <div className="flex justify-between items-center pt-2 border-t border-white/5 col-span-2">
+                          <span className="text-[10px] text-white/30 uppercase">Uncertainty (StdDev)</span>
+                          <span className={cn("text-[10px] font-mono", (liveParams.uncertainty || 0) > settings.maxUncertainty ? "text-red-400" : "text-emerald-400")}>
+                            {liveParams.uncertainty ? liveParams.uncertainty.toFixed(4) : '0.0000'}
+                          </span>
+                        </div>
+                        <div className="flex justify-between items-center col-span-2">
+                          <span className="text-[10px] text-white/30 uppercase">Velocity (Delta)</span>
+                          <span className={cn("text-[10px] font-mono", (liveParams.velocity || 0) < settings.minSignalVelocity ? "text-amber-400" : "text-emerald-400")}>
+                            {liveParams.velocity ? (liveParams.velocity > 0 ? '+' : '') + liveParams.velocity.toFixed(4) : '0.0000'}
+                          </span>
+                        </div>
                         <div className="col-span-2 flex justify-between items-center pt-2 border-t border-white/5 opacity-40">
                           <span className="text-[9px] uppercase tracking-tighter">Last Updated</span>
                           <span className="text-[9px] font-mono">{lastLiveUpdate ? format(lastLiveUpdate, 'HH:mm:ss') : '--:--:--'}</span>
                         </div>
+                      </div>
+                    )}
+
+                    {activeLiveTrade && activeLiveTrade.type === 'CALL_SPREAD' && activeLiveTrade.legs && (
+                      <div className="pt-4 border-t border-white/5 space-y-2">
+                        <div className="text-[10px] text-white/40 font-bold uppercase tracking-wider">Spread Legs</div>
+                        {activeLiveTrade.legs.map((leg: any, idx: number) => (
+                          <div key={idx} className="flex justify-between items-center text-[10px]">
+                            <span className={cn(leg.side === 'sell' ? "text-red-400" : "text-emerald-400")}>
+                              {leg.side.toUpperCase()} {leg.symbol}
+                            </span>
+                            <span className="text-white/60 font-mono">${leg.entryPrice.toFixed(2)}</span>
+                          </div>
+                        ))}
                       </div>
                     )}
 
@@ -2622,7 +2798,7 @@ export default function App() {
                         "text-[10px] font-bold px-2 py-0.5 rounded uppercase",
                         activeLiveTrade ? "bg-amber-500/10 text-amber-500" : "bg-white/5 text-white/40"
                       )}>
-                        {activeLiveTrade ? 'In Trade (SHORT)' : 'Waiting for Signal'}
+                        {activeLiveTrade ? `In Trade (${activeLiveTrade.type})` : 'Waiting for Signal'}
                       </span>
                     </div>
                   </div>
