@@ -26,7 +26,7 @@ interface TradingSettings {
   mcPasses: number;
   maxUncertainty: number;
   minSignalVelocity: number;
-  strategyType: 'SHORT_BTC' | 'CALL_SPREAD';
+  strategyType: 'SHORT_BTC' | 'CALL_SPREAD' | 'SHORT_CALL';
   shortCallDelta: number;
   longCallDelta: number;
   dailyProfitLimit: number;
@@ -34,7 +34,7 @@ interface TradingSettings {
 }
 
 interface ActiveTrade {
-  type: 'LONG' | 'SHORT' | 'CALL_SPREAD';
+  type: 'LONG' | 'SHORT' | 'CALL_SPREAD' | 'SHORT_CALL';
   entryPrice: number;
   entryTime: number;
   highestProfitPct: number;
@@ -56,7 +56,7 @@ interface ActiveTrade {
 }
 
 interface ClosedTrade {
-  type: 'LONG' | 'SHORT' | 'CALL_SPREAD';
+  type: 'LONG' | 'SHORT' | 'CALL_SPREAD' | 'SHORT_CALL';
   entryPrice: number;
   exitPrice: number;
   entryTime: number;
@@ -236,7 +236,7 @@ export class TradingService {
       this.log('Manual trade closure requested via API', 'info');
       
       if (this.isRealTrading) {
-        if (this.activeTrade.type === 'CALL_SPREAD' && this.activeTrade.legs) {
+        if ((this.activeTrade.type === 'CALL_SPREAD' || this.activeTrade.type === 'SHORT_CALL') && this.activeTrade.legs) {
           for (const leg of this.activeTrade.legs) {
             const exitSide = leg.side === 'sell' ? 'buy' : 'sell';
             await this.placeOptionOrder(leg.symbol, exitSide, leg.size);
@@ -732,7 +732,7 @@ export class TradingService {
         const entry = this.activeTrade.entryPrice;
         const size = this.activeTrade.size || 0;
         
-        if (this.activeTrade.type === 'CALL_SPREAD' && this.activeTrade.legs) {
+        if ((this.activeTrade.type === 'CALL_SPREAD' || this.activeTrade.type === 'SHORT_CALL') && this.activeTrade.legs) {
           // Use real PNL from syncPositionWithRest if available
           if (this.activeTrade.pnl !== undefined) {
             // Estimate initial value for profit percentage
@@ -771,7 +771,7 @@ export class TradingService {
           }
         } else {
           // Fallback to local calculation if size/entry not yet synced
-          if (this.activeTrade.type === 'SHORT') {
+          if (this.activeTrade.type === 'SHORT' || this.activeTrade.type === 'CALL_SPREAD' || this.activeTrade.type === 'SHORT_CALL') {
             profitPct = (this.activeTrade.entryPrice - price) / this.activeTrade.entryPrice;
           } else {
             profitPct = (price - this.activeTrade.entryPrice) / this.activeTrade.entryPrice;
@@ -779,17 +779,17 @@ export class TradingService {
         }
       } else {
         // Paper trading logic
-        if (this.activeTrade.type === 'SHORT') {
+        if (this.activeTrade.type === 'SHORT' || this.activeTrade.type === 'CALL_SPREAD' || this.activeTrade.type === 'SHORT_CALL') {
           profitPct = (this.activeTrade.entryPrice - price) / this.activeTrade.entryPrice;
         } else {
           profitPct = (price - this.activeTrade.entryPrice) / this.activeTrade.entryPrice;
         }
       }
 
-      const stopLossPrice = (this.activeTrade.type === 'SHORT' || this.activeTrade.type === 'CALL_SPREAD')
+      const stopLossPrice = (this.activeTrade.type === 'SHORT' || this.activeTrade.type === 'CALL_SPREAD' || this.activeTrade.type === 'SHORT_CALL')
         ? this.activeTrade.entryPrice * (1 + this.settings.stopLoss)
         : this.activeTrade.entryPrice * (1 - this.settings.stopLoss);
-      const takeProfitPrice = (this.activeTrade.type === 'SHORT' || this.activeTrade.type === 'CALL_SPREAD')
+      const takeProfitPrice = (this.activeTrade.type === 'SHORT' || this.activeTrade.type === 'CALL_SPREAD' || this.activeTrade.type === 'SHORT_CALL')
         ? this.activeTrade.entryPrice * (1 - this.settings.takeProfit)
         : this.activeTrade.entryPrice * (1 + this.settings.takeProfit);
 
@@ -800,7 +800,7 @@ export class TradingService {
         highestProfit = profitPct;
         this.activeTrade.highestProfitPct = highestProfit;
         if (profitPct >= this.settings.trailingStopActivation) {
-          if (this.activeTrade.type === 'SHORT' || this.activeTrade.type === 'CALL_SPREAD') {
+          if (this.activeTrade.type === 'SHORT' || this.activeTrade.type === 'CALL_SPREAD' || this.activeTrade.type === 'SHORT_CALL') {
             currentTrailingStop = price * (1 + this.settings.trailingStopOffset);
           } else {
             currentTrailingStop = price * (1 - this.settings.trailingStopOffset);
@@ -812,7 +812,7 @@ export class TradingService {
       let shouldExit = false;
       let reason = '';
 
-      if (this.activeTrade.type === 'SHORT' || this.activeTrade.type === 'CALL_SPREAD') {
+      if (this.activeTrade.type === 'SHORT' || this.activeTrade.type === 'CALL_SPREAD' || this.activeTrade.type === 'SHORT_CALL') {
         if (price >= stopLossPrice) {
           shouldExit = true;
           reason = 'STOP_LOSS';
@@ -849,7 +849,7 @@ export class TradingService {
         const btcQuantity = this.settings.quantityType === 'LOTS' ? this.settings.quantity * 0.001 : this.settings.quantity;
         const profit = this.settings.quantityType === 'USD'
           ? this.settings.quantity * profitPct
-          : btcQuantity * (this.activeTrade.type === 'SHORT' ? (this.activeTrade.entryPrice - price) : (price - this.activeTrade.entryPrice));
+          : btcQuantity * ((this.activeTrade.type === 'SHORT' || this.activeTrade.type === 'CALL_SPREAD' || this.activeTrade.type === 'SHORT_CALL') ? (this.activeTrade.entryPrice - price) : (price - this.activeTrade.entryPrice));
 
         const closedTrade: ClosedTrade = {
           type: this.activeTrade.type,
@@ -870,7 +870,7 @@ export class TradingService {
         this.dailyProfit += profit;
 
         if (this.isRealTrading) {
-          if (this.activeTrade.type === 'CALL_SPREAD' && this.activeTrade.legs) {
+          if ((this.activeTrade.type === 'CALL_SPREAD' || this.activeTrade.type === 'SHORT_CALL') && this.activeTrade.legs) {
             for (const leg of this.activeTrade.legs) {
               const exitSide = leg.side === 'sell' ? 'buy' : 'sell';
               await this.placeOptionOrder(leg.symbol, exitSide, leg.size);
@@ -942,6 +942,8 @@ export class TradingService {
         try {
           if (this.settings.strategyType === 'CALL_SPREAD') {
             await this.executeCallSpread(price, prediction, currentFeatures);
+          } else if (this.settings.strategyType === 'SHORT_CALL') {
+            await this.executeShortCall(price, prediction, currentFeatures);
           } else {
             this.log(`Opening SHORT at $${price} | Prediction: ${prediction.toFixed(4)}`, 'success');
             this.activeTrade = {
@@ -977,7 +979,7 @@ export class TradingService {
     try {
       const positions = await deltaRequest('GET', '/v2/positions?underlying_asset_symbol=BTC');
       if (positions.success && Array.isArray(positions.result)) {
-        if (this.activeTrade.type === 'CALL_SPREAD' && this.activeTrade.legs) {
+        if ((this.activeTrade.type === 'CALL_SPREAD' || this.activeTrade.type === 'SHORT_CALL') && this.activeTrade.legs) {
           let totalPnl = 0;
           for (const leg of this.activeTrade.legs) {
             const legPos = positions.result.find((p: any) => p.symbol === leg.symbol);
@@ -1253,6 +1255,56 @@ export class TradingService {
       };
       this.saveState();
       this.log(`Paper Call Spread opened: Sell ${shortLeg.symbol} @ ${shortLeg.mark_price} | Buy ${longLeg.symbol} @ ${longLeg.mark_price}`, 'success');
+    }
+  }
+
+  private async executeShortCall(price: number, prediction: number, features: any) {
+    if (!this.settings) return;
+    this.log(`Executing Short Call strategy...`, 'info');
+
+    const shortLeg = await this.findOptionByDelta(true, this.settings.shortCallDelta);
+
+    if (!shortLeg) {
+      this.log('Failed to find suitable option leg for short call', 'error');
+      return;
+    }
+
+    if (this.isRealTrading) {
+      const shortOrderId = await this.placeOptionOrder(shortLeg.symbol, 'sell', this.settings.quantity);
+
+      if (shortOrderId) {
+        this.activeTrade = {
+          type: 'SHORT_CALL',
+          entryPrice: price,
+          entryTime: Date.now(),
+          highestProfitPct: 0,
+          trailingStopPrice: null,
+          prediction: prediction,
+          features: features,
+          legs: [
+            { symbol: shortLeg.symbol, side: 'sell', entryPrice: shortLeg.best_bid, size: this.settings.quantity }
+          ]
+        };
+        this.saveState();
+        this.log(`Real Short Call opened: Sell ${shortLeg.symbol}`, 'success');
+        // Sync positions after a short delay to allow exchange to process
+        setTimeout(() => this.syncPositionWithRest(), 2000);
+      }
+    } else {
+      this.activeTrade = {
+        type: 'SHORT_CALL',
+        entryPrice: price,
+        entryTime: Date.now(),
+        highestProfitPct: 0,
+        trailingStopPrice: null,
+        prediction: prediction,
+        features: features,
+        legs: [
+          { symbol: shortLeg.symbol, side: 'sell', entryPrice: shortLeg.mark_price, size: this.settings.quantity }
+        ]
+      };
+      this.saveState();
+      this.log(`Paper Short Call opened: Sell ${shortLeg.symbol} @ ${shortLeg.mark_price}`, 'success');
     }
   }
 }

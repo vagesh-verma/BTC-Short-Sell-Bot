@@ -2504,9 +2504,10 @@ export default function App() {
                     >
                       <option value="SHORT_BTC">Short BTC Futures</option>
                       <option value="CALL_SPREAD">Sell Call Spread (Tomorrow)</option>
+                      <option value="SHORT_CALL">Short Single Call (Tomorrow)</option>
                     </select>
                   </div>
-                  {settings.strategyType === 'CALL_SPREAD' && (
+                  {(settings.strategyType === 'CALL_SPREAD' || settings.strategyType === 'SHORT_CALL') && (
                     <div className="grid grid-cols-2 gap-4 animate-in fade-in slide-in-from-top-1 duration-200">
                       <div className="space-y-1">
                         <label className="text-[10px] text-white/30 uppercase">Short Call Delta</label>
@@ -2517,15 +2518,17 @@ export default function App() {
                           className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
                         />
                       </div>
-                      <div className="space-y-1">
-                        <label className="text-[10px] text-white/30 uppercase">Long Call Delta</label>
-                        <input 
-                          type="number" step="0.01" min="0" max="1"
-                          value={settings.longCallDelta || 0.1}
-                          onChange={(e) => setSettings({...settings, longCallDelta: parseFloat(e.target.value) || 0})}
-                          className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
-                        />
-                      </div>
+                      {settings.strategyType === 'CALL_SPREAD' && (
+                        <div className="space-y-1">
+                          <label className="text-[10px] text-white/30 uppercase">Long Call Delta</label>
+                          <input 
+                            type="number" step="0.01" min="0" max="1"
+                            value={settings.longCallDelta || 0.1}
+                            onChange={(e) => setSettings({...settings, longCallDelta: parseFloat(e.target.value) || 0})}
+                            className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/80 focus:border-blue-500/50 outline-none transition-all"
+                          />
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -2808,9 +2811,11 @@ export default function App() {
                       </div>
                     )}
 
-                    {activeLiveTrade && activeLiveTrade.type === 'CALL_SPREAD' && activeLiveTrade.legs && (
+                    {activeLiveTrade && (activeLiveTrade.type === 'CALL_SPREAD' || activeLiveTrade.type === 'SHORT_CALL') && activeLiveTrade.legs && (
                       <div className="pt-4 border-t border-white/5 space-y-2">
-                        <div className="text-[10px] text-white/40 font-bold uppercase tracking-wider">Spread Legs</div>
+                        <div className="text-[10px] text-white/40 font-bold uppercase tracking-wider">
+                          {activeLiveTrade.type === 'CALL_SPREAD' ? 'Spread Legs' : 'Option Leg'}
+                        </div>
                         {activeLiveTrade.legs.map((leg: any, idx: number) => (
                           <div key={idx} className="space-y-1 pb-1 border-b border-white/5 last:border-0">
                             <div className="flex justify-between items-center text-[10px]">
