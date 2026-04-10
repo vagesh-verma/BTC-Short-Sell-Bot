@@ -988,7 +988,8 @@ export default function App() {
       const currentTime = candles1h[i].time;
       let last4hIdx = -1;
       for (let j = candles4h.length - 1; j >= windowSize; j--) {
-        if (candles4h[j].time <= currentTime) {
+        // Ensure the 4h candle has finished before the current 1h candle time
+        if (candles4h[j].time + (4 * 60 * 60 * 1000) <= currentTime) {
           last4hIdx = j;
           break;
         }
