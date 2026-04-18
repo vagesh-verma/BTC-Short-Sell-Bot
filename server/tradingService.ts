@@ -31,6 +31,14 @@ interface TradingSettings {
   longCallDelta: number;
   dailyProfitLimit: number;
   dailyLossLimit: number;
+  indicatorPeriods?: {
+    rsi: number;
+    ema: number;
+    ema9: number;
+    bb: number;
+    mfi: number;
+    volatility: number;
+  };
 }
 
 interface ActiveTrade {
@@ -89,6 +97,9 @@ export class TradingService {
   private closedTrades: ClosedTrade[] = [];
   private lastPrediction: number | null = null;
   private previousPrediction: number | null = null;
+  private lastPredictionTime: number = 0;
+  private lastUncertainty: number = 0;
+  private lastVelocity: number = 0;
   private lastPrice: number | null = null;
   private lastFeatures: Record<string, number> | null = null;
   private lastParams: any = null;
@@ -96,6 +107,7 @@ export class TradingService {
   private logs: LogEntry[] = [];
   private tickerCount: number = 0;
   private lastProcessTime: number = 0;
+  private lastRefreshTime: number = 0;
   private lastTradeCloseTime: number = 0;
   private dailyProfit: number = 0;
   private lastDailyReset: number = 0;
@@ -335,6 +347,7 @@ export class TradingService {
 
       this.candles = await fetchCandles('1h', startTs);
       this.candles4h = await fetchCandles('4h', startTs - (20 * 4 * 60 * 60 * 1000));
+      this.lastRefreshTime = Date.now();
       this.log(`Loaded ${this.candles.length} 1h candles and ${this.candles4h.length} 4h candles`);
     } catch (err) {
       this.log(`Error fetching initial data: ${err}`, 'error');
@@ -484,240 +497,266 @@ export class TradingService {
     const nowDate = new Date();
     if (this.candles.length > 0) {
       const lastCandleTime = this.candles[this.candles.length - 1].time * 1000;
-      if (nowDate.getTime() - lastCandleTime >= 60 * 60 * 1000) {
+      const oneHourMs = 60 * 60 * 1000;
+      const timeSinceLastCandle = nowDate.getTime() - lastCandleTime;
+      const timeSinceLastRefresh = nowDate.getTime() - this.lastRefreshTime;
+
+      // Only refresh if:
+      // 1. More than an hour has passed since the last candle started
+      // 2. We haven't tried refreshing in the last 2 minutes (to avoid spamming if the exchange is slow to finalize)
+      if (timeSinceLastCandle >= oneHourMs && timeSinceLastRefresh >= 2 * 60 * 1000) {
         this.log('New hour detected, refreshing candles...');
         await this.fetchInitialData();
       }
     }
 
-    // 1. Calculate 4h prediction
-    const prices4h = this.candles4h.map(c => c.close);
-    const highs4h = this.candles4h.map(c => c.high);
-    const lows4h = this.candles4h.map(c => c.low);
-    const volumes4h = this.candles4h.map(c => c.volume);
-    const hours4h = this.candles4h.map(c => new Date(c.time * 1000).getHours());
-    const days4h = this.candles4h.map(c => new Date(c.time * 1000).getDay());
-
-    const rsi4h = indicators.calculateRSI(prices4h);
-    const ema4h = indicators.calculateEMA(prices4h, 20);
-    const ema9_4h = indicators.calculateEMA(prices4h, 9);
-    const bb4h = indicators.calculateBollingerBands(prices4h);
-    const macd4h = indicators.calculateMACD(prices4h);
-    const stochRsi4h = indicators.calculateStochasticRSI(rsi4h);
-    const atr4h = indicators.calculateATR(highs4h, lows4h, prices4h);
-    const cross4h = indicators.calculateEMACross(ema9_4h, ema4h);
-    const obv4h = indicators.calculateOBV(prices4h, volumes4h);
-    const mfi4h = indicators.calculateMFI(highs4h, lows4h, prices4h, volumes4h);
-    const vol4h = indicators.calculateVolatility(prices4h);
-    const opens4h = this.candles4h.map(c => c.open);
-    const harami4h = indicators.calculateBearishHarami(opens4h, prices4h);
-    const marubozu4h = indicators.calculateMarubozu(opens4h, highs4h, lows4h, prices4h);
-    const engulfing4h = indicators.calculateEngulfing(opens4h, prices4h);
-
-    const normalize = (arr: number[]) => {
-      const min = Math.min(...arr);
-      const max = Math.max(...arr);
-      return arr.map(v => (max === min ? 0 : (v - min) / (max - min)));
-    };
+    // 1. Get completed candles
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const completed1h = this.candles.filter(c => c.time + 3600 <= nowSeconds);
+    const completed4h = this.candles4h.filter(c => c.time + 14400 <= nowSeconds);
 
     const windowSize = 20;
-    const last4hIdx = prices4h.length - 1;
-    if (last4hIdx < windowSize) {
+    if (completed1h.length < windowSize || completed4h.length < windowSize) {
       if (this.tickerCount % 100 === 0) {
-        this.log(`Insufficient 4h data: ${prices4h.length} candles (need ${windowSize})`, 'warning');
+        this.log(`Insufficient data: 1h=${completed1h.length}, 4h=${completed4h.length}`, 'warning');
       }
       return;
     }
-    const windowIndices4h = Array.from({ length: windowSize }, (_, k) => last4hIdx - windowSize + 1 + k);
+
+    const lastCompleted1hTime = completed1h[completed1h.length - 1].time;
     
-    const pWindow4h = windowIndices4h.map(idx => prices4h[idx]);
-    const rWindow4h = windowIndices4h.map(idx => rsi4h[idx]);
-    const eWindow4h = windowIndices4h.map(idx => ema4h[idx]);
-    const uWindow4h = windowIndices4h.map(idx => bb4h.upper[idx]);
-    const lWindow4h = windowIndices4h.map(idx => bb4h.lower[idx]);
-    const mWindow4h = windowIndices4h.map(idx => macd4h.histogram[idx]);
-    const sWindow4h = windowIndices4h.map(idx => stochRsi4h[idx]);
-    const aWindow4h = windowIndices4h.map(idx => atr4h[idx]);
-    const e9Window4h = windowIndices4h.map(idx => ema9_4h[idx]);
-    const belowWindow4h = windowIndices4h.map(idx => cross4h.isBelow[idx]);
-    const crossWindow4h = windowIndices4h.map(idx => cross4h.isCross[idx]);
-    const obvWindow4h = windowIndices4h.map(idx => obv4h[idx]);
-    const mfiWindow4h = windowIndices4h.map(idx => mfi4h[idx]);
-    const volWindow4h = windowIndices4h.map(idx => vol4h[idx]);
-    const hourWindow4h = windowIndices4h.map(idx => hours4h[idx]);
+    // Only recalculate prediction when a new hour is finalized
+    if (lastCompleted1hTime !== this.lastPredictionTime) {
+      this.log(`New hour finalized: ${new Date(lastCompleted1hTime * 1000).toISOString()}. Calculating prediction...`);
 
-    const np4h = normalize(pWindow4h);
-    const nr4h = rWindow4h.map(v => v / 100);
-    const ne4h = normalize(eWindow4h);
-    const nu4h = normalize(uWindow4h);
-    const nl4h = normalize(lWindow4h);
-    const nm4h = normalize(mWindow4h);
-    const na4h = normalize(aWindow4h);
-    const ne9_4h = normalize(e9Window4h);
-    const nobv4h = normalize(obvWindow4h);
-    const nvol4h = normalize(volWindow4h);
-    const nday4h = windowIndices4h.map(idx => days4h[idx]);
-    const nharami4h = windowIndices4h.map(idx => harami4h[idx]);
-    const nmarubozu4h = windowIndices4h.map(idx => marubozu4h[idx]);
-    const nengulfing4h = windowIndices4h.map(idx => engulfing4h[idx]);
+      const normalize = (arr: number[]) => {
+        const min = Math.min(...arr);
+        const max = Math.max(...arr);
+        return arr.map(v => (max === min ? 0 : (v - min) / (max - min)));
+      };
 
-    const x4h: number[] = [];
-    for (let j = 0; j < windowSize; j++) {
-      const h = hourWindow4h[j];
-      x4h.push(
-        np4h[j], nr4h[j], ne4h[j], nu4h[j], nl4h[j],
-        nm4h[j], sWindow4h[j], na4h[j], ne9_4h[j],
-        belowWindow4h[j], crossWindow4h[j], nobv4h[j],
-        mfiWindow4h[j] / 100, nvol4h[j],
-        h / 24, h >= 0 && h <= 9 ? 1 : 0, h >= 8 && h <= 17 ? 1 : 0, h >= 13 && h <= 22 ? 1 : 0, nday4h[j] / 7,
-        nharami4h[j], nmarubozu4h[j], nengulfing4h[j]
-      );
-    }
-    let secondaryPrediction = 0;
-    try {
-      secondaryPrediction = this.model4h.predict(x4h);
-    } catch (err: any) {
-      this.log(`4h Prediction failed: ${err.message}`, 'error');
-    }
-
-    // 2. Calculate 1h prediction
-    const fullPrices1h = [...this.candles.map(c => c.close), price];
-    const fullHighs1h = [...this.candles.map(c => c.high), price];
-    const fullLows1h = [...this.candles.map(c => c.low), price];
-    const fullVolumes1h = [...this.candles.map(c => c.volume), 0];
-    const fullHours1h = [...this.candles.map(c => new Date(c.time * 1000).getHours()), nowDate.getHours()];
-    const fullDays1h = [...this.candles.map(c => new Date(c.time * 1000).getDay()), nowDate.getDay()];
-
-    const rsi1h = indicators.calculateRSI(fullPrices1h);
-    const ema1h = indicators.calculateEMA(fullPrices1h, 20);
-    const ema9_1h = indicators.calculateEMA(fullPrices1h, 9);
-    const bb1h = indicators.calculateBollingerBands(fullPrices1h);
-    const macd1h = indicators.calculateMACD(fullPrices1h);
-    const stochRsi1h = indicators.calculateStochasticRSI(rsi1h);
-    const atr1h = indicators.calculateATR(fullHighs1h, fullLows1h, fullPrices1h);
-    const cross1h = indicators.calculateEMACross(ema9_1h, ema1h);
-    const obv1h = indicators.calculateOBV(fullPrices1h, fullVolumes1h);
-    const mfi1h = indicators.calculateMFI(fullHighs1h, fullLows1h, fullPrices1h, fullVolumes1h);
-    const vol1h = indicators.calculateVolatility(fullPrices1h);
-    const opens1h = [...this.candles.map(c => c.open), price];
-    const harami1h = indicators.calculateBearishHarami(opens1h, fullPrices1h);
-    const marubozu1h = indicators.calculateMarubozu(opens1h, fullHighs1h, fullLows1h, fullPrices1h);
-    const engulfing1h = indicators.calculateEngulfing(opens1h, fullPrices1h);
-
-    const last1hIdx = fullPrices1h.length - 1;
-    if (last1hIdx < windowSize) {
-      if (this.tickerCount % 100 === 0) {
-        this.log(`Insufficient 1h data: ${fullPrices1h.length} candles (need ${windowSize})`, 'warning');
+      // A. Calculate Secondary Predictions for the 1h Window
+      const bufferSize = 100;
+      const windowSize = 20;
+      
+      if (completed1h.length < bufferSize || completed4h.length < bufferSize) {
+        this.log(`Insufficient data: 1h=${completed1h.length}, 4h=${completed4h.length}`, 'warning');
+        return;
       }
-      return;
+
+      const context1h = completed1h.slice(completed1h.length - bufferSize);
+      const prices1h = context1h.map(c => c.close);
+      const highs1h = context1h.map(c => c.high);
+      const lows1h = context1h.map(c => c.low);
+      const volumes1h = context1h.map(c => c.volume);
+      const hours1h = context1h.map(c => new Date(c.time * 1000).getHours());
+      const days1h = context1h.map(c => new Date(c.time * 1000).getDay());
+      const opens1h = context1h.map(c => c.open);
+
+      // We need secondary predictions for each of the last 20 1h candles
+      const secondaryPredictions: number[] = [];
+      const winIdx1h = Array.from({ length: windowSize }, (_, k) => bufferSize - windowSize + k);
+      
+      for (const idx of winIdx1h) {
+        const targetTime = context1h[idx].time;
+        
+        let last4hIdx = -1;
+        for (let j = completed4h.length - 1; j >= 0; j--) {
+          if (completed4h[j].time + 14400 <= targetTime) {
+            last4hIdx = j;
+            break;
+          }
+        }
+
+        if (last4hIdx < windowSize - 1) {
+          secondaryPredictions.push(0.5);
+          continue;
+        }
+
+        const subContext4h = completed4h.slice(last4hIdx - windowSize + 1, last4hIdx + 1);
+        const subPrices4h = subContext4h.map(c => c.close);
+        const subHighs4h = subContext4h.map(c => c.high);
+        const subLows4h = subContext4h.map(c => c.low);
+        const subVolumes4h = subContext4h.map(c => c.volume);
+        const subHours4h = subContext4h.map(c => new Date(c.time * 1000).getHours());
+        const subDays4h = subContext4h.map(c => new Date(c.time * 1000).getDay());
+        const subOpens4h = subContext4h.map(c => c.open);
+
+        const periods = this.settings?.indicatorPeriods || { rsi: 14, ema: 20, ema9: 9, bb: 20, mfi: 14, volatility: 20 };
+        const rsi4h = indicators.calculateRSI(subPrices4h, periods.rsi);
+        const ema4h = indicators.calculateEMA(subPrices4h, periods.ema);
+        const ema9_4h = indicators.calculateEMA(subPrices4h, periods.ema9);
+        const bb4h = indicators.calculateBollingerBands(subPrices4h, periods.bb);
+        const macd4h = indicators.calculateMACD(subPrices4h);
+        const stochRsi4h = indicators.calculateStochasticRSI(rsi4h);
+        const atr4h = indicators.calculateATR(subHighs4h, subLows4h, subPrices4h);
+        const cross4h = indicators.calculateEMACross(ema9_4h, ema4h);
+        const obv4h = indicators.calculateOBV(subPrices4h, subVolumes4h);
+        const mfi4h = indicators.calculateMFI(subHighs4h, subLows4h, subPrices4h, subVolumes4h, periods.mfi);
+        const harami4h = indicators.calculateBearishHarami(subOpens4h, subPrices4h);
+        const marubozu4h = indicators.calculateMarubozu(subOpens4h, subHighs4h, subLows4h, subPrices4h);
+        const engulfing4h = indicators.calculateEngulfing(subOpens4h, subPrices4h);
+
+        const x4h: number[] = [];
+        const np4h = normalize(subPrices4h);
+        const nr4h = rsi4h.map(v => v / 100);
+        const ne4h = normalize(ema4h);
+        const nu4h = normalize(bb4h.upper);
+        const nl4h = normalize(bb4h.lower);
+        const nm4h = normalize(macd4h.histogram);
+        const na4h = normalize(atr4h);
+        const ne9_4h = normalize(ema9_4h);
+        const nobv4h = normalize(obv4h);
+        const nvol4h = normalize(indicators.calculateVolatility(subPrices4h));
+
+        for (let j = 0; j < windowSize; j++) {
+          const h = subHours4h[j];
+          x4h.push(
+            np4h[j], nr4h[j], ne4h[j], nu4h[j], nl4h[j],
+            nm4h[j], stochRsi4h[j], na4h[j], ne9_4h[j],
+            cross4h.isBelow[j], cross4h.isCross[j], nobv4h[j],
+            mfi4h[j] / 100, nvol4h[j],
+            h / 24, h >= 0 && h <= 9 ? 1 : 0, h >= 8 && h <= 17 ? 1 : 0, h >= 13 && h <= 22 ? 1 : 0, subDays4h[j] / 7,
+            harami4h[j], marubozu4h[j], engulfing4h[j]
+          );
+        }
+
+        try {
+          secondaryPredictions.push(this.model4h.predict(x4h));
+        } catch (err) {
+          secondaryPredictions.push(0.5);
+        }
+      }
+
+      // B. Calculate 1h Prediction
+      const periods = this.settings?.indicatorPeriods || { rsi: 14, ema: 20, ema9: 9, bb: 20, mfi: 14, volatility: 20 };
+      const rsi1h = indicators.calculateRSI(prices1h, periods.rsi);
+      const ema1h = indicators.calculateEMA(prices1h, periods.ema);
+      const ema9_1h = indicators.calculateEMA(prices1h, periods.ema9);
+      const bb1h = indicators.calculateBollingerBands(prices1h, periods.bb);
+      const macd1h = indicators.calculateMACD(prices1h);
+      const stochRsi1h = indicators.calculateStochasticRSI(rsi1h);
+      const atr1h = indicators.calculateATR(highs1h, lows1h, prices1h);
+      const cross1h = indicators.calculateEMACross(ema9_1h, ema1h);
+      const obv1h = indicators.calculateOBV(prices1h, volumes1h);
+      const mfi1h = indicators.calculateMFI(highs1h, lows1h, prices1h, volumes1h, periods.mfi);
+      const vol1h = indicators.calculateVolatility(prices1h, periods.volatility);
+      const harami1h = indicators.calculateBearishHarami(opens1h, prices1h);
+      const marubozu1h = indicators.calculateMarubozu(opens1h, highs1h, lows1h, prices1h);
+      const engulfing1h = indicators.calculateEngulfing(opens1h, prices1h);
+
+      const x1h: number[] = [];
+      
+      const pWin1h = winIdx1h.map(idx => prices1h[idx]);
+      const rWin1h = winIdx1h.map(idx => rsi1h[idx]);
+      const eWin1h = winIdx1h.map(idx => ema1h[idx]);
+      const uWin1h = winIdx1h.map(idx => bb1h.upper[idx]);
+      const lWin1h = winIdx1h.map(idx => bb1h.lower[idx]);
+      const mWin1h = winIdx1h.map(idx => macd1h.histogram[idx]);
+      const sWin1h = winIdx1h.map(idx => stochRsi1h[idx]);
+      const aWin1h = winIdx1h.map(idx => atr1h[idx]);
+      const e9Win1h = winIdx1h.map(idx => ema9_1h[idx]);
+      const belowWin1h = winIdx1h.map(idx => cross1h.isBelow[idx]);
+      const crossWin1h = winIdx1h.map(idx => cross1h.isCross[idx]);
+      const obvWin1h = winIdx1h.map(idx => obv1h[idx]);
+      const mfiWin1h = winIdx1h.map(idx => mfi1h[idx]);
+      const volWin1h = winIdx1h.map(idx => vol1h[idx]);
+      const hourWin1h = winIdx1h.map(idx => hours1h[idx]);
+      const dayWin1h = winIdx1h.map(idx => days1h[idx]);
+      const haramiWin1h = winIdx1h.map(idx => harami1h[idx]);
+      const marubozuWin1h = winIdx1h.map(idx => marubozu1h[idx]);
+      const engulfingWin1h = winIdx1h.map(idx => engulfing1h[idx]);
+
+      const np1h = normalize(pWin1h);
+      const nr1h = rWin1h.map(v => v / 100);
+      const ne1h = normalize(eWin1h);
+      const nu1h = normalize(uWin1h);
+      const nl1h = normalize(lWin1h);
+      const nm1h = normalize(mWin1h);
+      const na1h = normalize(aWin1h);
+      const ne9_1h = normalize(e9Win1h);
+      const nobv1h = normalize(obvWin1h);
+      const nvol1h = normalize(volWin1h);
+
+      for (let j = 0; j < windowSize; j++) {
+        const h = hourWin1h[j];
+        x1h.push(
+          np1h[j], nr1h[j], ne1h[j], nu1h[j], nl1h[j],
+          nm1h[j], sWin1h[j], na1h[j], secondaryPredictions[j],
+          ne9_1h[j], belowWin1h[j], crossWin1h[j],
+          nobv1h[j], mfiWin1h[j] / 100, nvol1h[j],
+          h / 24, h >= 0 && h <= 9 ? 1 : 0, h >= 8 && h <= 17 ? 1 : 0, h >= 13 && h <= 22 ? 1 : 0, dayWin1h[j] / 7,
+          haramiWin1h[j], marubozuWin1h[j], engulfingWin1h[j]
+        );
+      }
+
+      let prediction = 0;
+      let uncertainty = 0;
+      try {
+        const mcPasses = this.settings?.mcPasses || 1;
+        const result = this.model1h.predictMultiple(x1h, mcPasses);
+        prediction = result.mean;
+        uncertainty = result.std;
+      } catch (err: any) {
+        this.log(`1h Prediction failed: ${err.message}`, 'error');
+      }
+
+      const featureNames = [
+        'Price', 'RSI', 'EMA', 'BB_Upper', 'BB_Lower', 'MACD_Hist', 'Stoch_RSI', 'ATR', 'Secondary_Pred',
+        'EMA9', 'Below', 'Cross', 'OBV', 'MFI', 'Volatility', 'Hour', 'Asia', 'London', 'NY', 'Day',
+        'Harami', 'Marubozu', 'Engulfing'
+      ];
+      const currentFeatures: Record<string, number> = {};
+      const last1hFeatures = [
+        np1h[windowSize - 1], nr1h[windowSize - 1], ne1h[windowSize - 1], nu1h[windowSize - 1], nl1h[windowSize - 1],
+        nm1h[windowSize - 1], stochRsi1h[windowSize - 1], na1h[windowSize - 1], secondaryPredictions[secondaryPredictions.length - 1],
+        ne9_1h[windowSize - 1], cross1h.isBelow[windowSize - 1], cross1h.isCross[windowSize - 1],
+        nobv1h[windowSize - 1], mfi1h[windowSize - 1] / 100, nvol1h[windowSize - 1],
+        hours1h[windowSize - 1] / 24, 
+        hours1h[windowSize - 1] >= 0 && hours1h[windowSize - 1] <= 9 ? 1 : 0,
+        hours1h[windowSize - 1] >= 8 && hours1h[windowSize - 1] <= 17 ? 1 : 0,
+        hours1h[windowSize - 1] >= 13 && hours1h[windowSize - 1] <= 22 ? 1 : 0,
+        days1h[windowSize - 1] / 7,
+        harami1h[windowSize - 1], marubozu1h[windowSize - 1], engulfing1h[windowSize - 1]
+      ];
+      featureNames.forEach((name, idx) => { currentFeatures[name] = last1hFeatures[idx]; });
+
+      this.lastVelocity = this.lastPrediction !== null ? (prediction - this.lastPrediction) : 0;
+      this.previousPrediction = this.lastPrediction;
+      this.lastPrediction = prediction;
+      this.lastUncertainty = uncertainty;
+      this.lastFeatures = currentFeatures;
+      this.lastPredictionTime = lastCompleted1hTime;
+      this.lastParams = {
+        ...this.lastParams,
+        rsi: rsi1h[rsi1h.length - 1],
+        ema: ema1h[ema1h.length - 1],
+        ema9: ema9_1h[ema9_1h.length - 1],
+        bbUpper: bb1h.upper[bb1h.upper.length - 1],
+        bbLower: bb1h.lower[bb1h.lower.length - 1],
+        macdHist: macd1h.histogram[macd1h.histogram.length - 1],
+        stochRsi: stochRsi1h[stochRsi1h.length - 1],
+        atr: atr1h[atr1h.length - 1],
+        emaCross: cross1h.isBelow[cross1h.isBelow.length - 1] === 1,
+        secondaryPrediction: secondaryPredictions[secondaryPredictions.length - 1],
+        obv: obv1h[obv1h.length - 1],
+        mfi: mfi1h[mfi1h.length - 1],
+        volatility: vol1h[vol1h.length - 1],
+        harami: harami1h[harami1h.length - 1],
+        marubozu: marubozu1h[marubozu1h.length - 1],
+        uncertainty: uncertainty,
+      };
+
+      this.log(`New Hourly Prediction: ${(prediction || 0).toFixed(4)} (Velocity: ${(this.lastVelocity || 0).toFixed(4)})`);
     }
-    const windowIndices1h = Array.from({ length: windowSize }, (_, k) => last1hIdx - windowSize + 1 + k);
 
-    const pWindow1h = windowIndices1h.map(idx => fullPrices1h[idx]);
-    const rWindow1h = windowIndices1h.map(idx => rsi1h[idx]);
-    const eWindow1h = windowIndices1h.map(idx => ema1h[idx]);
-    const uWindow1h = windowIndices1h.map(idx => bb1h.upper[idx]);
-    const lWindow1h = windowIndices1h.map(idx => bb1h.lower[idx]);
-    const mWindow1h = windowIndices1h.map(idx => macd1h.histogram[idx]);
-    const sWindow1h = windowIndices1h.map(idx => stochRsi1h[idx]);
-    const aWindow1h = windowIndices1h.map(idx => atr1h[idx]);
-    const e9Window1h = windowIndices1h.map(idx => ema9_1h[idx]);
-    const belowWindow1h = windowIndices1h.map(idx => cross1h.isBelow[idx]);
-    const crossWindow1h = windowIndices1h.map(idx => cross1h.isCross[idx]);
-    const obvWindow1h = windowIndices1h.map(idx => obv1h[idx]);
-    const mfiWindow1h = windowIndices1h.map(idx => mfi1h[idx]);
-    const volWindow1h = windowIndices1h.map(idx => vol1h[idx]);
-    const hourWindow1h = windowIndices1h.map(idx => fullHours1h[idx]);
+    const prediction = this.lastPrediction || 0;
+    const uncertainty = this.lastUncertainty || 0;
+    const velocity = this.lastVelocity || 0;
 
-    const np1h = normalize(pWindow1h);
-    const nr1h = rWindow1h.map(v => v / 100);
-    const ne1h = normalize(eWindow1h);
-    const nu1h = normalize(uWindow1h);
-    const nl1h = normalize(lWindow1h);
-    const nm1h = normalize(mWindow1h);
-    const na1h = normalize(aWindow1h);
-    const ne9_1h = normalize(e9Window1h);
-    const nobv1h = normalize(obvWindow1h);
-    const nvol1h = normalize(volWindow1h);
-    const nday1h = windowIndices1h.map(idx => fullDays1h[idx]);
-    const nharami1h = windowIndices1h.map(idx => harami1h[idx]);
-    const nmarubozu1h = windowIndices1h.map(idx => marubozu1h[idx]);
-    const nengulfing1h = windowIndices1h.map(idx => engulfing1h[idx]);
-
-    const x1h: number[] = [];
-    for (let j = 0; j < windowSize; j++) {
-      const h = hourWindow1h[j];
-      x1h.push(
-        np1h[j], nr1h[j], ne1h[j], nu1h[j], nl1h[j],
-        nm1h[j], sWindow1h[j], na1h[j], secondaryPrediction,
-        ne9_1h[j], belowWindow1h[j], crossWindow1h[j],
-        nobv1h[j], mfiWindow1h[j] / 100, nvol1h[j],
-        h / 24, h >= 0 && h <= 9 ? 1 : 0, h >= 8 && h <= 17 ? 1 : 0, h >= 13 && h <= 22 ? 1 : 0, nday1h[j] / 7,
-        nharami1h[j], nmarubozu1h[j], nengulfing1h[j]
-      );
-    }
-
-    const featureNames = [
-      'Price', 'RSI', 'EMA', 'BB_Upper', 'BB_Lower', 'MACD_Hist', 'Stoch_RSI', 'ATR', 'Secondary_Pred',
-      'EMA9', 'Below', 'Cross', 'OBV', 'MFI', 'Volatility', 'Hour', 'Asia', 'London', 'NY', 'Day',
-      'Harami', 'Marubozu', 'Engulfing'
-    ];
-
-    const currentFeatures: Record<string, number> = {};
-    const last1hFeatures = [
-      np1h[windowSize - 1], nr1h[windowSize - 1], ne1h[windowSize - 1], nu1h[windowSize - 1], nl1h[windowSize - 1],
-      nm1h[windowSize - 1], sWindow1h[windowSize - 1], na1h[windowSize - 1], secondaryPrediction,
-      ne9_1h[windowSize - 1], belowWindow1h[windowSize - 1], crossWindow1h[windowSize - 1],
-      nobv1h[windowSize - 1], mfiWindow1h[windowSize - 1] / 100, nvol1h[windowSize - 1],
-      hourWindow1h[windowSize - 1] / 24, 
-      hourWindow1h[windowSize - 1] >= 0 && hourWindow1h[windowSize - 1] <= 9 ? 1 : 0,
-      hourWindow1h[windowSize - 1] >= 8 && hourWindow1h[windowSize - 1] <= 17 ? 1 : 0,
-      hourWindow1h[windowSize - 1] >= 13 && hourWindow1h[windowSize - 1] <= 22 ? 1 : 0,
-      nday1h[windowSize - 1] / 7,
-      nharami1h[windowSize - 1], nmarubozu1h[windowSize - 1], nengulfing1h[windowSize - 1]
-    ];
-
-    featureNames.forEach((name, idx) => {
-      currentFeatures[name] = last1hFeatures[idx];
-    });
-
-    let prediction = 0;
-    let uncertainty = 0;
-    try {
-      const mcPasses = this.settings?.mcPasses || 1;
-      const result = this.model1h.predictMultiple(x1h, mcPasses);
-      prediction = result.mean;
-      uncertainty = result.std;
-    } catch (err: any) {
-      this.log(`1h Prediction failed: ${err.message}`, 'error');
-    }
-    
-    // Calculate Signal Velocity (Temporal Delta)
-    const velocity = this.previousPrediction !== null ? (prediction - this.previousPrediction) : 0;
-    
-    this.previousPrediction = this.lastPrediction;
-    this.lastPrediction = prediction;
-    this.lastFeatures = currentFeatures;
     this.lastParams = {
-      ...this.lastParams, // Keep existing if any
-      rsi: rsi1h[rsi1h.length - 1],
-      ema: ema1h[ema1h.length - 1],
-      ema9: ema9_1h[ema9_1h.length - 1],
-      bbUpper: bb1h.upper[bb1h.upper.length - 1],
-      bbLower: bb1h.lower[bb1h.lower.length - 1],
-      macdHist: macd1h.histogram[macd1h.histogram.length - 1],
-      stochRsi: stochRsi1h[stochRsi1h.length - 1],
-      atr: atr1h[atr1h.length - 1],
-      emaCross: cross1h.isBelow[cross1h.isBelow.length - 1] === 1,
-      secondaryPrediction: secondaryPrediction,
-      obv: obv1h[obv1h.length - 1],
-      mfi: mfi1h[mfi1h.length - 1],
-      volatility: vol1h[vol1h.length - 1],
-      harami: harami1h[harami1h.length - 1],
-      marubozu: marubozu1h[marubozu1h.length - 1],
-      uncertainty: uncertainty,
+      ...this.lastParams,
       velocity: velocity,
-      engulfing: engulfing1h[engulfing1h.length - 1],
       session: nowDate.getUTCHours() >= this.settings.asiaStart && nowDate.getUTCHours() < this.settings.asiaEnd ? 'Asia' : 
                nowDate.getUTCHours() >= this.settings.nyStart && nowDate.getUTCHours() < this.settings.nyEnd ? 'New York' : 'Off-Session',
       dayOfWeek: nowDate.getDay()
@@ -802,10 +841,15 @@ export class TradingService {
         if (profitPct >= this.settings.trailingStopActivation) {
           if (this.activeTrade.type === 'SHORT' || this.activeTrade.type === 'CALL_SPREAD' || this.activeTrade.type === 'SHORT_CALL') {
             currentTrailingStop = price * (1 + this.settings.trailingStopOffset);
+            if (this.activeTrade.trailingStopPrice === null || currentTrailingStop < this.activeTrade.trailingStopPrice) {
+              this.activeTrade.trailingStopPrice = currentTrailingStop;
+            }
           } else {
             currentTrailingStop = price * (1 - this.settings.trailingStopOffset);
+            if (this.activeTrade.trailingStopPrice === null || currentTrailingStop > this.activeTrade.trailingStopPrice) {
+              this.activeTrade.trailingStopPrice = currentTrailingStop;
+            }
           }
-          this.activeTrade.trailingStopPrice = currentTrailingStop;
         }
       }
 
@@ -844,7 +888,7 @@ export class TradingService {
       }
 
       if (shouldExit) {
-        this.log(`Closing Trade: ${reason} at $${price} | Prediction: ${prediction.toFixed(4)} | Profit: ${(profitPct * 100).toFixed(2)}%`, profitPct >= 0 ? 'success' : 'warning');
+        this.log(`Closing Trade: ${reason} at $${price} | Prediction: ${(prediction || 0).toFixed(4)} | Profit: ${((profitPct || 0) * 100).toFixed(2)}%`, profitPct >= 0 ? 'success' : 'warning');
         
         const btcQuantity = this.settings.quantityType === 'LOTS' ? this.settings.quantity * 0.001 : this.settings.quantity;
         const profit = this.settings.quantityType === 'USD'
@@ -891,7 +935,7 @@ export class TradingService {
       // 1. Uncertainty Filter (MC Dropout)
       if (this.settings.mcPasses > 1 && uncertainty > this.settings.maxUncertainty) {
         if (this.tickerCount % 100 === 0) {
-          this.log(`Signal detected but uncertainty too high: ${uncertainty.toFixed(4)} > ${this.settings.maxUncertainty}`, 'info');
+          this.log(`Signal detected but uncertainty too high: ${(uncertainty || 0).toFixed(4)} > ${this.settings.maxUncertainty}`, 'info');
         }
         return;
       }
@@ -899,7 +943,7 @@ export class TradingService {
       // 2. Signal Velocity Filter (Temporal Delta)
       if (velocity < this.settings.minSignalVelocity) {
         if (this.tickerCount % 100 === 0) {
-          this.log(`Signal detected but velocity too low: ${velocity.toFixed(4)} < ${this.settings.minSignalVelocity}`, 'info');
+          this.log(`Signal detected but velocity too low: ${(velocity || 0).toFixed(4)} < ${this.settings.minSignalVelocity}`, 'info');
         }
         return;
       }
@@ -920,13 +964,13 @@ export class TradingService {
       // Daily Limits check
       if (this.settings.dailyProfitLimit > 0 && this.dailyProfit >= this.settings.dailyProfitLimit) {
         if (this.tickerCount % 100 === 0) {
-          this.log(`Daily profit limit reached: $${this.dailyProfit.toFixed(2)} >= $${this.settings.dailyProfitLimit}`, 'warning');
+          this.log(`Daily profit limit reached: $${(this.dailyProfit || 0).toFixed(2)} >= $${this.settings.dailyProfitLimit}`, 'warning');
         }
         canTrade = false;
       }
       if (this.settings.dailyLossLimit > 0 && this.dailyProfit <= -this.settings.dailyLossLimit) {
         if (this.tickerCount % 100 === 0) {
-          this.log(`Daily loss limit reached: $${this.dailyProfit.toFixed(2)} <= -$${this.settings.dailyLossLimit}`, 'warning');
+          this.log(`Daily loss limit reached: $${(this.dailyProfit || 0).toFixed(2)} <= -$${this.settings.dailyLossLimit}`, 'warning');
         }
         canTrade = false;
       }
@@ -941,11 +985,11 @@ export class TradingService {
         this.isOpeningTrade = true;
         try {
           if (this.settings.strategyType === 'CALL_SPREAD') {
-            await this.executeCallSpread(price, prediction, currentFeatures);
+            await this.executeCallSpread(price, prediction, this.lastFeatures || {});
           } else if (this.settings.strategyType === 'SHORT_CALL') {
-            await this.executeShortCall(price, prediction, currentFeatures);
+            await this.executeShortCall(price, prediction, this.lastFeatures || {});
           } else {
-            this.log(`Opening SHORT at $${price} | Prediction: ${prediction.toFixed(4)}`, 'success');
+            this.log(`Opening SHORT at $${price} | Prediction: ${(prediction || 0).toFixed(4)}`, 'success');
             this.activeTrade = {
               type: 'SHORT',
               entryPrice: price,
@@ -953,7 +997,7 @@ export class TradingService {
               highestProfitPct: 0,
               trailingStopPrice: null,
               prediction: prediction,
-              features: currentFeatures
+              features: this.lastFeatures || {}
             };
             if (this.isRealTrading) {
               this.placeRealOrder('sell', this.settings.quantity, false).then(orderId => {
@@ -1147,7 +1191,7 @@ export class TradingService {
         }
       }
       if (bestOption) {
-        this.log(`Found best option: ${bestOption.symbol} with delta ${bestOption.delta.toFixed(3)}`, 'success');
+        this.log(`Found best option: ${bestOption.symbol} with delta ${(bestOption.delta || 0).toFixed(3)}`, 'success');
       } else {
         this.log(`No option found with greeks for delta ${targetDelta}`, 'warning');
       }

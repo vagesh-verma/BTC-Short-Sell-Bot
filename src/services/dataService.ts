@@ -27,7 +27,7 @@ export async function fetchBTCData(limit: number = 500, interval: string = '1h',
   };
 
   const resolution = resolutionMap[interval] || '1h';
-  const symbol = 'BTCUSD'; // Delta Exchange perpetual symbol
+  let symbol = 'BTCUSD'; // Delta Exchange perpetual symbol
   
   // Calculate start time based on limit and interval if not provided
   const intervalInSeconds: { [key: string]: number } = {
@@ -88,14 +88,25 @@ export async function fetchBTCData(limit: number = 500, interval: string = '1h',
       const response = await fetch(url.toString());
       
       if (!response.ok) {
+        if (symbol === 'BTCUSD') {
+          logger.warning(`BTCUSD failed, trying BTCUSD_P...`);
+          symbol = 'BTCUSD_P';
+          continue; // Retry with new symbol
+        }
         const errorText = await response.text();
         logger.error(`Delta API Error (${response.status}): ${errorText}`);
         throw new Error(`Delta API Error: ${response.status}`);
       }
       
       const result = await response.json();
-      const data = result.result || [];
+      let data = result.result || [];
       
+      if ((!data || data.length === 0) && symbol === 'BTCUSD') {
+        logger.warning(`No data for BTCUSD, trying BTCUSD_P...`);
+        symbol = 'BTCUSD_P';
+        continue; // Retry with new symbol
+      }
+
       if (!data || data.length === 0) {
         logger.warning(`No data returned for batch. Stopping fetch.`);
         break;

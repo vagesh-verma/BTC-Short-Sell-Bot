@@ -74,7 +74,7 @@ export class GRUModel {
       callbacks: {
         onEpochEnd: (epoch, logs) => {
           if (logs) {
-            logger.info(`Epoch ${epoch + 1}/${epochs} - loss: ${logs.loss.toFixed(4)}, acc: ${logs.acc.toFixed(4)}`);
+            logger.info(`Epoch ${epoch + 1}/${epochs} - loss: ${(logs.loss || 0).toFixed(4)}, acc: ${(logs.acc || 0).toFixed(4)}`);
           }
           if (onEpochEnd) onEpochEnd(epoch, logs);
         }
@@ -241,11 +241,13 @@ export function prepareData(
   dayOfWeek?: number[],
   bearishHarami?: number[],
   marubozu?: number[],
-  engulfing?: number[]
+  engulfing?: number[],
+  startIndex: number = 0
 ) {
   const samples: { x: number[], y: number }[] = [];
+  const actualStart = Math.max(windowSize, startIndex);
   
-  for (let i = windowSize; i < prices.length - 1; i++) {
+  for (let i = actualStart; i < prices.length - 1; i++) {
     const windowIndices = Array.from({ length: windowSize }, (_, k) => i - windowSize + k);
     
     const priceWindow = windowIndices.map(idx => prices[idx]);

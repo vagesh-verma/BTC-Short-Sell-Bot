@@ -1,0 +1,52 @@
+808:        logger.success(`Live Trade Closed: ${reason} | Profit: $${(profit || 0).toFixed(2)}`);
+847:      logger.info(`Live Trade Opened: SHORT at $${(price || 0).toFixed(2)}`);
+1462:      logger.info(`Running backtest on ${validHighResCandles.length} candles (${((validHighResCandles.length * 5 / 60) || 0).toFixed(1)} hours of data)...`);
+1467:      logger.success(`Backtest complete! Profit: ${(result.totalProfit || 0).toFixed(2)}%`);
+1489:      balance: parseFloat((e.balance || 0).toFixed(2)),
+1498:      prediction: parseFloat(((backtestResult.predictions[i] || 0) * 100).toFixed(2)),
+1714:                        <span className="text-xs font-bold text-purple-300">{((predictionStats.total > 0 ? (predictionStats.aboveThreshold / predictionStats.total * 100) : 0) || 0).toFixed(1)}% Active</span>
+1836:                            Drops: {trainingStats1h.positive} / {trainingStats1h.total} ({((trainingStats1h.total > 0 ? (trainingStats1h.positive / trainingStats1h.total * 100) : 0) || 0).toFixed(1)}%)
+1847:                              <span className="text-white/60">L: {(log.loss || 0).toFixed(4)}</span>
+1848:                              <span className="text-amber-500">A: {((log.acc || 0) * 100).toFixed(1)}%</span>
+1859:                            Drops: {trainingStats4h.positive} / {trainingStats4h.total} ({((trainingStats4h.total > 0 ? (trainingStats4h.positive / trainingStats4h.total * 100) : 0) || 0).toFixed(1)}%)
+1870:                              <span className="text-white/60">L: {(log.loss || 0).toFixed(4)}</span>
+1871:                              <span className="text-amber-500">A: {((log.acc || 0) * 100).toFixed(1)}%</span>
+2026:                <MetricCard title="Win Rate" value={backtestResult ? `${(backtestResult.winRate || 0).toFixed(1)}%` : '---'} color="text-blue-400" />
+2028:                <MetricCard title="Max Drawdown" value={backtestResult ? `${(backtestResult.maxDrawdown || 0).toFixed(2)}%` : '---'} color="text-red-400" />
+2029:                <MetricCard title="Avg Profit" value={backtestResult ? `$${(backtestResult.avgProfit || 0).toFixed(2)}` : '---'} color="text-emerald-500/70" />
+2030:                <MetricCard title="Avg Loss" value={backtestResult ? `$${(backtestResult.avgLoss || 0).toFixed(2)}` : '---'} color="text-red-500/70" />
+2031:                <MetricCard title="Max Profit" value={backtestResult ? `$${(backtestResult.maxProfit || 0).toFixed(2)}` : '---'} color="text-emerald-600" />
+2032:                <MetricCard title="Max Loss" value={backtestResult ? `$${(backtestResult.maxLoss || 0).toFixed(2)}` : '---'} color="text-red-600" />
+2123:                              {trade.profitPct > 0 ? '+' : ''}{(trade.profitPct || 0).toFixed(2)}%
+2134:                              <p className="text-amber-400 font-bold mt-1">Pred: {((trade.prediction || 0) * 100).toFixed(1)}%</p>
+2153:                                  <div key={name} className="truncate">{name}: {(val as number || 0).toFixed(4)}</div>
+2164:                          <span className="text-[9px] text-white/30 italic">Duration: {(((trade.exitTime - trade.entryTime) / (1000 * 60 * 60)) || 0).toFixed(1)}h</span>
+2166:                            ${(trade.profit || 0).toFixed(2)}
+2365:                      <span className="text-blue-400 font-mono">{((settings.threshold * 100) || 0).toFixed(1)}%</span>
+2377:                      <span className="text-purple-400 font-mono">{((settings.exitThreshold * 100) || 0).toFixed(1)}%</span>
+2704:                      Daily: ${(serverTradingStatus?.dailyProfit || 0).toFixed(2)}
+2724:                        {livePrediction ? ((livePrediction * 100) || 0).toFixed(1) : '--'}%
+2741:                          <span className="text-[10px] font-mono text-white/60">{(liveParams.rsi || 0).toFixed(1)}</span>
+2751:                          <span className="text-[10px] font-mono text-white/60">{(liveParams.macdHist || 0).toFixed(2)}</span>
+2755:                          <span className="text-[10px] font-mono text-white/60">{(liveParams.stochRsi || 0).toFixed(2)}</span>
+2759:                          <span className="text-[10px] font-mono text-white/60">{(liveParams.atr || 0).toFixed(1)}</span>
+2763:                          <span className="text-[10px] font-mono text-white/60">{((liveParams.secondaryPrediction || 0) * 100).toFixed(1)}%</span>
+2771:                          <span className="text-[10px] font-mono text-white/60">{(liveParams.mfi || 0).toFixed(1)}</span>
+2775:                          <span className="text-[10px] font-mono text-white/60">{(liveParams.volatility || 0).toFixed(1)}%</span>
+2802:                            {liveParams.uncertainty ? (liveParams.uncertainty || 0).toFixed(4) : '0.0000'}
+2808:                            {liveParams.velocity ? (liveParams.velocity > 0 ? '+' : '') + (liveParams.velocity || 0).toFixed(4) : '0.0000'}
+2829:                              <span className="text-white/60 font-mono">${(leg.entryPrice || 0).toFixed(2)}</span>
+2835:                                  {leg.pnl >= 0 ? '+' : ''}{(leg.pnl || 0).toFixed(4)} USDT
+2874:                        <span className="text-[10px] font-mono text-red-400">{((serverTradingStatus.settings.stopLoss * 100) || 0).toFixed(1)}%</span>
+2878:                        <span className="text-[10px] font-mono text-emerald-400">{((serverTradingStatus.settings.takeProfit * 100) || 0).toFixed(1)}%</span>
+2882:                        <span className="text-[10px] font-mono text-white/60">{((serverTradingStatus.settings.trailingStopActivation * 100) || 0).toFixed(1)}%</span>
+2886:                        <span className="text-[10px] font-mono text-white/60">{((serverTradingStatus.settings.trailingStopOffset * 100) || 0).toFixed(1)}%</span>
+2922:                          {activeLiveTrade.pnlPct !== undefined ? (activeLiveTrade.pnlPct || 0).toFixed(2) : (((activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice * 100) || 0).toFixed(2)}%
+2932:                          <span className="text-[10px] text-blue-400 font-mono">Pred: {(activeLiveTrade.prediction || 0).toFixed(3)}</span>
+2938:                              <div className="text-[10px] font-mono text-white/60">{(val as number || 0).toFixed(2)}</div>
+2973:                              ? `$${(activeLiveTrade.pnl || 0).toFixed(2)} (${(activeLiveTrade.pnlPct || 0).toFixed(2)}%)`
+2979:                                ) || 0).toFixed(2)} (${(((activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice * 100) || 0).toFixed(2)}%)`
+3045:                              {trade.profit >= 0 ? '+' : ''}{(trade.profit || 0).toFixed(2)}
+3063:                                <span className="text-blue-400">Pred: {(trade.prediction || 0).toFixed(3)}</span>
+3069:                                    <span className="text-white/60">{(val as number || 0).toFixed(2)}</span>
+3079:                              {trade.profitPct >= 0 ? '+' : ''}{(trade.profitPct || 0).toFixed(2)}%

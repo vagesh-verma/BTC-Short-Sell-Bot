@@ -58,6 +58,8 @@ const FEATURE_NAMES = [
   'Harami', 'Marubozu', 'Engulfing'
 ];
 
+const INDICATOR_WARMUP = 200; // Number of candles to fetch before the range for indicator stability
+
 export default function App() {
   const [candles, setCandles] = useState<Candle[]>([]);
   const [candles4h, setCandles4h] = useState<Candle[]>([]);
@@ -339,7 +341,7 @@ export default function App() {
       const res = await fetch('/api/trading/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ settings })
+        body: JSON.stringify({ settings, indicatorPeriods })
       });
       if (res.ok) {
         logger.success('Settings pushed to server and persisted');
@@ -425,7 +427,7 @@ export default function App() {
         await fetch('/api/trading/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ settings, isRealTrading })
+          body: JSON.stringify({ settings, isRealTrading, indicatorPeriods })
         });
         logger.success('Server-side trading started!');
       }
@@ -803,7 +805,7 @@ export default function App() {
         setLiveTrades(prev => [newTrade, ...prev]);
         setLivePaperBalance(prev => prev + profit);
         setActiveLiveTrade(null);
-        logger.success(`Live Trade Closed: ${reason} | Profit: $${profit.toFixed(2)}`);
+        logger.success(`Live Trade Closed: ${reason} | Profit: $${(profit || 0).toFixed(2)}`);
         
         if (isRealTrading) {
           placeRealOrder('buy', settings.quantity); // Close SHORT with BUY
@@ -842,7 +844,7 @@ export default function App() {
         prediction: prediction,
         features: currentFeatures
       });
-      logger.info(`Live Trade Opened: SHORT at $${price.toFixed(2)}`);
+      logger.info(`Live Trade Opened: SHORT at $${(price || 0).toFixed(2)}`);
       
       if (isRealTrading) {
         placeRealOrder('sell', settings.quantity); // Open SHORT with SELL
@@ -935,8 +937,12 @@ export default function App() {
     try {
       const startTs = new Date(trainingRange.start).getTime();
       const endTs = new Date(trainingRange.end).getTime();
-      const data = await fetchBTCData(0, '1h', startTs, endTs);
-      const data4h = await fetchBTCData(0, '4h', startTs - (windowSize * 4 * 60 * 60 * 1000), endTs);
+      
+      // Fetch extra data before the start for indicator stability
+      const fetchStartTs = startTs - (INDICATOR_WARMUP * 60 * 60 * 1000);
+      
+      const data = await fetchBTCData(0, '1h', fetchStartTs, endTs);
+      const data4h = await fetchBTCData(0, '4h', fetchStartTs - (INDICATOR_WARMUP * 4 * 60 * 60 * 1000), endTs);
       
       if (data.length === 0 || data4h.length === 0) {
         logger.error('Failed to fetch initial data.');
@@ -958,51 +964,66 @@ export default function App() {
 
   const getPredictionsForRange = async (candles1h: Candle[], candles4h: Candle[], m1h: GRUModel, m4h: GRUModel, mcPasses: number = 1) => {
     logger.info(`Generating predictions for provided range (MC Passes: ${mcPasses})...`);
-    const prices4h = candles4h.map(c => c.close);
-    const highs4h = candles4h.map(c => c.high);
-    const lows4h = candles4h.map(c => c.low);
-    const volumes4h = candles4h.map(c => c.volume);
-    const hours4h = candles4h.map(c => new Date(c.time).getHours());
-    const days4h = candles4h.map(c => new Date(c.time).getDay());
-
-    const rsi4h = calculateRSI(prices4h, indicatorPeriods.rsi);
-    const ema4h = calculateEMA(prices4h, indicatorPeriods.ema);
-    const ema9_4h = calculateEMA(prices4h, indicatorPeriods.ema9);
-    const cross4h = calculateEMACross(ema9_4h, ema4h);
-    const bb4h = calculateBollingerBands(prices4h, indicatorPeriods.bb);
-    const macd4h = calculateMACD(prices4h);
-    const stochRsi4h = calculateStochasticRSI(rsi4h);
-    const atr4h = calculateATR(highs4h, lows4h, prices4h);
-    const obv4h = calculateOBV(prices4h, volumes4h);
-    const mfi4h = calculateMFI(highs4h, lows4h, prices4h, volumes4h, indicatorPeriods.mfi);
-    const vol4h = calculateVolatility(prices4h, indicatorPeriods.volatility);
-    const opens4h = candles4h.map(c => c.open);
-    const harami4h = calculateBearishHarami(opens4h, prices4h);
-    const marubozu4h = calculateMarubozu(opens4h, highs4h, lows4h, prices4h);
-    const engulfing4h = calculateEngulfing(opens4h, prices4h);
-
-    const secondaryPredictionsFor1h: number[] = [];
-    const prices1h = candles1h.map(c => c.close);
     
-    for (let i = 0; i < candles1h.length; i++) {
-      const currentTime = candles1h[i].time;
-      let last4hIdx = -1;
-      for (let j = candles4h.length - 1; j >= windowSize; j--) {
-        // Ensure the 4h candle has finished before the current 1h candle time
-        if (candles4h[j].time + (4 * 60 * 60 * 1000) <= currentTime) {
-          last4hIdx = j;
-          break;
-        }
-      }
+    const bufferSize = 100; // Match live bot buffer size
+    const generatedPredictions: number[] = [];
+    const generatedUncertainties: number[] = [];
+    const generatedFeatures: number[][] = [];
 
-      if (last4hIdx >= windowSize) {
-        const windowIndices = Array.from({ length: windowSize }, (_, k) => last4hIdx - windowSize + k);
-        const pWindow = windowIndices.map(idx => prices4h[idx]);
-        const rWindow = windowIndices.map(idx => rsi4h[idx]);
-        const eWindow = windowIndices.map(idx => ema4h[idx]);
-        const e9Window = windowIndices.map(idx => ema9_4h[idx]);
-        const uWindow = windowIndices.map(idx => bb4h.upper[idx]);
-        const lWindow = windowIndices.map(idx => bb4h.lower[idx]);
+    // We start from where we have enough data for both the window and the indicator buffer
+    const startIdx = Math.max(windowSize, bufferSize);
+    
+    if (candles1h.length <= startIdx) {
+      logger.warning(`Not enough 1h candles (${candles1h.length}) to generate predictions with buffer ${bufferSize}`);
+      return { predictions: [], uncertainties: [], features: [] };
+    }
+
+    for (let i = startIdx; i < candles1h.length; i++) {
+      // 1. Calculate 4h context (Secondary Predictions) for the current 1h window
+      const secondaryPredictions: number[] = [];
+      const windowIndices = Array.from({ length: windowSize }, (_, k) => i - windowSize + k);
+      
+      for (const idx of windowIndices) {
+        const currentTime = candles1h[idx].time;
+        
+        // Find the last completed 4h candle for this 1h candle
+        let last4hIdx = -1;
+        for (let j = candles4h.length - 1; j >= 0; j--) {
+          if (candles4h[j].time + (4 * 60 * 60 * 1000) <= currentTime) {
+            last4hIdx = j;
+            break;
+          }
+        }
+
+        if (last4hIdx < bufferSize - 1) {
+          secondaryPredictions.push(0.5);
+          continue;
+        }
+
+        // Calculate 4h indicators using a FIXED buffer for determinism
+        const sub4h = candles4h.slice(last4hIdx - bufferSize + 1, last4hIdx + 1);
+        const p4 = sub4h.map(c => c.close);
+        const h4 = sub4h.map(c => c.high);
+        const l4 = sub4h.map(c => c.low);
+        const v4 = sub4h.map(c => c.volume);
+        const o4 = sub4h.map(c => c.open);
+        const hr4 = sub4h.map(c => new Date(c.time).getHours());
+        const d4 = sub4h.map(c => new Date(c.time).getDay());
+
+        const rsi4 = calculateRSI(p4, indicatorPeriods.rsi);
+        const ema4 = calculateEMA(p4, indicatorPeriods.ema);
+        const ema9_4 = calculateEMA(p4, indicatorPeriods.ema9);
+        const bb4 = calculateBollingerBands(p4, indicatorPeriods.bb);
+        const macd4 = calculateMACD(p4);
+        const stoch4 = calculateStochasticRSI(rsi4);
+        const atr4 = calculateATR(h4, l4, p4);
+        const cross4 = calculateEMACross(ema9_4, ema4);
+        const obv4 = calculateOBV(p4, v4);
+        const mfi4 = calculateMFI(h4, l4, p4, v4, indicatorPeriods.mfi);
+        const vol4 = calculateVolatility(p4, indicatorPeriods.volatility);
+        const harami4 = calculateBearishHarami(o4, p4);
+        const marubozu4 = calculateMarubozu(o4, h4, l4, p4);
+        const engulfing4 = calculateEngulfing(o4, p4);
 
         const normalize = (arr: number[]) => {
           const min = Math.min(...arr);
@@ -1010,77 +1031,57 @@ export default function App() {
           return arr.map(v => (max === min ? 0 : (v - min) / (max - min)));
         };
 
-        const input: number[] = [];
-        const nP = normalize(pWindow);
-        const nR = rWindow.map(v => v / 100);
-        const nE = normalize(eWindow);
-        const nE9 = normalize(e9Window);
-        const nU = normalize(uWindow);
-        const nL = normalize(lWindow);
-        const nH = normalize(windowIndices.map(idx => macd4h.histogram[idx]));
-        const nS = windowIndices.map(idx => stochRsi4h[idx]);
-        const nA = normalize(windowIndices.map(idx => atr4h[idx]));
-        const nBelow = windowIndices.map(idx => cross4h.isBelow[idx]);
-        const nCross = windowIndices.map(idx => cross4h.isCross[idx]);
+        const winIdx4 = Array.from({ length: windowSize }, (_, k) => bufferSize - windowSize + k);
+        const np4 = normalize(winIdx4.map(idx => p4[idx]));
+        const nr4 = winIdx4.map(idx => rsi4[idx] / 100);
+        const ne4 = normalize(winIdx4.map(idx => ema4[idx]));
+        const nu4 = normalize(winIdx4.map(idx => bb4.upper[idx]));
+        const nl4 = normalize(winIdx4.map(idx => bb4.lower[idx]));
+        const nm4 = normalize(winIdx4.map(idx => macd4.histogram[idx]));
+        const na4 = normalize(winIdx4.map(idx => atr4[idx]));
+        const ne9_4 = normalize(winIdx4.map(idx => ema9_4[idx]));
+        const nobv4 = normalize(winIdx4.map(idx => obv4[idx]));
+        const nvol4 = normalize(winIdx4.map(idx => vol4[idx]));
 
-        const nObv = normalize(windowIndices.map(idx => obv4h[idx]));
-        const nMfi = windowIndices.map(idx => mfi4h[idx]).map(v => v / 100);
-        const nVol = normalize(windowIndices.map(idx => vol4h[idx]));
-        const nHour = windowIndices.map(idx => hours4h[idx]);
-        const nDay = windowIndices.map(idx => days4h[idx]);
-        const nHarami = windowIndices.map(idx => harami4h[idx]);
-        const nMarubozu = windowIndices.map(idx => marubozu4h[idx]);
-        const nEngulfing = windowIndices.map(idx => engulfing4h[idx]);
-
+        const x4: number[] = [];
         for (let j = 0; j < windowSize; j++) {
-          const h = nHour[j];
-          input.push(
-            nP[j], nR[j], nE[j], nU[j], nL[j], nH[j], nS[j], nA[j], nE9[j], nBelow[j], nCross[j], nObv[j], nMfi[j], nVol[j],
-            h / 24, h >= 0 && h <= 9 ? 1 : 0, h >= 8 && h <= 17 ? 1 : 0, h >= 13 && h <= 22 ? 1 : 0, nDay[j] / 7,
-            nHarami[j], nMarubozu[j], nEngulfing[j]
+          const h = hr4[winIdx4[j]];
+          x4.push(
+            np4[j], nr4[j], ne4[j], nu4[j], nl4[j],
+            nm4[j], stoch4[winIdx4[j]], na4[j], ne9_4[j],
+            cross4.isBelow[winIdx4[j]], cross4.isCross[winIdx4[j]], nobv4[j],
+            mfi4[winIdx4[j]] / 100, nvol4[j],
+            h / 24, h >= 0 && h <= 9 ? 1 : 0, h >= 8 && h <= 17 ? 1 : 0, h >= 13 && h <= 22 ? 1 : 0, d4[winIdx4[j]] / 7,
+            harami4[winIdx4[j]], marubozu4[winIdx4[j]], engulfing4[winIdx4[j]]
           );
         }
-        secondaryPredictionsFor1h.push(m4h.predict(input));
-      } else {
-        secondaryPredictionsFor1h.push(0.5);
+        secondaryPredictions.push(m4h.predict(x4));
       }
-    }
 
-    const highs1h = candles1h.map(c => c.high);
-    const lows1h = candles1h.map(c => c.low);
-    const volumes1h = candles1h.map(c => c.volume);
-    const hours1h = candles1h.map(c => new Date(c.time).getHours());
-    const days1h = candles1h.map(c => new Date(c.time).getDay());
+      // 2. Calculate 1h indicators using a FIXED buffer for determinism
+      const sub1h = candles1h.slice(i - bufferSize + 1, i + 1);
+      const p1 = sub1h.map(c => c.close);
+      const h1 = sub1h.map(c => c.high);
+      const l1 = sub1h.map(c => c.low);
+      const v1 = sub1h.map(c => c.volume);
+      const o1 = sub1h.map(c => c.open);
+      const hr1 = sub1h.map(c => new Date(c.time).getHours());
+      const d1 = sub1h.map(c => new Date(c.time).getDay());
 
-    const rsi1h = calculateRSI(prices1h, indicatorPeriods.rsi);
-    const ema1h = calculateEMA(prices1h, indicatorPeriods.ema);
-    const ema9_1h = calculateEMA(prices1h, indicatorPeriods.ema9);
-    const cross1h = calculateEMACross(ema9_1h, ema1h);
-    const bb1h = calculateBollingerBands(prices1h, indicatorPeriods.bb);
-    const macd1h = calculateMACD(prices1h);
-    const stochRsi1h = calculateStochasticRSI(rsi1h);
-    const atr1h = calculateATR(highs1h, lows1h, prices1h);
-    const obv1h = calculateOBV(prices1h, volumes1h);
-    const mfi1h = calculateMFI(highs1h, lows1h, prices1h, volumes1h, indicatorPeriods.mfi);
-    const vol1h = calculateVolatility(prices1h, indicatorPeriods.volatility);
-    const opens1h = candles1h.map(c => c.open);
-    const harami1h = calculateBearishHarami(opens1h, prices1h);
-    const marubozu1h = calculateMarubozu(opens1h, highs1h, lows1h, prices1h);
-    const engulfing1h = calculateEngulfing(opens1h, prices1h);
-
-    const generatedPredictions: number[] = [];
-    const generatedUncertainties: number[] = [];
-    const generatedFeatures: number[][] = [];
-    for (let i = windowSize; i < prices1h.length; i++) {
-      const windowIndices = Array.from({ length: windowSize }, (_, k) => i - windowSize + k);
-      
-      const priceWindow = windowIndices.map(idx => prices1h[idx]);
-      const rsiWindow = windowIndices.map(idx => rsi1h[idx]);
-      const emaWindow = windowIndices.map(idx => ema1h[idx]);
-      const ema9Window = windowIndices.map(idx => ema9_1h[idx]);
-      const bbUpperWindow = windowIndices.map(idx => bb1h.upper[idx]);
-      const bbLowerWindow = windowIndices.map(idx => bb1h.lower[idx]);
-      const secWindow = windowIndices.map(idx => secondaryPredictionsFor1h[idx]);
+      const rsi1 = calculateRSI(p1, indicatorPeriods.rsi);
+      const ema1 = calculateEMA(p1, indicatorPeriods.ema);
+      const ema9_1 = calculateEMA(p1, indicatorPeriods.ema9);
+      const cross1 = calculateEMACross(ema9_1, ema1);
+      const bb1 = calculateBollingerBands(p1, indicatorPeriods.bb);
+      const macd1 = calculateMACD(p1);
+      const stoch1 = calculateStochasticRSI(rsi1);
+      const atr1 = calculateATR(h1, l1, p1);
+      const obv1 = calculateOBV(p1, v1);
+      const mfi1 = calculateMFI(h1, l1, p1, v1, indicatorPeriods.mfi);
+      const vol1 = calculateVolatility(p1, indicatorPeriods.volatility);
+      const harami1 = calculateBearishHarami(o1, p1);
+      const marubozu1 = calculateMarubozu(o1, h1, l1, p1);
+      const engulfing1 = calculateEngulfing(o1, p1);
 
       const normalize = (arr: number[]) => {
         const min = Math.min(...arr);
@@ -1088,42 +1089,37 @@ export default function App() {
         return arr.map(v => (max === min ? 0 : (v - min) / (max - min)));
       };
 
-      const normPrice = normalize(priceWindow);
-      const normRsi = rsiWindow.map(v => v / 100);
-      const normEma = normalize(emaWindow);
-      const normEma9 = normalize(ema9Window);
-      const normBbUpper = normalize(bbUpperWindow);
-      const normBbLower = normalize(bbLowerWindow);
-      const normMacd = normalize(windowIndices.map(idx => macd1h.histogram[idx]));
-      const normStochRsi = windowIndices.map(idx => stochRsi1h[idx]);
-      const normAtr = normalize(windowIndices.map(idx => atr1h[idx]));
-      const normBelow = windowIndices.map(idx => cross1h.isBelow[idx]);
-      const normCross = windowIndices.map(idx => cross1h.isCross[idx]);
-      const normObv = normalize(windowIndices.map(idx => obv1h[idx]));
-      const normMfi = windowIndices.map(idx => mfi1h[idx]).map(v => v / 100);
-      const normVol = normalize(windowIndices.map(idx => vol1h[idx]));
-      const normHour = windowIndices.map(idx => hours1h[idx]);
-      const normDay = windowIndices.map(idx => days1h[idx]);
-      const normHarami = windowIndices.map(idx => harami1h[idx]);
-      const normMarubozu = windowIndices.map(idx => marubozu1h[idx]);
-      const normEngulfing = windowIndices.map(idx => engulfing1h[idx]);
+      const winIdx1 = Array.from({ length: windowSize }, (_, k) => bufferSize - windowSize + k);
+      const np1 = normalize(winIdx1.map(idx => p1[idx]));
+      const nr1 = winIdx1.map(idx => rsi1[idx] / 100);
+      const ne1 = normalize(winIdx1.map(idx => ema1[idx]));
+      const nu1 = normalize(winIdx1.map(idx => bb1.upper[idx]));
+      const nl1 = normalize(winIdx1.map(idx => bb1.lower[idx]));
+      const nm1 = normalize(winIdx1.map(idx => macd1.histogram[idx]));
+      const na1 = normalize(winIdx1.map(idx => atr1[idx]));
+      const ne9_1 = normalize(winIdx1.map(idx => ema9_1[idx]));
+      const nobv1 = normalize(winIdx1.map(idx => obv1[idx]));
+      const nvol1 = normalize(winIdx1.map(idx => vol1[idx]));
 
-      const input: number[] = [];
+      const x1: number[] = [];
       for (let j = 0; j < windowSize; j++) {
-        const h = normHour[j];
-        input.push(
-          normPrice[j], normRsi[j], normEma[j], normBbUpper[j], normBbLower[j],
-          normMacd[j], normStochRsi[j], normAtr[j], secWindow[j],
-          normEma9[j], normBelow[j], normCross[j], normObv[j], normMfi[j], normVol[j],
-          h / 24, h >= 0 && h <= 9 ? 1 : 0, h >= 8 && h <= 17 ? 1 : 0, h >= 13 && h <= 22 ? 1 : 0, normDay[j] / 7,
-          normHarami[j], normMarubozu[j], normEngulfing[j]
+        const h = hr1[winIdx1[j]];
+        x1.push(
+          np1[j], nr1[j], ne1[j], nu1[j], nl1[j],
+          nm1[j], stoch1[winIdx1[j]], na1[j], secondaryPredictions[j],
+          ne9_1[j], cross1.isBelow[winIdx1[j]], cross1.isCross[winIdx1[j]],
+          nobv1[j], mfi1[winIdx1[j]] / 100, nvol1[j],
+          h / 24, h >= 0 && h <= 9 ? 1 : 0, h >= 8 && h <= 17 ? 1 : 0, h >= 13 && h <= 22 ? 1 : 0, d1[winIdx1[j]] / 7,
+          harami1[winIdx1[j]], marubozu1[winIdx1[j]], engulfing1[winIdx1[j]]
         );
       }
-      const result = m1h.predictMultiple(input, mcPasses);
+
+      const result = m1h.predictMultiple(x1, mcPasses);
       generatedPredictions.push(result.mean);
       generatedUncertainties.push(result.std);
-      generatedFeatures.push(input);
+      generatedFeatures.push(x1);
     }
+
     return { predictions: generatedPredictions, uncertainties: generatedUncertainties, features: generatedFeatures };
   };
 
@@ -1183,7 +1179,8 @@ export default function App() {
         undefined, macd4h.histogram, stochRsi4h, atr4h, dropThreshold4h,
         ema9_4h, cross4h.isBelow, cross4h.isCross,
         obv4h, mfi4h, vol4h, hours4h, days4h,
-        harami4h, marubozu4h, engulfing4h
+        harami4h, marubozu4h, engulfing4h,
+        INDICATOR_WARMUP
       );
       setTrainingStats4h(data4h.stats);
       const model4h = new GRUModel(windowSize, 22, 'temp_4h'); // Updated feature count (19 + 3)
@@ -1314,7 +1311,8 @@ export default function App() {
         days1h,
         harami1h,
         marubozu1h,
-        engulfing1h
+        engulfing1h,
+        INDICATOR_WARMUP
       );
       setTrainingStats1h(data1h.stats);
       
@@ -1348,7 +1346,9 @@ export default function App() {
       
       // Auto-run initial backtest
       logger.info('Running initial backtest...');
-      const result = runBacktest(candles.slice(windowSize), generatedPredictions, settings, 10000, 0, generatedFeatures, FEATURE_NAMES);
+      const bufferSize = 100;
+      const startIdx = Math.max(windowSize, bufferSize);
+      const result = runBacktest(candles.slice(startIdx), generatedPredictions, settings, 10000, 0, generatedFeatures, FEATURE_NAMES);
       setBacktestResult(result);
       logger.success('--- Training and Backtest Complete ---');
     } catch (err: any) {
@@ -1378,17 +1378,17 @@ export default function App() {
       logger.info(`--- Starting Backtest from ${backtestRange.start} to ${backtestRange.end} ---`);
       
       // 1. Fetch 1h and 4h data for the backtest range to generate predictions
-      // We need extra data before the start to fill the window
-      const fetchStartTs = startTs - (windowSize * 60 * 60 * 1000);
+      // We need extra data before the start to fill the window and stabilize indicators
+      const fetchStartTs = startTs - (INDICATOR_WARMUP * 60 * 60 * 1000);
       
       logger.info(`Fetching 1h data from ${format(new Date(fetchStartTs), 'yyyy-MM-dd HH:mm')} to ${format(new Date(endTs), 'yyyy-MM-dd HH:mm')}...`);
       const btCandles1h = await fetchBTCData(0, '1h', fetchStartTs, endTs);
       
       logger.info(`Fetching 4h data for trend context...`);
-      const btCandles4h = await fetchBTCData(0, '4h', fetchStartTs - (windowSize * 4 * 60 * 60 * 1000), endTs);
+      const btCandles4h = await fetchBTCData(0, '4h', fetchStartTs - (INDICATOR_WARMUP * 4 * 60 * 60 * 1000), endTs);
 
-      if (btCandles1h.length < windowSize) {
-        throw new Error(`Insufficient 1h data: got ${btCandles1h.length}, need at least ${windowSize}`);
+      if (btCandles1h.length < 5) {
+        throw new Error(`Insufficient 1h data: got ${btCandles1h.length}, need at least 5 candles to start.`);
       }
 
       setStatus('Generating predictions for backtest range...');
@@ -1411,9 +1411,12 @@ export default function App() {
       setStatus('Aligning predictions with 5m candles...');
       
       const predictionMap = new Map<number, { val: number, uncertainty: number, features: number[] }>();
+      const bufferSize = 100;
+      const startIdx = Math.max(windowSize, bufferSize);
+      
       btPredictions.forEach((val, i) => {
-        // btPredictions[i] corresponds to btCandles1h[i + windowSize]
-        const candleIndex = i + windowSize;
+        // btPredictions[i] corresponds to btCandles1h[i + startIdx]
+        const candleIndex = i + startIdx;
         if (btCandles1h[candleIndex]) {
           const time = btCandles1h[candleIndex].time;
           predictionMap.set(time, { 
@@ -1456,12 +1459,12 @@ export default function App() {
       }
 
       setStatus('Running High-Resolution Backtest...');
-      logger.info(`Running backtest on ${validHighResCandles.length} candles (${(validHighResCandles.length * 5 / 60).toFixed(1)} hours of data)...`);
-      const result = runBacktest(validHighResCandles, alignedPredictions, settings, 10000, windowSize, alignedFeatures, FEATURE_NAMES, alignedUncertainties);
+      logger.info(`Running backtest on ${validHighResCandles.length} candles (${((validHighResCandles.length * 5 / 60) || 0).toFixed(1)} hours of data)...`);
+      const result = runBacktest(validHighResCandles, alignedPredictions, settings, 10000, 0, alignedFeatures, FEATURE_NAMES, alignedUncertainties);
       
       setBacktestResult(result);
       setStatus('Backtest complete!');
-      logger.success(`Backtest complete! Profit: ${result.totalProfit.toFixed(2)}%`);
+      logger.success(`Backtest complete! Profit: ${(result.totalProfit || 0).toFixed(2)}%`);
     } catch (err: any) {
       const msg = err.message || 'Error running backtest';
       setError(msg);
@@ -1483,7 +1486,7 @@ export default function App() {
     if (!backtestResult) return [];
     return backtestResult.equityCurve.map(e => ({
       time: format(new Date(e.time), 'MM/dd HH:mm'),
-      balance: parseFloat(e.balance.toFixed(2)),
+      balance: parseFloat((e.balance || 0).toFixed(2)),
     }));
   }, [backtestResult]);
 
@@ -1492,7 +1495,7 @@ export default function App() {
     return backtestResult.candles.map((c, i) => ({
       time: format(new Date(c.time), 'MM/dd HH:mm'),
       price: c.close,
-      prediction: parseFloat((backtestResult.predictions[i] * 100).toFixed(2)),
+      prediction: parseFloat(((backtestResult.predictions[i] || 0) * 100).toFixed(2)),
     }));
   }, [backtestResult]);
 
@@ -1708,7 +1711,7 @@ export default function App() {
                     <div className="p-4 bg-purple-500/10 border border-purple-500/20 rounded-xl space-y-2">
                       <div className="flex items-center justify-between">
                         <span className="text-[10px] text-purple-400 uppercase font-bold">Model Confidence</span>
-                        <span className="text-xs font-bold text-purple-300">{(predictionStats.aboveThreshold / predictionStats.total * 100).toFixed(1)}% Active</span>
+                        <span className="text-xs font-bold text-purple-300">{((predictionStats.total > 0 ? (predictionStats.aboveThreshold / predictionStats.total * 100) : 0) || 0).toFixed(1)}% Active</span>
                       </div>
                       <div className="flex items-center justify-between text-[10px] text-white/40">
                         <span>Signals Triggered:</span>
@@ -1830,7 +1833,7 @@ export default function App() {
                         <h4 className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Primary Logs (1h)</h4>
                         {trainingStats1h && (
                           <span className="text-[9px] text-purple-400 font-mono">
-                            Drops: {trainingStats1h.positive} / {trainingStats1h.total} ({(trainingStats1h.positive / trainingStats1h.total * 100).toFixed(1)}%)
+                            Drops: {trainingStats1h.positive} / {trainingStats1h.total} ({((trainingStats1h.total > 0 ? (trainingStats1h.positive / trainingStats1h.total * 100) : 0) || 0).toFixed(1)}%)
                           </span>
                         )}
                       </div>
@@ -1841,8 +1844,8 @@ export default function App() {
                           trainingLogs.map((log, i) => (
                             <div key={i} className="flex justify-between border-b border-white/5 pb-1">
                               <span className="text-emerald-500">Epoch {log.epoch.toString().padStart(2, '0')}</span>
-                              <span className="text-white/60">L: {log.loss.toFixed(4)}</span>
-                              <span className="text-amber-500">A: {(log.acc * 100).toFixed(1)}%</span>
+                              <span className="text-white/60">L: {(log.loss || 0).toFixed(4)}</span>
+                              <span className="text-amber-500">A: {((log.acc || 0) * 100).toFixed(1)}%</span>
                             </div>
                           ))
                         )}
@@ -1853,7 +1856,7 @@ export default function App() {
                         <h4 className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Secondary Logs (4h)</h4>
                         {trainingStats4h && (
                           <span className="text-[9px] text-purple-400 font-mono">
-                            Drops: {trainingStats4h.positive} / {trainingStats4h.total} ({(trainingStats4h.positive / trainingStats4h.total * 100).toFixed(1)}%)
+                            Drops: {trainingStats4h.positive} / {trainingStats4h.total} ({((trainingStats4h.total > 0 ? (trainingStats4h.positive / trainingStats4h.total * 100) : 0) || 0).toFixed(1)}%)
                           </span>
                         )}
                       </div>
@@ -1864,8 +1867,8 @@ export default function App() {
                           secondaryTrainingLogs.map((log, i) => (
                             <div key={i} className="flex justify-between border-b border-white/5 pb-1">
                               <span className="text-emerald-500">Epoch {log.epoch.toString().padStart(2, '0')}</span>
-                              <span className="text-white/60">L: {log.loss.toFixed(4)}</span>
-                              <span className="text-amber-500">A: {(log.acc * 100).toFixed(1)}%</span>
+                              <span className="text-white/60">L: {(log.loss || 0).toFixed(4)}</span>
+                              <span className="text-amber-500">A: {((log.acc || 0) * 100).toFixed(1)}%</span>
                             </div>
                           ))
                         )}
@@ -2020,13 +2023,13 @@ export default function App() {
               {/* Detailed Metrics */}
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <MetricCard title="Total Profit" value={backtestResult ? `$${backtestResult.totalProfit.toLocaleString()}` : '---'} color="text-emerald-400" />
-                <MetricCard title="Win Rate" value={backtestResult ? `${backtestResult.winRate.toFixed(1)}%` : '---'} color="text-blue-400" />
+                <MetricCard title="Win Rate" value={backtestResult ? `${(backtestResult.winRate || 0).toFixed(1)}%` : '---'} color="text-blue-400" />
                 <MetricCard title="Total Trades" value={backtestResult ? backtestResult.trades.length.toString() : '---'} color="text-purple-400" />
-                <MetricCard title="Max Drawdown" value={backtestResult ? `${backtestResult.maxDrawdown.toFixed(2)}%` : '---'} color="text-red-400" />
-                <MetricCard title="Avg Profit" value={backtestResult ? `$${backtestResult.avgProfit.toFixed(2)}` : '---'} color="text-emerald-500/70" />
-                <MetricCard title="Avg Loss" value={backtestResult ? `$${backtestResult.avgLoss.toFixed(2)}` : '---'} color="text-red-500/70" />
-                <MetricCard title="Max Profit" value={backtestResult ? `$${backtestResult.maxProfit.toFixed(2)}` : '---'} color="text-emerald-600" />
-                <MetricCard title="Max Loss" value={backtestResult ? `$${backtestResult.maxLoss.toFixed(2)}` : '---'} color="text-red-600" />
+                <MetricCard title="Max Drawdown" value={backtestResult ? `${(backtestResult.maxDrawdown || 0).toFixed(2)}%` : '---'} color="text-red-400" />
+                <MetricCard title="Avg Profit" value={backtestResult ? `$${(backtestResult.avgProfit || 0).toFixed(2)}` : '---'} color="text-emerald-500/70" />
+                <MetricCard title="Avg Loss" value={backtestResult ? `$${(backtestResult.avgLoss || 0).toFixed(2)}` : '---'} color="text-red-500/70" />
+                <MetricCard title="Max Profit" value={backtestResult ? `$${(backtestResult.maxProfit || 0).toFixed(2)}` : '---'} color="text-emerald-600" />
+                <MetricCard title="Max Loss" value={backtestResult ? `$${(backtestResult.maxLoss || 0).toFixed(2)}` : '---'} color="text-red-600" />
               </div>
 
               {/* Price & Prediction Chart */}
@@ -2117,7 +2120,7 @@ export default function App() {
                           </div>
                           <div className="text-right">
                             <p className={cn("text-sm font-bold", trade.profit > 0 ? "text-emerald-500" : "text-red-500")}>
-                              {trade.profitPct > 0 ? '+' : ''}{trade.profitPct.toFixed(2)}%
+                              {trade.profitPct > 0 ? '+' : ''}{(trade.profitPct || 0).toFixed(2)}%
                             </p>
                           </div>
                         </div>
@@ -2128,7 +2131,7 @@ export default function App() {
                             <p className="text-white/80">{format(new Date(trade.entryTime), 'MM/dd HH:mm')}</p>
                             <p className="text-white font-mono font-medium">${trade.entryPrice.toLocaleString()}</p>
                             {trade.prediction !== undefined && (
-                              <p className="text-amber-400 font-bold mt-1">Pred: {(trade.prediction * 100).toFixed(1)}%</p>
+                              <p className="text-amber-400 font-bold mt-1">Pred: {((trade.prediction || 0) * 100).toFixed(1)}%</p>
                             )}
                           </div>
                           <div className="space-y-1 text-right">
@@ -2147,7 +2150,7 @@ export default function App() {
                               </summary>
                               <div className="mt-2 grid grid-cols-3 gap-x-2 gap-y-1 text-[8px] text-white/40 font-mono bg-black/40 p-2 rounded-lg">
                                 {Object.entries(trade.features).map(([name, val]) => (
-                                  <div key={name} className="truncate">{name}: {(val as number).toFixed(4)}</div>
+                                  <div key={name} className="truncate">{name}: {(val as number || 0).toFixed(4)}</div>
                                 ))}
                                 <div className="col-span-full mt-1 pt-1 border-t border-white/5 text-[7px] italic opacity-50">
                                   Showing entry features
@@ -2158,9 +2161,9 @@ export default function App() {
                         )}
 
                         <div className="pt-2 border-t border-white/5 flex justify-between items-center">
-                          <span className="text-[9px] text-white/30 italic">Duration: {((trade.exitTime - trade.entryTime) / (1000 * 60 * 60)).toFixed(1)}h</span>
+                          <span className="text-[9px] text-white/30 italic">Duration: {(((trade.exitTime - trade.entryTime) / (1000 * 60 * 60)) || 0).toFixed(1)}h</span>
                           <span className={cn("text-xs font-bold", trade.profit > 0 ? "text-emerald-500/70" : "text-red-500/70")}>
-                            ${trade.profit.toFixed(2)}
+                            ${(trade.profit || 0).toFixed(2)}
                           </span>
                         </div>
                       </div>
@@ -2359,7 +2362,7 @@ export default function App() {
                   <div className="space-y-2">
                     <div className="flex justify-between text-xs">
                       <span className="text-white/60">Entry Threshold</span>
-                      <span className="text-blue-400 font-mono">{(settings.threshold * 100).toFixed(1)}%</span>
+                      <span className="text-blue-400 font-mono">{((settings.threshold * 100) || 0).toFixed(1)}%</span>
                     </div>
                     <input 
                       type="range" min="0" max="1" step="0.01" 
@@ -2371,7 +2374,7 @@ export default function App() {
                   <div className="space-y-2">
                     <div className="flex justify-between text-xs">
                       <span className="text-white/60">Exit Threshold</span>
-                      <span className="text-purple-400 font-mono">{(settings.exitThreshold * 100).toFixed(1)}%</span>
+                      <span className="text-purple-400 font-mono">{((settings.exitThreshold * 100) || 0).toFixed(1)}%</span>
                     </div>
                     <input 
                       type="range" min="0" max="0.5" step="0.01" 
@@ -2718,7 +2721,7 @@ export default function App() {
                         "text-xs font-bold",
                         livePrediction && livePrediction > settings.threshold ? "text-amber-400" : "text-white/40"
                       )}>
-                        {livePrediction ? (livePrediction * 100).toFixed(1) : '--'}%
+                        {livePrediction !== null ? ((livePrediction * 100) || 0).toFixed(1) : '--'}%
                       </span>
                     </div>
                     <div className="w-full bg-white/5 h-1.5 rounded-full overflow-hidden">
@@ -2735,7 +2738,7 @@ export default function App() {
                       <div className="grid grid-cols-2 gap-x-4 gap-y-2 pt-4 border-t border-white/5">
                         <div className="flex justify-between items-center">
                           <span className="text-[10px] text-white/30 uppercase">RSI</span>
-                          <span className="text-[10px] font-mono text-white/60">{liveParams.rsi.toFixed(1)}</span>
+                          <span className="text-[10px] font-mono text-white/60">{(liveParams.rsi || 0).toFixed(1)}</span>
                         </div>
                         <div className="flex justify-between items-center">
                           <span className="text-[10px] text-white/30 uppercase">EMA9/20</span>
@@ -2745,31 +2748,31 @@ export default function App() {
                         </div>
                         <div className="flex justify-between items-center">
                           <span className="text-[10px] text-white/30 uppercase">MACD Hist</span>
-                          <span className="text-[10px] font-mono text-white/60">{liveParams.macdHist.toFixed(2)}</span>
+                          <span className="text-[10px] font-mono text-white/60">{(liveParams.macdHist || 0).toFixed(2)}</span>
                         </div>
                         <div className="flex justify-between items-center">
                           <span className="text-[10px] text-white/30 uppercase">StochRSI</span>
-                          <span className="text-[10px] font-mono text-white/60">{liveParams.stochRsi.toFixed(2)}</span>
+                          <span className="text-[10px] font-mono text-white/60">{(liveParams.stochRsi || 0).toFixed(2)}</span>
                         </div>
                         <div className="flex justify-between items-center">
                           <span className="text-[10px] text-white/30 uppercase">ATR</span>
-                          <span className="text-[10px] font-mono text-white/60">{liveParams.atr.toFixed(1)}</span>
+                          <span className="text-[10px] font-mono text-white/60">{(liveParams.atr || 0).toFixed(1)}</span>
                         </div>
                         <div className="flex justify-between items-center">
                           <span className="text-[10px] text-white/30 uppercase">4h Pred</span>
-                          <span className="text-[10px] font-mono text-white/60">{(liveParams.secondaryPrediction * 100).toFixed(1)}%</span>
+                          <span className="text-[10px] font-mono text-white/60">{((liveParams.secondaryPrediction || 0) * 100).toFixed(1)}%</span>
                         </div>
                         <div className="flex justify-between items-center">
                           <span className="text-[10px] text-white/30 uppercase">OBV</span>
-                          <span className="text-[10px] font-mono text-white/60">{liveParams.obv.toLocaleString()}</span>
+                          <span className="text-[10px] font-mono text-white/60">{(liveParams.obv || 0).toLocaleString()}</span>
                         </div>
                         <div className="flex justify-between items-center">
                           <span className="text-[10px] text-white/30 uppercase">MFI</span>
-                          <span className="text-[10px] font-mono text-white/60">{liveParams.mfi.toFixed(1)}</span>
+                          <span className="text-[10px] font-mono text-white/60">{(liveParams.mfi || 0).toFixed(1)}</span>
                         </div>
                         <div className="flex justify-between items-center">
                           <span className="text-[10px] text-white/30 uppercase">Volat.</span>
-                          <span className="text-[10px] font-mono text-white/60">{liveParams.volatility.toFixed(1)}%</span>
+                          <span className="text-[10px] font-mono text-white/60">{(liveParams.volatility || 0).toFixed(1)}%</span>
                         </div>
                         <div className="flex justify-between items-center">
                           <span className="text-[10px] text-white/30 uppercase">Harami</span>
@@ -2796,13 +2799,13 @@ export default function App() {
                         <div className="flex justify-between items-center pt-2 border-t border-white/5 col-span-2">
                           <span className="text-[10px] text-white/30 uppercase">Uncertainty (StdDev)</span>
                           <span className={cn("text-[10px] font-mono", (liveParams.uncertainty || 0) > settings.maxUncertainty ? "text-red-400" : "text-emerald-400")}>
-                            {liveParams.uncertainty ? liveParams.uncertainty.toFixed(4) : '0.0000'}
+                            {liveParams.uncertainty !== undefined ? (liveParams.uncertainty || 0).toFixed(4) : '0.0000'}
                           </span>
                         </div>
                         <div className="flex justify-between items-center col-span-2">
                           <span className="text-[10px] text-white/30 uppercase">Velocity (Delta)</span>
                           <span className={cn("text-[10px] font-mono", (liveParams.velocity || 0) < settings.minSignalVelocity ? "text-amber-400" : "text-emerald-400")}>
-                            {liveParams.velocity ? (liveParams.velocity > 0 ? '+' : '') + liveParams.velocity.toFixed(4) : '0.0000'}
+                            {liveParams.velocity !== undefined ? (liveParams.velocity > 0 ? '+' : '') + (liveParams.velocity || 0).toFixed(4) : '0.0000'}
                           </span>
                         </div>
                         <div className="col-span-2 flex justify-between items-center pt-2 border-t border-white/5 opacity-40">
@@ -2823,13 +2826,13 @@ export default function App() {
                               <span className={cn(leg.side === 'sell' ? "text-red-400" : "text-emerald-400")}>
                                 {leg.side.toUpperCase()} {leg.symbol}
                               </span>
-                              <span className="text-white/60 font-mono">${leg.entryPrice.toFixed(2)}</span>
+                              <span className="text-white/60 font-mono">${(leg.entryPrice || 0).toFixed(2)}</span>
                             </div>
                             {leg.pnl !== undefined && (
                               <div className="flex justify-between items-center text-[9px]">
                                 <span className="text-white/30 uppercase">PNL</span>
                                 <span className={cn("font-mono font-bold", leg.pnl >= 0 ? "text-emerald-400" : "text-red-400")}>
-                                  {leg.pnl >= 0 ? '+' : ''}{leg.pnl.toFixed(4)} USDT
+                                  {leg.pnl >= 0 ? '+' : ''}{(leg.pnl || 0).toFixed(4)} USDT
                                 </span>
                               </div>
                             )}
@@ -2868,19 +2871,19 @@ export default function App() {
                       </div>
                       <div className="flex justify-between items-center">
                         <span className="text-[10px] text-white/30 uppercase">Stop Loss</span>
-                        <span className="text-[10px] font-mono text-red-400">{(serverTradingStatus.settings.stopLoss * 100).toFixed(1)}%</span>
+                        <span className="text-[10px] font-mono text-red-400">{((serverTradingStatus.settings.stopLoss * 100) || 0).toFixed(1)}%</span>
                       </div>
                       <div className="flex justify-between items-center">
                         <span className="text-[10px] text-white/30 uppercase">Take Profit</span>
-                        <span className="text-[10px] font-mono text-emerald-400">{(serverTradingStatus.settings.takeProfit * 100).toFixed(1)}%</span>
+                        <span className="text-[10px] font-mono text-emerald-400">{((serverTradingStatus.settings.takeProfit * 100) || 0).toFixed(1)}%</span>
                       </div>
                       <div className="flex justify-between items-center">
                         <span className="text-[10px] text-white/30 uppercase">TS Activation</span>
-                        <span className="text-[10px] font-mono text-white/60">{(serverTradingStatus.settings.trailingStopActivation * 100).toFixed(1)}%</span>
+                        <span className="text-[10px] font-mono text-white/60">{((serverTradingStatus.settings.trailingStopActivation * 100) || 0).toFixed(1)}%</span>
                       </div>
                       <div className="flex justify-between items-center">
                         <span className="text-[10px] text-white/30 uppercase">TS Offset</span>
-                        <span className="text-[10px] font-mono text-white/60">{(serverTradingStatus.settings.trailingStopOffset * 100).toFixed(1)}%</span>
+                        <span className="text-[10px] font-mono text-white/60">{((serverTradingStatus.settings.trailingStopOffset * 100) || 0).toFixed(1)}%</span>
                       </div>
                       <div className="flex justify-between items-center">
                         <span className="text-[10px] text-white/30 uppercase">Quantity</span>
@@ -2914,9 +2917,9 @@ export default function App() {
                       <div className="text-right">
                         <div className={cn(
                           "text-2xl font-bold",
-                          (activeLiveTrade.pnlPct !== undefined ? activeLiveTrade.pnlPct >= 0 : ((activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice) >= 0) ? "text-emerald-400" : "text-red-400"
+                          (activeLiveTrade.pnlPct !== undefined ? activeLiveTrade.pnlPct >= 0 : ((activeLiveTrade.entryPrice - (livePrice || 0)) / activeLiveTrade.entryPrice) >= 0) ? "text-emerald-400" : "text-red-400"
                         )}>
-                          {activeLiveTrade.pnlPct !== undefined ? activeLiveTrade.pnlPct.toFixed(2) : ((activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice * 100).toFixed(2)}%
+                          {activeLiveTrade.pnlPct !== undefined ? (activeLiveTrade.pnlPct || 0).toFixed(2) : (((activeLiveTrade.entryPrice - (livePrice || 0)) / activeLiveTrade.entryPrice * 100) || 0).toFixed(2)}%
                         </div>
                         <div className="text-[10px] text-white/30">Live P&L</div>
                       </div>
@@ -2926,13 +2929,13 @@ export default function App() {
                       <div className="mb-6 p-4 bg-white/5 rounded-xl border border-white/5">
                         <div className="flex items-center justify-between mb-3">
                           <span className="text-[10px] text-white/30 uppercase font-bold tracking-wider">Entry Features</span>
-                          <span className="text-[10px] text-blue-400 font-mono">Pred: {activeLiveTrade.prediction.toFixed(3)}</span>
+                          <span className="text-[10px] text-blue-400 font-mono">Pred: {(activeLiveTrade.prediction || 0).toFixed(3)}</span>
                         </div>
                         <div className="grid grid-cols-4 gap-4">
                           {Object.entries(activeLiveTrade.features).slice(0, 12).map(([name, val]) => (
                             <div key={name} className="space-y-1">
                               <div className="text-[8px] text-white/20 uppercase truncate">{name}</div>
-                              <div className="text-[10px] font-mono text-white/60">{(val as number).toFixed(2)}</div>
+                              <div className="text-[10px] font-mono text-white/60">{(val as number || 0).toFixed(2)}</div>
                             </div>
                           ))}
                         </div>
@@ -2964,27 +2967,27 @@ export default function App() {
                           <span className="text-[9px] text-white/30 uppercase">Unrealized P&L</span>
                           <div className={cn(
                             "text-sm font-bold",
-                            (activeLiveTrade.pnlPct !== undefined ? activeLiveTrade.pnlPct >= 0 : ((activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice) >= 0) ? "text-emerald-400" : "text-red-400"
+                          (activeLiveTrade.pnlPct !== undefined ? activeLiveTrade.pnlPct >= 0 : ((activeLiveTrade.entryPrice - (livePrice || 0)) / activeLiveTrade.entryPrice) >= 0) ? "text-emerald-400" : "text-red-400"
                           )}>
                             {activeLiveTrade.pnl !== undefined 
-                              ? `$${activeLiveTrade.pnl.toFixed(2)} (${activeLiveTrade.pnlPct?.toFixed(2)}%)`
-                              : `$${(settings.quantityType === 'USD' 
-                                  ? (settings.quantity * (activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice)
+                              ? `$${(activeLiveTrade.pnl || 0).toFixed(2)} (${(activeLiveTrade.pnlPct || 0).toFixed(2)}%)`
+                              : `$${((settings.quantityType === 'USD' 
+                                  ? (settings.quantity * (activeLiveTrade.entryPrice - (livePrice || 0)) / activeLiveTrade.entryPrice)
                                   : (settings.quantityType === 'LOTS'
-                                    ? (settings.quantity * 0.001 * (activeLiveTrade.entryPrice - livePrice))
-                                    : (settings.quantity * (activeLiveTrade.entryPrice - livePrice)))
-                                ).toFixed(2)} (${((activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice * 100).toFixed(2)}%)`
+                                    ? (settings.quantity * 0.001 * (activeLiveTrade.entryPrice - (livePrice || 0)))
+                                    : (settings.quantity * (activeLiveTrade.entryPrice - (livePrice || 0))))
+                                ) || 0).toFixed(2)} (${(((activeLiveTrade.entryPrice - (livePrice || 0)) / activeLiveTrade.entryPrice * 100) || 0).toFixed(2)}%)`
                             }
                           </div>
                         </div>
                       </div>
                       <button 
                         onClick={() => {
-                          const profitPct = (activeLiveTrade.entryPrice - livePrice) / activeLiveTrade.entryPrice;
+                          const profitPct = (activeLiveTrade.entryPrice - (livePrice || 0)) / activeLiveTrade.entryPrice;
                           const btcQuantity = settings.quantityType === 'LOTS' ? settings.quantity * 0.001 : settings.quantity;
                           const profit = settings.quantityType === 'USD'
                             ? settings.quantity * profitPct
-                            : btcQuantity * (activeLiveTrade.entryPrice - livePrice);
+                            : btcQuantity * (activeLiveTrade.entryPrice - (livePrice || 0));
                             
                           const newTrade: Trade = {
                             type: 'SHORT',
@@ -3039,7 +3042,7 @@ export default function App() {
                               </span>
                             </div>
                             <span className={cn("text-xs font-bold", trade.profit >= 0 ? "text-emerald-500" : "text-red-500")}>
-                              {trade.profit >= 0 ? '+' : ''}{trade.profit.toFixed(2)}
+                              {trade.profit >= 0 ? '+' : ''}{(trade.profit || 0).toFixed(2)}
                             </span>
                           </div>
                           <div className="grid grid-cols-2 gap-4 text-[10px]">
@@ -3063,7 +3066,7 @@ export default function App() {
                                 {Object.entries(trade.features).slice(0, 9).map(([name, val]) => (
                                   <div key={name} className="flex justify-between border-b border-white/5 pb-0.5">
                                     <span className="text-white/20 truncate mr-1">{name}</span>
-                                    <span className="text-white/60">{(val as number).toFixed(2)}</span>
+                                    <span className="text-white/60">{(val as number || 0).toFixed(2)}</span>
                                   </div>
                                 ))}
                               </div>
@@ -3073,7 +3076,7 @@ export default function App() {
                           <div className="pt-2 border-t border-white/5 flex justify-between items-center">
                             <span className="text-[9px] text-white/30 italic">{format(trade.exitTime, 'MMM dd, HH:mm')}</span>
                             <span className={cn("text-[10px] font-bold", trade.profitPct >= 0 ? "text-emerald-500/70" : "text-red-500/70")}>
-                              {trade.profitPct >= 0 ? '+' : ''}{trade.profitPct.toFixed(2)}%
+                              {trade.profitPct >= 0 ? '+' : ''}{(trade.profitPct || 0).toFixed(2)}%
                             </span>
                           </div>
                         </div>

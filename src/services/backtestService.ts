@@ -1,7 +1,7 @@
 import { Candle } from './dataService';
 
 export interface Trade {
-  type: 'SHORT';
+  type: 'SHORT' | 'CALL_SPREAD' | 'SHORT_CALL';
   entryPrice: number;
   exitPrice: number;
   entryTime: number;
@@ -33,7 +33,7 @@ export interface BacktestSettings {
   minSignalVelocity?: number;
   mcPasses?: number;
   maxUncertainty?: number;
-  strategyType?: 'SHORT_BTC' | 'CALL_SPREAD';
+  strategyType?: 'SHORT_BTC' | 'CALL_SPREAD' | 'SHORT_CALL';
   shortCallDelta?: number;
   longCallDelta?: number;
   dailyProfitLimit?: number;
@@ -124,7 +124,19 @@ export function runBacktest(
       }
 
       if (shouldExit) {
-        const currentProfitPct = (activeTrade.entryPrice - exitPrice) / activeTrade.entryPrice;
+        const underlyingProfitPct = (activeTrade.entryPrice - exitPrice) / activeTrade.entryPrice;
+        let currentProfitPct = underlyingProfitPct;
+
+        // Adjust profit for options strategies based on delta approximation
+        if (settings.strategyType === 'SHORT_CALL') {
+          const delta = settings.shortCallDelta || 0.3;
+          currentProfitPct = underlyingProfitPct * delta;
+        } else if (settings.strategyType === 'CALL_SPREAD') {
+          const shortDelta = settings.shortCallDelta || 0.3;
+          const longDelta = settings.longCallDelta || 0.1;
+          const netDelta = Math.max(0, shortDelta - longDelta);
+          currentProfitPct = underlyingProfitPct * netDelta;
+        }
         
         let profit = 0;
         if (settings.quantityType === 'USD') {
@@ -141,7 +153,7 @@ export function runBacktest(
         balance += profit;
         
         trades.push({
-          type: 'SHORT',
+          type: (settings.strategyType === 'SHORT_BTC' ? 'SHORT' : settings.strategyType) || 'SHORT',
           entryPrice: activeTrade.entryPrice,
           exitPrice: exitPrice,
           entryTime: activeTrade.entryTime,

@@ -17,7 +17,10 @@ app.use(express.json({ limit: '50mb' }));
 
 // Trading API Endpoints
 app.post("/api/trading/start", async (req, res) => {
-  const { settings, isRealTrading } = req.body;
+  const { settings, isRealTrading, indicatorPeriods } = req.body;
+  if (indicatorPeriods) {
+    settings.indicatorPeriods = indicatorPeriods;
+  }
   await tradingService.start(settings, isRealTrading);
   res.json({ success: true });
 });
@@ -28,7 +31,10 @@ app.post("/api/trading/stop", (req, res) => {
 });
 
 app.post("/api/trading/settings", (req, res) => {
-  const { settings } = req.body;
+  const { settings, indicatorPeriods } = req.body;
+  if (indicatorPeriods) {
+    settings.indicatorPeriods = indicatorPeriods;
+  }
   tradingService.updateSettings(settings);
   res.json({ success: true });
 });
