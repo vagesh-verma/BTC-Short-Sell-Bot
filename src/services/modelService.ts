@@ -1,6 +1,36 @@
 import * as tf from '@tensorflow/tfjs';
 import { logger } from './loggerService';
 
+export interface DataPreparationOptions {
+  prices: number[];
+  highs?: number[];
+  lows?: number[];
+  rsi: number[];
+  ema: number[];
+  bbUpper: number[];
+  bbLower: number[];
+  windowSize: number;
+  secondaryPredictions?: number[];
+  macdHistogram?: number[];
+  stochRsi?: number[];
+  atr?: number[];
+  dropThreshold?: number;
+  longThreshold?: number;
+  maxLookahead?: number;
+  ema9?: number[];
+  emaBelow?: number[];
+  emaCross?: number[];
+  obv?: number[];
+  mfi?: number[];
+  volatility?: number[];
+  hourOfDay?: number[];
+  dayOfWeek?: number[];
+  bearishHarami?: number[];
+  marubozu?: number[];
+  engulfing?: number[];
+  startIndex?: number;
+}
+
 export class GRUModel {
   private model: tf.LayersModel | null = null;
   private windowSize: number;
@@ -37,12 +67,12 @@ export class GRUModel {
     
     model.add(tf.layers.dropout({ rate: dropout }));
     
-    // Output Layer: Predict if the price will go DOWN (Short opportunity)
-    model.add(tf.layers.dense({ units: 1, activation: 'sigmoid' }));
+    // Output Layer: Predict Short, Long, or Sideways
+    model.add(tf.layers.dense({ units: 3, activation: 'softmax' }));
 
     model.compile({
       optimizer: tf.train.adam(learningRate),
-      loss: 'binaryCrossentropy',
+      loss: 'categoricalCrossentropy',
       metrics: ['accuracy'],
     });
 
@@ -65,7 +95,7 @@ export class GRUModel {
     logger.info(`Starting training with ${numSamples} samples for ${epochs} epochs...`);
     
     const xs = tf.tensor3d(data, [numSamples, this.windowSize, this.featureCount]);
-    const ys = tf.tensor2d(labels, [labels.length, 1]);
+    const ys = tf.tensor2d(labels, [labels.length / 3, 3]);
 
     await this.model!.fit(xs, ys, {
       epochs,
@@ -86,32 +116,26 @@ export class GRUModel {
     ys.dispose();
   }
 
-  public predict(input: number[]): number {
-    if (!this.model) return 0;
+  public predict(input: number[]): number[] {
+    if (!this.model) return [0, 0, 1];
     
-    // Slice input to match expected shape if necessary
     const expectedSize = this.windowSize * this.featureCount;
     let finalInput = input;
     if (input.length > expectedSize) {
       finalInput = input.slice(0, expectedSize);
     } else if (input.length < expectedSize) {
-      // Pad with zeros if too small
       finalInput = [...input, ...new Array(expectedSize - input.length).fill(0)];
     }
 
-    const inputTensor = tf.tensor3d(finalInput, [1, this.windowSize, this.featureCount]);
-    const prediction = this.model.predict(inputTensor) as tf.Tensor;
-    const result = (prediction.dataSync()[0] as number);
-    
-    inputTensor.dispose();
-    prediction.dispose();
-    
-    return result;
+    return tf.tidy(() => {
+      const inputTensor = tf.tensor3d(finalInput, [1, this.windowSize, this.featureCount]);
+      const prediction = this.model!.predict(inputTensor) as tf.Tensor;
+      return Array.from(prediction.dataSync());
+    });
   }
 
-  public predictMultiple(input: number[], passes: number = 10): { mean: number, std: number } {
-    if (!this.model) return { mean: 0, std: 0 };
-    if (passes <= 1) return { mean: this.predict(input), std: 0 };
+  public predictMultiple(input: number[], passes: number = 10): { mean: number[], std: number[] } {
+    if (!this.model) return { mean: [0, 0, 1], std: [0, 0, 0] };
 
     const expectedSize = this.windowSize * this.featureCount;
     let finalInput = input;
@@ -121,74 +145,74 @@ export class GRUModel {
       finalInput = [...input, ...new Array(expectedSize - input.length).fill(0)];
     }
 
-    const inputTensor = tf.tensor3d(finalInput, [1, this.windowSize, this.featureCount]);
-    const predictions: number[] = [];
+    return tf.tidy(() => {
+      const inputTensor = tf.tensor3d(finalInput, [1, this.windowSize, this.featureCount]);
+      const predictions: number[][] = [];
+      
+      for (let i = 0; i < passes; i++) {
+        // Monte Carlo Dropout - this depends on model being compiled with dropout
+        const pred = this.model!.predict(inputTensor) as tf.Tensor;
+        predictions.push(Array.from(pred.dataSync()));
+      }
 
-    for (let i = 0; i < passes; i++) {
-      // Use training: true to enable dropout during inference
-      const prediction = this.model.apply(inputTensor, { training: true }) as tf.Tensor;
-      predictions.push(prediction.dataSync()[0]);
-      prediction.dispose();
-    }
+      const numClasses = 3;
+      const means: number[] = new Array(numClasses).fill(0);
+      const stds: number[] = new Array(numClasses).fill(0);
 
-    inputTensor.dispose();
+      for (let c = 0; c < numClasses; c++) {
+        const classProbs = predictions.map(p => p[c]);
+        const mean = classProbs.reduce((a, b) => a + b, 0) / passes;
+        const variance = classProbs.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / passes;
+        means[c] = mean;
+        stds[c] = Math.sqrt(variance);
+      }
 
-    const mean = predictions.reduce((a, b) => a + b, 0) / passes;
-    const variance = predictions.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / passes;
-    const std = Math.sqrt(variance);
-
-    return { mean, std };
+      return { mean: means, std: stds };
+    });
   }
 
-  public getWindowSize(): number {
-    return this.windowSize;
-  }
-
-  public getFeatureCount(): number {
-    return this.featureCount;
-  }
-
-  public async save(name: string) {
-    if (!this.model) throw new Error('No model to save');
-    await this.model.save(`indexeddb://${name}`);
-    localStorage.setItem(`${name}_metadata`, JSON.stringify({
+  public async save(name?: string) {
+    if (!this.model) return;
+    const saveName = name || this.name;
+    await this.model.save(`indexeddb://${saveName}`);
+    localStorage.setItem(`${saveName}_metadata`, JSON.stringify({
       windowSize: this.windowSize,
       featureCount: this.featureCount
     }));
   }
 
   public async getArtifacts(): Promise<tf.io.ModelArtifacts> {
-    if (!this.model) throw new Error('No model to get artifacts from');
-    let artifacts: tf.io.ModelArtifacts | null = null;
-    await this.model.save({
-      save: (art) => {
-        artifacts = art;
-        return Promise.resolve({ modelArtifactsInfo: { dateSaved: new Date(), modelTopologyType: 'JSON' } });
-      }
+    if (!this.model) throw new Error('Model not initialized');
+    return new Promise((resolve) => {
+      this.model!.save(tf.io.withSaveHandler(async (artifacts) => {
+        resolve(artifacts);
+        return {
+          modelArtifactsInfo: {
+            dateSaved: new Date(),
+            modelTopologyType: 'JSON',
+          } as any
+        };
+      }));
     });
-    if (!artifacts) throw new Error('Failed to capture model artifacts');
-    return artifacts;
   }
 
-  public static async load(name: string): Promise<GRUModel> {
-    const metadataStr = localStorage.getItem(`${name}_metadata`);
-    if (!metadataStr) throw new Error('Model metadata not found');
-    const metadata = JSON.parse(metadataStr);
-    
-    const gru = new GRUModel(metadata.windowSize, metadata.featureCount, name);
+  public static async load(name: string): Promise<GRUModel | null> {
     try {
+      const metadataStr = localStorage.getItem(`${name}_metadata`);
+      if (!metadataStr) return null;
+      const metadata = JSON.parse(metadataStr);
+      const gru = new GRUModel(metadata.windowSize, metadata.featureCount, name);
       gru.model = await tf.loadLayersModel(`indexeddb://${name}`);
+      gru.model.compile({
+        optimizer: tf.train.adam(0.001),
+        loss: 'categoricalCrossentropy',
+        metrics: ['accuracy'],
+      });
+      return gru;
     } catch (err) {
-      logger.info(`Model ${name} not found in IndexedDB, trying LocalStorage...`);
-      gru.model = await tf.loadLayersModel(`localstorage://${name}`);
+      console.error('Error loading model:', err);
+      return null;
     }
-    
-    gru.model.compile({
-      optimizer: tf.train.adam(0.001),
-      loss: 'binaryCrossentropy',
-      metrics: ['accuracy'],
-    });
-    return gru;
   }
 
   public static async loadFromArtifacts(artifacts: tf.io.ModelArtifacts, metadata: { windowSize: number, featureCount: number }, name: string = 'unnamed'): Promise<GRUModel> {
@@ -198,7 +222,7 @@ export class GRUModel {
     });
     gru.model.compile({
       optimizer: tf.train.adam(0.001),
-      loss: 'binaryCrossentropy',
+      loss: 'categoricalCrossentropy',
       metrics: ['accuracy'],
     });
     return gru;
@@ -207,44 +231,25 @@ export class GRUModel {
   public static async remove(name: string) {
     try {
       await tf.io.removeModel(`indexeddb://${name}`);
-    } catch (err) {
-      // Ignore if not found in IndexedDB
-    }
+    } catch (err) {}
     try {
       await tf.io.removeModel(`localstorage://${name}`);
-    } catch (err) {
-      // Ignore if not found in LocalStorage
-    }
+    } catch (err) {}
     localStorage.removeItem(`${name}_metadata`);
   }
 }
 
-export function prepareData(
-  prices: number[], 
-  rsi: number[], 
-  ema: number[], 
-  bbUpper: number[], 
-  bbLower: number[], 
-  windowSize: number,
-  secondaryPredictions?: number[],
-  macdHistogram?: number[],
-  stochRsi?: number[],
-  atr?: number[],
-  dropThreshold: number = 0.5,
-  ema9?: number[],
-  emaBelow?: number[],
-  emaCross?: number[],
-  obv?: number[],
-  mfi?: number[],
-  volatility?: number[],
-  hourOfDay?: number[],
-  dayOfWeek?: number[],
-  bearishHarami?: number[],
-  marubozu?: number[],
-  engulfing?: number[],
-  startIndex: number = 0
-) {
-  const samples: { x: number[], y: number }[] = [];
+export function prepareData(options: DataPreparationOptions) {
+    const {
+    prices, highs, lows, rsi, ema, bbUpper, bbLower, windowSize,
+    secondaryPredictions, macdHistogram, stochRsi, atr,
+    dropThreshold = 0.5, longThreshold = 0.5, maxLookahead = 12,
+    ema9, emaBelow, emaCross, obv, mfi, volatility,
+    hourOfDay, dayOfWeek, bearishHarami, marubozu, engulfing,
+    startIndex = 0
+  } = options;
+
+  const samples: { x: number[], y: number[] }[] = [];
   const actualStart = Math.max(windowSize, startIndex);
   
   for (let i = actualStart; i < prices.length - 1; i++) {
@@ -255,26 +260,11 @@ export function prepareData(
     const emaWindow = windowIndices.map(idx => ema[idx]);
     const bbUpperWindow = windowIndices.map(idx => bbUpper[idx]);
     const bbLowerWindow = windowIndices.map(idx => bbLower[idx]);
-    const secondaryWindow = secondaryPredictions ? windowIndices.map(idx => secondaryPredictions[idx]) : [];
-    const macdWindow = macdHistogram ? windowIndices.map(idx => macdHistogram[idx]) : [];
-    const stochRsiWindow = stochRsi ? windowIndices.map(idx => stochRsi[idx]) : [];
-    const atrWindow = atr ? windowIndices.map(idx => atr[idx]) : [];
-    const ema9Window = ema9 ? windowIndices.map(idx => ema9[idx]) : [];
-    const emaBelowWindow = emaBelow ? windowIndices.map(idx => emaBelow[idx]) : [];
-    const emaCrossWindow = emaCross ? windowIndices.map(idx => emaCross[idx]) : [];
-    const obvWindow = obv ? windowIndices.map(idx => obv[idx]) : [];
-    const mfiWindow = mfi ? windowIndices.map(idx => mfi[idx]) : [];
-    const volWindow = volatility ? windowIndices.map(idx => volatility[idx]) : [];
-    const hourWindow = hourOfDay ? windowIndices.map(idx => hourOfDay[idx]) : [];
-    const dayWindow = dayOfWeek ? windowIndices.map(idx => dayOfWeek[idx]) : [];
-    const haramiWindow = bearishHarami ? windowIndices.map(idx => bearishHarami[idx]) : [];
-    const marubozuWindow = marubozu ? windowIndices.map(idx => marubozu[idx]) : [];
-    const engulfingWindow = engulfing ? windowIndices.map(idx => engulfing[idx]) : [];
 
     const normalize = (arr: number[]) => {
       const min = Math.min(...arr);
       const max = Math.max(...arr);
-      return arr.map(v => (max === min ? 0 : (v - min) / (max - min)));
+      return arr.map(v => (max === min ? 0.5 : (v - min) / (max - min)));
     };
 
     const normPrice = normalize(priceWindow);
@@ -282,86 +272,123 @@ export function prepareData(
     const normEma = normalize(emaWindow);
     const normBbUpper = normalize(bbUpperWindow);
     const normBbLower = normalize(bbLowerWindow);
-    const normMacd = macdHistogram ? normalize(macdWindow) : [];
-    const normAtr = atr ? normalize(atrWindow) : [];
-    const normEma9 = ema9 ? normalize(ema9Window) : [];
-    const normObv = obv ? normalize(obvWindow) : [];
-    const normVol = volatility ? normalize(volWindow) : [];
 
     const x: number[] = [];
     for (let j = 0; j < windowSize; j++) {
       x.push(normPrice[j], normRsi[j], normEma[j], normBbUpper[j], normBbLower[j]);
-      if (macdHistogram) x.push(normMacd[j]);
-      if (stochRsi) x.push(stochRsiWindow[j]);
-      if (atr) x.push(normAtr[j]);
-      if (secondaryPredictions) x.push(secondaryWindow[j]);
-      if (ema9) x.push(normEma9[j]);
-      if (emaBelow) x.push(emaBelowWindow[j]);
-      if (emaCross) x.push(emaCrossWindow[j]);
-      if (obv) x.push(normObv[j]);
-      if (mfi) x.push(mfiWindow[j] / 100);
-      if (volatility) x.push(normVol[j]);
+      
+      if (secondaryPredictions) x.push(secondaryPredictions[i - windowSize + j + 1] || 0.5);
+      if (macdHistogram) x.push(normalize(windowIndices.map(idx => macdHistogram[idx]))[j]);
+      if (stochRsi) x.push(stochRsi[windowIndices[j]]);
+      if (atr) x.push(normalize(windowIndices.map(idx => atr[idx]))[j]);
+      if (ema9) x.push(normalize(windowIndices.map(idx => ema9[idx]))[j]);
+      if (emaBelow) x.push(emaBelow[windowIndices[j]]);
+      if (emaCross) x.push(emaCross[windowIndices[j]]);
+      if (obv) x.push(normalize(windowIndices.map(idx => obv[idx]))[j]);
+      if (mfi) x.push(mfi[windowIndices[j]] / 100);
+      if (volatility) x.push(normalize(windowIndices.map(idx => volatility[idx]))[j]);
+      
       if (hourOfDay) {
-        const h = hourWindow[j];
+        const h = hourOfDay[windowIndices[j]];
         x.push(h / 24);
-        // Asia: 0-9 UTC
         x.push(h >= 0 && h <= 9 ? 1 : 0);
-        // London: 8-17 UTC
         x.push(h >= 8 && h <= 17 ? 1 : 0);
-        // NY: 13-22 UTC
         x.push(h >= 13 && h <= 22 ? 1 : 0);
       }
-      if (dayOfWeek) x.push(dayWindow[j] / 7);
-      if (bearishHarami) x.push(haramiWindow[j]);
-      if (marubozu) x.push(marubozuWindow[j]);
-      if (engulfing) x.push(engulfingWindow[j]);
+      if (dayOfWeek) x.push(dayOfWeek[windowIndices[j]] / 7);
+      if (bearishHarami) x.push(bearishHarami[windowIndices[j]]);
+      if (marubozu) x.push(marubozu[windowIndices[j]]);
+      if (engulfing) x.push(engulfing[windowIndices[j]]);
     }
     
     const currentPrice = prices[i];
-    const nextPrice = prices[i + 1];
-    // dropThreshold is percentage, e.g. 0.5 means 0.5% drop
-    const multiplier = 1 - (dropThreshold / 100);
-    const y = nextPrice < currentPrice * multiplier ? 1 : 0;
     
-    samples.push({ x, y });
-  }
-
-  const positiveSamples = samples.filter(s => s.y === 1);
-  const negativeSamples = samples.filter(s => s.y === 0);
-  
-  logger.info(`Data prepared: ${samples.length} total samples.`);
-  logger.info(`Initial balance: ${positiveSamples.length} positive (drops), ${negativeSamples.length} negative.`);
-
-  const balancedSamples = [...negativeSamples];
-  if (positiveSamples.length > 0) {
-    // Aim for roughly 20% positive samples if possible
-    const targetPositiveCount = Math.floor(negativeSamples.length * 0.25);
-    const multiplier = Math.ceil(targetPositiveCount / positiveSamples.length);
+    const shortTP = currentPrice * (1 - (dropThreshold / 100));
+    const shortSL = currentPrice * (1 + (dropThreshold / 100));
     
-    logger.info(`Oversampling positive class ${multiplier}x to balance training.`);
-    for (let m = 0; m < multiplier; m++) {
-      balancedSamples.push(...positiveSamples);
+    const longTP = currentPrice * (1 + (longThreshold / 100));
+    const longSL = currentPrice * (1 - (longThreshold / 100));
+
+    let isShort = false;
+    let isLong = false;
+
+    // Look ahead to check if target achieved before opposite movement
+    const lookLimit = Math.min(i + maxLookahead, prices.length - 1);
+    
+    // Check for SHORT signal
+    for (let j = i + 1; j <= lookLimit; j++) {
+      const high = highs ? highs[j] : prices[j];
+      const low = lows ? lows[j] : prices[j];
+      
+      if (low <= shortTP && high < shortSL) {
+        isShort = true;
+        break;
+      }
+      if (high >= shortSL) break; // Hit SL first or in same bar (conservative)
     }
+
+    // Check for LONG signal (if not already short, or check separately for multi-label, but here we pick one)
+    if (!isShort) {
+      for (let j = i + 1; j <= lookLimit; j++) {
+        const high = highs ? highs[j] : prices[j];
+        const low = lows ? lows[j] : prices[j];
+        
+        if (high >= longTP && low > longSL) {
+          isLong = true;
+          break;
+        }
+        if (low <= longSL) break; // Hit SL first or in same bar
+      }
+    }
+
+    let classification: number[];
+    if (isShort) {
+      classification = [1, 0, 0];
+    } else if (isLong) {
+      classification = [0, 1, 0];
+    } else {
+      classification = [0, 0, 1];
+    }
+    
+    samples.push({ x, y: classification });
   }
 
-  logger.info(`Final balanced dataset: ${balancedSamples.length} samples.`);
+  const shortSamples = samples.filter(s => s.y[0] === 1);
+  const longSamples = samples.filter(s => s.y[1] === 1);
+  const sidewaysSamples = samples.filter(s => s.y[2] === 1);
+  
+  const balancedSamples: { x: number[], y: number[] }[] = [];
+  const maxClassCount = Math.max(shortSamples.length, longSamples.length, sidewaysSamples.length);
+  const oversample = (arr: {x: number[], y: number[]}[], target: number) => {
+    if (arr.length === 0) return [];
+    const result = [...arr];
+    while (result.length < target) {
+      result.push(arr[Math.floor(Math.random() * arr.length)]);
+    }
+    return result;
+  };
 
-  // Shuffle balanced samples
+  const targetCount = Math.min(maxClassCount, sidewaysSamples.length * 2);
+  balancedSamples.push(...oversample(shortSamples, targetCount));
+  balancedSamples.push(...oversample(longSamples, targetCount));
+  balancedSamples.push(...sidewaysSamples);
+
   for (let i = balancedSamples.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [balancedSamples[i], balancedSamples[j]] = [balancedSamples[j], balancedSamples[i]];
   }
 
   const xs = balancedSamples.flatMap(s => s.x);
-  const ys = balancedSamples.map(s => s.y);
+  const ys = balancedSamples.flatMap(s => s.y);
 
   return { 
     xs, 
     ys, 
     stats: { 
       total: samples.length, 
-      positive: positiveSamples.length, 
-      negative: negativeSamples.length 
+      short: shortSamples.length,
+      long: longSamples.length,
+      sideways: sidewaysSamples.length
     } 
   };
 }

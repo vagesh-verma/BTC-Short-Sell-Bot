@@ -8,31 +8,44 @@ export interface GitHubConfig {
 }
 
 function buildUrl(owner: string, repo: string, path: string, fileName?: string): string {
+  if (!owner || !repo) {
+    throw new Error('GitHub Owner and Repo must be configured.');
+  }
+
   const cleanOwner = encodeURIComponent(owner.trim());
   const cleanRepo = encodeURIComponent(repo.trim());
   
-  // Split path into segments and encode each, but preserve '+' as requested by the user.
-  // We don't use decodeURIComponent here because it can convert '+' to ' ' in some contexts,
-  // and we want to be very explicit about what we encode.
   const segments = path.split('/').filter(Boolean);
   if (fileName) {
     segments.push(fileName);
   }
   
   const encodedPath = segments.map(s => {
-    // Encode everything but preserve '+'
     return encodeURIComponent(s).replace(/%2B/g, '+');
   }).join('/');
   
-  const url = `https://api.github.com/repos/${cleanOwner}/${cleanRepo}/contents${encodedPath ? '/' + encodedPath : ''}`;
-  return url;
+  return `https://api.github.com/repos/${cleanOwner}/${cleanRepo}/contents${encodedPath ? '/' + encodedPath : ''}`;
 }
 
 const GITHUB_HEADERS = (token: string) => ({
   'Authorization': `token ${token}`,
   'Accept': 'application/vnd.github.v3+json',
-  'X-GitHub-Api-Version': '2022-11-28' // Standard stable version, or use the one from docs if needed
+  'X-GitHub-Api-Version': '2022-11-28'
 });
+
+async function safeFetch(url: string, headers: any, method: string = 'GET', body?: any): Promise<Response> {
+  try {
+    const options: any = { method, headers };
+    if (body) options.body = JSON.stringify(body);
+    
+    return await fetch(url, options);
+  } catch (err: any) {
+    if (err.name === 'TypeError' && err.message === 'Failed to fetch') {
+      throw new Error('GitHub API unreachable. This could be a network issue or CORS restriction. Please ensure your internet connection is active.');
+    }
+    throw err;
+  }
+}
 
 export async function uploadToGitHub(config: GitHubConfig, fileName: string, content: string, message: string) {
   const { owner, repo, path, token } = config;
@@ -41,9 +54,7 @@ export async function uploadToGitHub(config: GitHubConfig, fileName: string, con
   try {
     // Check if file exists to get its SHA (required for updates)
     let sha: string | undefined;
-    const getResponse = await fetch(url, {
-      headers: GITHUB_HEADERS(token)
-    });
+    const getResponse = await safeFetch(url, GITHUB_HEADERS(token));
 
     if (getResponse.ok) {
       const data = await getResponse.json();
@@ -59,20 +70,16 @@ export async function uploadToGitHub(config: GitHubConfig, fileName: string, con
       sha
     };
 
-    const putResponse = await fetch(url, {
-      method: 'PUT',
-      headers: {
-        ...GITHUB_HEADERS(token),
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(body)
-    });
+    const putResponse = await safeFetch(url, {
+      ...GITHUB_HEADERS(token),
+      'Content-Type': 'application/json'
+    }, 'PUT', body);
 
     if (!putResponse.ok) {
       const errorData = await putResponse.json();
       const errorMsg = errorData.message || 'Failed to upload to GitHub';
       if (putResponse.status === 404) {
-        throw new Error(`GitHub Repository or Path not found. Please check your Owner ("${owner}") and Repo ("${repo}") settings. (Error: ${errorMsg})`);
+        throw new Error(`GitHub Repository not found. Please ensure "https://github.com/${owner}/${repo}" exists and your token has permission to access it. (Error: ${errorMsg})`);
       }
       throw new Error(errorMsg);
     }
@@ -90,9 +97,7 @@ export async function deleteFromGitHub(config: GitHubConfig, fileName: string, m
 
   try {
     // Must get SHA first
-    const getResponse = await fetch(url, {
-      headers: GITHUB_HEADERS(token)
-    });
+    const getResponse = await safeFetch(url, GITHUB_HEADERS(token));
 
     if (!getResponse.ok) {
       if (getResponse.status === 404) {
@@ -106,17 +111,10 @@ export async function deleteFromGitHub(config: GitHubConfig, fileName: string, m
     const data = await getResponse.json();
     const sha = data.sha;
 
-    const deleteResponse = await fetch(url, {
-      method: 'DELETE',
-      headers: {
-        ...GITHUB_HEADERS(token),
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        message,
-        sha
-      })
-    });
+    const deleteResponse = await safeFetch(url, {
+      ...GITHUB_HEADERS(token),
+      'Content-Type': 'application/json'
+    }, 'DELETE', { message, sha });
 
     if (!deleteResponse.ok) {
       const errorData = await deleteResponse.json();
@@ -136,9 +134,7 @@ export async function fetchFromGitHub(config: GitHubConfig, fileName: string): P
   logger.info(`Fetching from GitHub: ${url}`);
 
   try {
-    const response = await fetch(url, {
-      headers: GITHUB_HEADERS(token)
-    });
+    const response = await safeFetch(url, GITHUB_HEADERS(token));
 
     if (!response.ok) {
       const errorData = await response.json();
@@ -163,15 +159,25 @@ export async function listFromGitHub(config: GitHubConfig): Promise<any[]> {
   const url = buildUrl(owner, repo, path);
 
   try {
-    const response = await fetch(url, {
-      headers: GITHUB_HEADERS(token)
-    });
+    const response = await safeFetch(url, GITHUB_HEADERS(token));
 
     if (!response.ok) {
       if (response.status === 404) {
-        // If it's a 404, it could be that the path doesn't exist yet, OR the repo is wrong.
-        // We'll return an empty array but log a warning if it might be a repo issue.
-        logger.info(`GitHub path "${path}" not found or repository "${owner}/${repo}" is inaccessible.`);
+        // If it's a 404, we want to know if it's the repo or the path.
+        const repoUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+        const repoCheck = await safeFetch(repoUrl, GITHUB_HEADERS(token));
+        
+        if (!repoCheck.ok) {
+          if (repoCheck.status === 404) {
+            logger.error(`GitHub Repository "${owner}/${repo}" not found. Please check your repository name and ensure it is public (or your token has access).`);
+          } else if (repoCheck.status === 401 || repoCheck.status === 403) {
+            logger.error(`GitHub Access Denied. Please check your token permissions for "${owner}/${repo}".`);
+          } else {
+            logger.error(`GitHub Repo Error: ${repoCheck.statusText} (${repoCheck.status})`);
+          }
+        } else {
+          logger.info(`GitHub path "${path}" not found in repository "${owner}/${repo}". This is normal if you haven't uploaded any models yet.`);
+        }
         return [];
       }
       const errorData = await response.json();

@@ -10,12 +10,12 @@ export class GRUModel {
     this.featureCount = featureCount;
   }
 
-  public predict(input: number[]): number {
+  public predict(input: number[]): number[] {
     return this.predictMultiple(input, 1).mean;
   }
 
-  public predictMultiple(input: number[], passes: number = 1): { mean: number, std: number } {
-    if (!this.model) return { mean: 0, std: 0 };
+  public predictMultiple(input: number[], passes: number = 1): { mean: number[], std: number[] } {
+    if (!this.model) return { mean: [0, 0, 1], std: [0, 0, 0] };
     
     // Slice input to match expected shape if necessary
     const expectedSize = this.windowSize * this.featureCount;
@@ -28,22 +28,27 @@ export class GRUModel {
     }
 
     const inputTensor = tf.tensor3d(finalInput, [1, this.windowSize, this.featureCount]);
-    const predictions: number[] = [];
+    const allPredictions: number[][] = [];
 
     for (let i = 0; i < passes; i++) {
       // Use training: true to enable dropout during inference (MC Dropout)
       const pred = this.model.apply(inputTensor, { training: passes > 1 }) as tf.Tensor;
-      predictions.push(pred.dataSync()[0]);
+      allPredictions.push(Array.from(pred.dataSync() as Float32Array));
       pred.dispose();
     }
     
     inputTensor.dispose();
 
-    const mean = predictions.reduce((a, b) => a + b, 0) / predictions.length;
-    let std = 0;
-    if (predictions.length > 1) {
-      const variance = predictions.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / predictions.length;
-      std = Math.sqrt(variance);
+    const mean = [0, 0, 0];
+    const std = [0, 0, 0];
+
+    for (let c = 0; c < 3; c++) {
+      const classPredictions = allPredictions.map(p => p[c]);
+      mean[c] = classPredictions.reduce((a, b) => a + b, 0) / passes;
+      if (passes > 1) {
+        const variance = classPredictions.reduce((a, b) => a + Math.pow(b - mean[c], 2), 0) / passes;
+        std[c] = Math.sqrt(variance);
+      }
     }
     
     return { mean, std };
@@ -71,7 +76,7 @@ export class GRUModel {
     });
     gru.model.compile({
       optimizer: tf.train.adam(0.001),
-      loss: 'binaryCrossentropy',
+      loss: 'categoricalCrossentropy',
       metrics: ['accuracy'],
     });
     return gru;

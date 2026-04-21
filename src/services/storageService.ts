@@ -142,11 +142,10 @@ export async function syncModelsFromGitHub(config: GitHubConfig): Promise<ModelP
   }
 }
 
-export async function saveModelPair(name: string, model1h: GRUModel, model4h: GRUModel) {
+export async function saveModelPair(name: string, model1h: GRUModel) {
   try {
     const id = nameToId(name);
     await model1h.save(`model_pair_${id}_1h`);
-    await model4h.save(`model_pair_${id}_4h`);
 
     const pairs = getSavedModelPairs();
     const newPair: ModelPair = { name, timestamp: Date.now() };
@@ -160,9 +159,9 @@ export async function saveModelPair(name: string, model1h: GRUModel, model4h: GR
     }
 
     localStorage.setItem(STORAGE_KEY, JSON.stringify(pairs));
-    logger.success(`Model pair "${name}" saved successfully.`);
+    logger.success(`Model "${name}" saved successfully.`);
   } catch (err) {
-    logger.error(`Failed to save model pair: ${err}`);
+    logger.error(`Failed to save model: ${err}`);
     throw err;
   }
 }
@@ -174,18 +173,14 @@ export async function uploadModelPairToGitHub(name: string, config: GitHubConfig
     const id = pair?.githubId || nameToId(name);
     const modelConfig = { ...config, path: config.path ? `${config.path}/${id}` : id };
     
-    const { model1h, model4h } = await loadModelPair(name);
+    const { model1h } = await loadModelPair(name);
 
     const artifacts1h = await model1h.getArtifacts();
-    const artifacts4h = await model4h.getArtifacts();
 
     const metadata1h = localStorage.getItem(`model_pair_${id}_1h_metadata`);
-    const metadata4h = localStorage.getItem(`model_pair_${id}_4h_metadata`);
 
     await uploadToGitHub(modelConfig, `1h.json`, serializeArtifacts(artifacts1h), `Upload model 1h: ${name}`);
-    await uploadToGitHub(modelConfig, `4h.json`, serializeArtifacts(artifacts4h), `Upload model 4h: ${name}`);
     if (metadata1h) await uploadToGitHub(modelConfig, `1h_metadata.json`, metadata1h, `Upload metadata 1h: ${name}`);
-    if (metadata4h) await uploadToGitHub(modelConfig, `4h_metadata.json`, metadata4h, `Upload metadata 4h: ${name}`);
 
     const idx = pairs.findIndex(p => p.name === name);
     if (idx !== -1) {
@@ -193,9 +188,9 @@ export async function uploadModelPairToGitHub(name: string, config: GitHubConfig
       localStorage.setItem(STORAGE_KEY, JSON.stringify(pairs));
     }
 
-    logger.success(`Model pair "${name}" uploaded to GitHub.`);
+    logger.success(`Model "${name}" uploaded to GitHub.`);
   } catch (err) {
-    logger.error(`Failed to upload model pair to GitHub: ${err}`);
+    logger.error(`Failed to upload model to GitHub: ${err}`);
     throw err;
   }
 }
@@ -208,9 +203,7 @@ export async function deleteModelPairFromGitHub(name: string, config: GitHubConf
     const modelConfig = { ...config, path: config.path ? `${config.path}/${id}` : id };
     
     await deleteFromGitHub(modelConfig, `1h.json`, `Delete model 1h: ${name}`);
-    await deleteFromGitHub(modelConfig, `4h.json`, `Delete model 4h: ${name}`);
     await deleteFromGitHub(modelConfig, `1h_metadata.json`, `Delete metadata 1h: ${name}`);
-    await deleteFromGitHub(modelConfig, `4h_metadata.json`, `Delete metadata 4h: ${name}`);
 
     const idx = pairs.findIndex(p => p.name === name);
     if (idx !== -1) {
@@ -218,14 +211,14 @@ export async function deleteModelPairFromGitHub(name: string, config: GitHubConf
       localStorage.setItem(STORAGE_KEY, JSON.stringify(pairs));
     }
 
-    logger.success(`Model pair "${name}" deleted from GitHub.`);
+    logger.success(`Model "${name}" deleted from GitHub.`);
   } catch (err) {
-    logger.error(`Failed to delete model pair from GitHub: ${err}`);
+    logger.error(`Failed to delete model from GitHub: ${err}`);
     throw err;
   }
 }
 
-export async function loadModelPairFromGitHub(name: string, config: GitHubConfig): Promise<{ model1h: GRUModel, model4h: GRUModel }> {
+export async function loadModelPairFromGitHub(name: string, config: GitHubConfig): Promise<{ model1h: GRUModel }> {
   try {
     const pairs = getSavedModelPairs();
     const pair = pairs.find(p => p.name === name);
@@ -236,78 +229,61 @@ export async function loadModelPairFromGitHub(name: string, config: GitHubConfig
     try {
       logger.info(`Trying Step 1: Subfolder structure at "${subfolderConfig.path}/1h.json"`);
       const artifacts1hStr = await fetchFromGitHub(subfolderConfig, `1h.json`);
-      const artifacts4hStr = await fetchFromGitHub(subfolderConfig, `4h.json`);
       const metadata1hStr = await fetchFromGitHub(subfolderConfig, `1h_metadata.json`);
-      const metadata4hStr = await fetchFromGitHub(subfolderConfig, `4h_metadata.json`);
 
       const artifacts1h = deserializeArtifacts(artifacts1hStr);
-      const artifacts4h = deserializeArtifacts(artifacts4hStr);
       const metadata1h = JSON.parse(metadata1hStr);
-      const metadata4h = JSON.parse(metadata4hStr);
 
       const model1h = await GRUModel.loadFromArtifacts(artifacts1h, metadata1h, `model_pair_${id}_1h`);
-      const model4h = await GRUModel.loadFromArtifacts(artifacts4h, metadata4h, `model_pair_${id}_4h`);
 
-      logger.success(`Model pair "${name}" loaded from GitHub (Subfolder).`);
-      return { model1h, model4h };
+      logger.success(`Model "${name}" loaded from GitHub (Subfolder).`);
+      return { model1h };
     } catch (err) {
       logger.info(`Step 1 failed: ${err}`);
       // 2. Try Direct Path Structure (path/1h.json)
-      // This handles cases where the user points directly to a model folder
       try {
         logger.info(`Trying Step 2: Direct path structure at "${config.path}/1h.json"`);
         const artifacts1hStr = await fetchFromGitHub(config, `1h.json`);
-        const artifacts4hStr = await fetchFromGitHub(config, `4h.json`);
         const metadata1hStr = await fetchFromGitHub(config, `1h_metadata.json`);
-        const metadata4hStr = await fetchFromGitHub(config, `4h_metadata.json`);
 
         const artifacts1h = deserializeArtifacts(artifacts1hStr);
-        const artifacts4h = deserializeArtifacts(artifacts4hStr);
         const metadata1h = JSON.parse(metadata1hStr);
-        const metadata4h = JSON.parse(metadata4hStr);
 
         const model1h = await GRUModel.loadFromArtifacts(artifacts1h, metadata1h, `model_pair_${id}_1h`);
-        const model4h = await GRUModel.loadFromArtifacts(artifacts4h, metadata4h, `model_pair_${id}_4h`);
 
-        logger.success(`Model pair "${name}" loaded from GitHub (Direct Path).`);
-        return { model1h, model4h };
+        logger.success(`Model "${name}" loaded from GitHub (Direct Path).`);
+        return { model1h };
       } catch (err2) {
         logger.info(`Step 2 failed: ${err2}`);
         // 3. Try Flat Structure (path/id_1h.json)
         logger.info(`Trying Step 3: Flat structure at "${config.path}/${id}_1h.json"`);
         
         const artifacts1hStr = await fetchFromGitHub(config, `${id}_1h.json`);
-        const artifacts4hStr = await fetchFromGitHub(config, `${id}_4h.json`);
         const metadata1hStr = await fetchFromGitHub(config, `${id}_1h_metadata.json`);
-        const metadata4hStr = await fetchFromGitHub(config, `${id}_4h_metadata.json`);
 
         const artifacts1h = deserializeArtifacts(artifacts1hStr);
-        const artifacts4h = deserializeArtifacts(artifacts4hStr);
         const metadata1h = JSON.parse(metadata1hStr);
-        const metadata4h = JSON.parse(metadata4hStr);
 
         const model1h = await GRUModel.loadFromArtifacts(artifacts1h, metadata1h, `model_pair_${id}_1h`);
-        const model4h = await GRUModel.loadFromArtifacts(artifacts4h, metadata4h, `model_pair_${id}_4h`);
 
-        logger.success(`Model pair "${name}" loaded from GitHub (Flat).`);
-        return { model1h, model4h };
+        logger.success(`Model "${name}" loaded from GitHub (Flat).`);
+        return { model1h };
       }
     }
   } catch (err) {
-    logger.error(`Failed to load model pair from GitHub: ${err}`);
+    logger.error(`Failed to load model from GitHub: ${err}`);
     throw err;
   }
 }
 
-export async function loadModelPair(name: string): Promise<{ model1h: GRUModel, model4h: GRUModel }> {
+export async function loadModelPair(name: string): Promise<{ model1h: GRUModel }> {
   try {
     const id = nameToId(name);
     const model1h = await GRUModel.load(`model_pair_${id}_1h`);
-    const model4h = await GRUModel.load(`model_pair_${id}_4h`);
-    logger.success(`Model pair "${name}" loaded successfully.`);
-    return { model1h, model4h };
+    logger.success(`Model "${name}" loaded successfully.`);
+    return { model1h };
   } catch (err) {
-    logger.error(`Failed to load model pair: ${err}`);
+    logger.error(`Failed to load model: ${err}`);
     throw err;
   }
 }
@@ -317,7 +293,6 @@ export async function deleteModelPair(name: string) {
   
   // Remove from IndexedDB
   await GRUModel.remove(`model_pair_${id}_1h`);
-  await GRUModel.remove(`model_pair_${id}_4h`);
   
   // Also clean up any legacy localStorage entries
   localStorage.removeItem(`model_pair_${id}_1h`);

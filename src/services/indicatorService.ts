@@ -31,8 +31,12 @@ export function calculateRSI(prices: number[], period: number = 14): number[] {
     avgGain = (avgGain * (period - 1) + gain) / period;
     avgLoss = (avgLoss * (period - 1) + loss) / period;
 
-    const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-    rsi[i] = 100 - 100 / (1 + rs);
+    if (avgLoss === 0) {
+      rsi[i] = avgGain === 0 ? 50 : 100;
+    } else {
+      const rs = avgGain / avgLoss;
+      rsi[i] = 100 - 100 / (1 + rs);
+    }
   }
 
   return rsi;
@@ -168,8 +172,12 @@ export function calculateMFI(highs: number[], lows: number[], closes: number[], 
       }
     }
 
-    const moneyRatio = negFlow === 0 ? 100 : posFlow / negFlow;
-    mfi[i] = 100 - (100 / (1 + moneyRatio));
+    if (posFlow + negFlow === 0) {
+      mfi[i] = 50;
+    } else {
+      const moneyRatio = negFlow === 0 ? 100 : posFlow / negFlow;
+      mfi[i] = 100 - (100 / (1 + moneyRatio));
+    }
   }
 
   return mfi;

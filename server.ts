@@ -51,15 +51,20 @@ app.post("/api/trading/mode", async (req, res) => {
 });
 
 app.get("/api/trading/status", (req, res) => {
-  res.json(tradingService.getStatus());
+  try {
+    const status = tradingService.getStatus();
+    res.json(status);
+  } catch (err: any) {
+    console.error("Failed to get trading status:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post("/api/trading/sync-model", async (req, res) => {
   try {
-    const { model1hArtifacts, model4hArtifacts, metadata1h, metadata4h } = req.body;
+    const { model1hArtifacts, metadata1h } = req.body;
     const model1h = await GRUModel.loadFromArtifacts(model1hArtifacts, metadata1h);
-    const model4h = await GRUModel.loadFromArtifacts(model4hArtifacts, metadata4h);
-    tradingService.setModels(model1h, model4h);
+    tradingService.setModels(model1h);
     res.json({ success: true });
   } catch (err: any) {
     console.error("Model sync failed:", err);
@@ -169,7 +174,16 @@ async function logServerInfo() {
   }
 }
 
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
 async function startServer() {
+  console.log("[Server] Starting initialization...");
   // Perform initialization tasks asynchronously
   logServerInfo().catch(err => console.warn("[Server] Info fetch failed:", err));
   fetchProducts().catch(err => console.warn("[Server] Product fetch failed:", err));
@@ -192,14 +206,8 @@ async function startServer() {
   const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
   });
-
-  process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  });
-
-  process.on('uncaughtException', (err) => {
-    console.error('Uncaught Exception:', err);
-  });
 }
 
-startServer();
+startServer().catch(err => {
+  console.error("[Server] Top-level failure during startup:", err);
+});
