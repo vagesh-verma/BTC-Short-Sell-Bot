@@ -38,9 +38,11 @@ import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
 import { fetchBTCData, Candle } from './services/dataService';
-import { GRUModel, prepareData } from './services/modelService';
+import { GRUModel, prepareData, prepareDataFromFeatures, XGBoostModel, prepareDRLData } from './services/modelService';
+import { drlService, TrainingProgress as DRLProgress } from './services/drlService';
 import { runBacktest, BacktestResult, Trade, BacktestSettings } from './services/backtestService';
-import { calculateEMA, calculateRSI, calculateBollingerBands, calculateMACD, calculateStochasticRSI, calculateATR, calculateEMACross, calculateOBV, calculateMFI, calculateVolatility, calculateBearishHarami, calculateMarubozu, calculateEngulfing } from './services/indicatorService';
+import { calculateEMA, calculateRSI, calculateBollingerBands, calculateMACD, calculateStochasticRSI, calculateATR, calculateEMACross, calculateOBV, calculateMFI, calculateVolatility, calculateROC, calculateBearishHarami, calculateMarubozu, calculateEngulfing } from './services/indicatorService';
+import { generateFeatureVector, INDICATOR_BUFFER_SIZE, generateFeatureSequence } from './services/featureService';
 import { DeltaSocketService, TickerUpdate } from './services/deltaSocketService';
 import { getSavedModelPairs, saveModelPair, loadModelPair, deleteModelPair, ModelPair, uploadModelPairToGitHub, deleteModelPairFromGitHub, loadModelPairFromGitHub, syncModelsFromGitHub } from './services/storageService';
 import { GitHubConfig } from './services/githubService';
@@ -53,12 +55,12 @@ function cn(...inputs: ClassValue[]) {
 }
 
 const FEATURE_NAMES = [
-  'Price', 'RSI', 'EMA', 'BB_Upper', 'BB_Lower', 'MACD_Hist', 'Stoch_RSI', 'ATR',
+  'Price', 'RSI', 'EMA', 'BB_Upper', 'BB_Lower', 'MACD_Hist', 'MACD_Line', 'ROC', 'Stoch_RSI', 'ATR',
   'EMA9', 'Below', 'Cross', 'OBV', 'MFI', 'Volatility', 'Hour', 'Asia', 'London', 'NY', 'Day',
   'Harami', 'Marubozu', 'Engulfing'
 ];
 
-const INDICATOR_WARMUP = 300; // Number of candles to fetch before the range for indicator stability
+const INDICATOR_WARMUP = 500; // Match INDICATOR_BUFFER_SIZE in featureService.ts
 
 export default function App() {
   const [candles, setCandles] = useState<Candle[]>([]);
@@ -69,12 +71,15 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [epochs, setEpochs] = useState<number>(15);
   const [trainingLogs, setTrainingLogs] = useState<{epoch: number, loss: number, acc: number}[]>([]);
+  const [drlTrainingLogs, setDrlTrainingLogs] = useState<DRLProgress[]>([]);
+  const [drlEpisodes, setDrlEpisodes] = useState<number>(50);
   const [trainingStats1h, setTrainingStats1h] = useState<{total: number, positive: number, negative: number} | null>(null);
   const [predictions, setPredictions] = useState<number[][]>([]);
   const [predictionStats, setPredictionStats] = useState<{total: number, short: number, long: number} | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<{ name: string, type: 'local' | 'github' | 'complete' } | null>(null);
   
   const model1hRef = useRef<GRUModel | null>(null);
+  const xgModelRef = useRef<XGBoostModel | null>(null);
 
   const [trainingRange, setTrainingRange] = useState({
     start: format(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000), 'yyyy-MM-dd'),
@@ -102,10 +107,14 @@ export default function App() {
 
   // Backtest & Live Settings
   const [settings, setSettings] = useState<BacktestSettings>({
-    shortThreshold: 0.3,
-    longThreshold: 0.3,
-    shortExitThreshold: 0.1,
-    longExitThreshold: 0.1,
+    shortThreshold: 65,
+    longThreshold: 65,
+    xgShortThreshold: 65,
+    xgLongThreshold: 65,
+    shortExitThreshold: 40,
+    longExitThreshold: 40,
+    xgShortExitThreshold: 40,
+    xgLongExitThreshold: 40,
     biasThreshold: 0,
     stopLoss: 0.01, // 1%
     takeProfit: 0.02, // 2%
@@ -130,6 +139,8 @@ export default function App() {
     longPutDelta: 0.1,
     dailyProfitLimit: 0,
     dailyLossLimit: 0,
+    useDRLConfluence: true,
+    useDRLOnly: false,
   });
 
   const [isRealTrading, setIsRealTrading] = useState(false);
@@ -538,126 +549,44 @@ export default function App() {
       }
     }
 
-    // 1. Calculate features for 1h model
-    const fullPrices1h = [...candles.map(c => c.close), price];
-    const fullHighs1h = [...candles.map(c => c.high), price];
-    const fullLows1h = [...candles.map(c => c.low), price];
-    const fullVolumes1h = [...candles.map(c => c.volume), 0];
-    const fullHours1h = [...candles.map(c => new Date(c.time).getHours()), now.getHours()];
-    const fullDays1h = [...candles.map(c => new Date(c.time).getDay()), now.getDay()];
-    
-    const rsi1h = calculateRSI(fullPrices1h, indicatorPeriods.rsi);
-    const ema1h = calculateEMA(fullPrices1h, indicatorPeriods.ema);
-    const ema9_1h = calculateEMA(fullPrices1h, indicatorPeriods.ema9);
-    const bb1h = calculateBollingerBands(fullPrices1h, indicatorPeriods.bb);
-    const macd1h = calculateMACD(fullPrices1h);
-    const stochRsi1h = calculateStochasticRSI(rsi1h);
-    const atr1h = calculateATR(fullHighs1h, fullLows1h, fullPrices1h);
-    const cross1h = calculateEMACross(ema9_1h, ema1h);
-    const obv1h = calculateOBV(fullPrices1h, fullVolumes1h);
-    const mfi1h = calculateMFI(fullHighs1h, fullLows1h, fullPrices1h, fullVolumes1h, indicatorPeriods.mfi);
-    const vol1h = calculateVolatility(fullPrices1h, indicatorPeriods.volatility);
-    const opens1h = [...candles.map(c => c.open), price];
-    const harami1h = calculateBearishHarami(opens1h, fullPrices1h);
-    const marubozu1h = calculateMarubozu(opens1h, fullHighs1h, fullLows1h, fullPrices1h);
-    const engulfing1h = calculateEngulfing(opens1h, fullPrices1h);
-
-    const normalize = (arr: number[]) => {
-      const min = Math.min(...arr);
-      const max = Math.max(...arr);
-      return arr.map(v => (max === min ? 0 : (v - min) / (max - min)));
+    // 1. Calculate features for 1h model using unified service for bit-perfect alignment
+    const lastCandle = candles[candles.length - 1];
+    const currentCandle: Candle = {
+      time: now.getTime(),
+      open: lastCandle.close,
+      high: Math.max(lastCandle.close, price),
+      low: Math.min(lastCandle.close, price),
+      close: price,
+      volume: 0
     };
-
-    const last1hIdx = fullPrices1h.length - 1;
-    const windowIndices1h = Array.from({ length: windowSize }, (_, k) => last1hIdx - windowSize + 1 + k);
-
-    const pWindow1h = windowIndices1h.map(idx => fullPrices1h[idx]);
-    const rWindow1h = windowIndices1h.map(idx => rsi1h[idx]);
-    const eWindow1h = windowIndices1h.map(idx => ema1h[idx]);
-    const uWindow1h = windowIndices1h.map(idx => bb1h.upper[idx]);
-    const lWindow1h = windowIndices1h.map(idx => bb1h.lower[idx]);
-    const mWindow1h = windowIndices1h.map(idx => macd1h.histogram[idx]);
-    const sWindow1h = windowIndices1h.map(idx => stochRsi1h[idx]);
-    const aWindow1h = windowIndices1h.map(idx => atr1h[idx]);
-    const e9Window1h = windowIndices1h.map(idx => ema9_1h[idx]);
-    const belowWindow1h = windowIndices1h.map(idx => cross1h.isBelow[idx]);
-    const crossWindow1h = windowIndices1h.map(idx => cross1h.isCross[idx]);
-    const obvWindow1h = windowIndices1h.map(idx => obv1h[idx]);
-    const mfiWindow1h = windowIndices1h.map(idx => mfi1h[idx]);
-    const volWindow1h = windowIndices1h.map(idx => vol1h[idx]);
-    const hourWindow1h = windowIndices1h.map(idx => fullHours1h[idx]);
-    const dayWindow1h = windowIndices1h.map(idx => fullDays1h[idx]);
-    const haramiWindow1h = windowIndices1h.map(idx => harami1h[idx]);
-    const marubozuWindow1h = windowIndices1h.map(idx => marubozu1h[idx]);
-    const engulfingWindow1h = windowIndices1h.map(idx => engulfing1h[idx]);
-
-    const np1h = normalize(pWindow1h);
-    const nr1h = rWindow1h.map(v => v / 100);
-    const ne1h = normalize(eWindow1h);
-    const nu1h = normalize(uWindow1h);
-    const nl1h = normalize(lWindow1h);
-    const nm1h = normalize(mWindow1h);
-    const na1h = normalize(aWindow1h);
-    const ne9_1h = normalize(e9Window1h);
-    const nobv1h = normalize(obvWindow1h);
-    const nvol1h = normalize(volWindow1h);
-
-    const x1h: number[] = [];
-    for (let j = 0; j < windowSize; j++) {
-      const h = hourWindow1h[j];
-      x1h.push(
-        np1h[j], nr1h[j], ne1h[j], nu1h[j], nl1h[j],
-        nm1h[j], sWindow1h[j], na1h[j],
-        ne9_1h[j], belowWindow1h[j], crossWindow1h[j],
-        nobv1h[j], mfiWindow1h[j] / 100, nvol1h[j],
-        h / 24, h >= 0 && h <= 9 ? 1 : 0, h >= 8 && h <= 17 ? 1 : 0, h >= 13 && h <= 22 ? 1 : 0, dayWindow1h[j] / 7,
-        haramiWindow1h[j], marubozuWindow1h[j], engulfingWindow1h[j]
-      );
-    }
+    const botCandles = [...candles, currentCandle];
+    const x1h = generateFeatureVector(botCandles, indicatorPeriods, windowSize);
 
     const currentFeatures: Record<string, number> = {};
-    const featureNamesSet = FEATURE_NAMES;
-    const last1hFeatures = [
-      np1h[windowSize - 1], nr1h[windowSize - 1], ne1h[windowSize - 1], nu1h[windowSize - 1], nl1h[windowSize - 1],
-      nm1h[windowSize - 1], sWindow1h[windowSize - 1], na1h[windowSize - 1],
-      ne9_1h[windowSize - 1], belowWindow1h[windowSize - 1], crossWindow1h[windowSize - 1],
-      nobv1h[windowSize - 1], mfiWindow1h[windowSize - 1] / 100, nvol1h[windowSize - 1],
-      hourWindow1h[windowSize - 1] / 24, 
-      hourWindow1h[windowSize - 1] >= 0 && hourWindow1h[windowSize - 1] <= 9 ? 1 : 0,
-      hourWindow1h[windowSize - 1] >= 8 && hourWindow1h[windowSize - 1] <= 17 ? 1 : 0,
-      hourWindow1h[windowSize - 1] >= 13 && hourWindow1h[windowSize - 1] <= 22 ? 1 : 0,
-      dayWindow1h[windowSize - 1] / 7,
-      haramiWindow1h[windowSize - 1], marubozuWindow1h[windowSize - 1], engulfingWindow1h[windowSize - 1]
-    ];
-
-    featureNamesSet.forEach((name, idx) => {
-      currentFeatures[name] = last1hFeatures[idx];
+    const lastStepStart = (windowSize - 1) * 24;
+    const lastStepFeatures = x1h.slice(lastStepStart);
+    
+    FEATURE_NAMES.forEach((name, idx) => {
+      currentFeatures[name] = lastStepFeatures[idx];
     });
 
-    const prediction = model1hRef.current.predict(x1h);
+    const predictionResult = model1hRef.current.predictMultiple(x1h, settings.mcPasses);
+    const prediction = predictionResult.mean;
+    const xgPrediction = xgModelRef.current ? xgModelRef.current.predict(x1h) : [1, 1, 0];
+    const drlAction = drlService.predict(x1h);
+
     setLivePrediction(prediction);
     setLivePrice(price);
     setLastLiveUpdate(new Date());
 
     setLiveParams({
-      rsi: rsi1h[rsi1h.length - 1],
-      ema: ema1h[ema1h.length - 1],
-      ema9: ema9_1h[ema9_1h.length - 1],
-      bbUpper: bb1h.upper[bb1h.upper.length - 1],
-      bbLower: bb1h.lower[bb1h.lower.length - 1],
-      macdHist: macd1h.histogram[macd1h.histogram.length - 1],
-      stochRsi: stochRsi1h[stochRsi1h.length - 1],
-      atr: atr1h[atr1h.length - 1],
-      emaCross: cross1h.isBelow[cross1h.isBelow.length - 1] === 1,
-      obv: obv1h[obv1h.length - 1],
-      mfi: mfi1h[mfi1h.length - 1],
-      volatility: vol1h[vol1h.length - 1],
-      harami: harami1h[harami1h.length - 1],
-      marubozu: marubozu1h[marubozu1h.length - 1],
-      engulfing: engulfing1h[engulfing1h.length - 1],
-      session: now.getUTCHours() >= settings.asiaStart && now.getUTCHours() < settings.asiaEnd ? 'Asia' : 
-               now.getUTCHours() >= settings.nyStart && now.getUTCHours() < settings.nyEnd ? 'New York' : 'Off-Session',
-      dayOfWeek: now.getDay()
+      rsi: lastStepFeatures[1] * 100,
+      ema: lastStepFeatures[2],
+      shortProb: prediction[0],
+      longProb: prediction[1],
+      xgShortProb: xgPrediction[0],
+      xgLongProb: xgPrediction[1],
+      drlAction: drlAction // 0: LONG, 1: SHORT, 2: NEUTRAL
     });
 
     // 3. Live Paper Trading Logic
@@ -700,7 +629,7 @@ export default function App() {
         } else if (currentTrailingStop && price >= currentTrailingStop) {
           shouldExit = true;
           reason = 'TRAILING_STOP';
-        } else if (prediction[0] < settings.shortExitThreshold) {
+        } else if (prediction[0] * 100 < settings.shortExitThreshold || (xgModelRef.current && xgPrediction[0] * 100 < (settings.xgShortExitThreshold ?? 0))) {
           shouldExit = true;
           reason = 'PREDICTION';
         }
@@ -714,7 +643,7 @@ export default function App() {
         } else if (currentTrailingStop && price <= currentTrailingStop) {
           shouldExit = true;
           reason = 'TRAILING_STOP';
-        } else if (prediction[1] < settings.longExitThreshold) {
+        } else if (prediction[1] * 100 < settings.longExitThreshold || (xgModelRef.current && xgPrediction[1] * 100 < (settings.xgLongExitThreshold ?? 0))) {
           shouldExit = true;
           reason = 'PREDICTION';
         }
@@ -756,8 +685,25 @@ export default function App() {
       }
     } else {
       // Entry Logic
-      const canShort = prediction[0] > settings.shortThreshold;
-      const canLong = prediction[1] > settings.longThreshold;
+      const drlAction = drlService.predict(x1h);
+      const drlMatchesShort = drlAction === 1; // 1 is SHORT
+      const drlMatchesLong = drlAction === 0; // 0 is LONG
+
+      let canShort = false;
+      let canLong = false;
+
+      if (settings.useDRLOnly) {
+        canShort = drlMatchesShort;
+        canLong = drlMatchesLong;
+      } else {
+        canShort = (prediction[0] * 100 > settings.shortThreshold) && 
+                   (xgPrediction[0] * 100 >= (settings.xgShortThreshold ?? 0)) &&
+                   (!settings.useDRLConfluence || drlMatchesShort);
+        
+        canLong = (prediction[1] * 100 > settings.longThreshold) && 
+                  (xgPrediction[1] * 100 >= (settings.xgLongThreshold ?? 0)) &&
+                  (!settings.useDRLConfluence || drlMatchesLong);
+      }
       
       let entryType: 'SHORT' | 'LONG' | null = null;
 
@@ -818,6 +764,7 @@ export default function App() {
     }
     try {
       await saveModelPair(newModelName, model1hRef.current);
+      await drlService.saveToLocalStorage(newModelName);
       setSavedModels(getSavedModelPairs());
       setNewModelName('');
     } catch (err) {
@@ -831,6 +778,7 @@ export default function App() {
       setStatus(`Loading model "${name}"...`);
       const { model1h } = await loadModelPair(name);
       model1hRef.current = model1h;
+      await drlService.loadFromLocalStorage(name);
       setStatus(`Model "${name}" loaded!`);
       // Trigger a re-render to update UI buttons
       setPredictions([]); 
@@ -910,11 +858,13 @@ export default function App() {
     }
   };
 
-  const getPredictionsForRange = async (candles1h: Candle[], m1h: GRUModel, mcPasses: number = 1) => {
+  const getPredictionsForRange = async (candles1h: Candle[], m1h: GRUModel, mXG: XGBoostModel | null, mcPasses: number = 1) => {
     logger.info(`Generating predictions for provided range (MC Passes: ${mcPasses})...`);
     
     const bufferSize = 300; // Match live bot buffer size (increased from 100 for stability)
     const generatedPredictions: number[][] = [];
+    const xgGeneratedPredictions: number[][] = [];
+    const drlGeneratedActions: number[] = [];
     const generatedUncertainties: number[][] = [];
     const generatedFeatures: number[][] = [];
 
@@ -923,73 +873,43 @@ export default function App() {
     
     if (candles1h.length <= startIdx) {
       logger.warning(`Not enough 1h candles (${candles1h.length}) to generate predictions with buffer ${bufferSize}`);
-      return { predictions: [], uncertainties: [], features: [] };
+      return { predictions: [], uncertainties: [], features: [], xgPredictions: [] };
     }
 
-    for (let i = startIdx; i < candles1h.length; i++) {
-      // 1. Calculate 1h indicators using a FIXED buffer for determinism
-      const sub1h = candles1h.slice(i - bufferSize + 1, i + 1);
-      const p1 = sub1h.map(c => c.close);
-      const h1 = sub1h.map(c => c.high);
-      const l1 = sub1h.map(c => c.low);
-      const v1 = sub1h.map(c => c.volume);
-      const o1 = sub1h.map(c => c.open);
-      const hr1 = sub1h.map(c => new Date(c.time).getHours());
-      const d1 = sub1h.map(c => new Date(c.time).getDay());
+    const featuresList = generateFeatureSequence(
+      candles1h,
+      indicatorPeriods,
+      windowSize,
+      startIdx,
+      candles1h.length - 1
+    );
 
-      const rsi1 = calculateRSI(p1, indicatorPeriods.rsi);
-      const ema1 = calculateEMA(p1, indicatorPeriods.ema);
-      const ema9_1 = calculateEMA(p1, indicatorPeriods.ema9);
-      const cross1 = calculateEMACross(ema9_1, ema1);
-      const bb1 = calculateBollingerBands(p1, indicatorPeriods.bb);
-      const macd1 = calculateMACD(p1);
-      const stoch1 = calculateStochasticRSI(rsi1);
-      const atr1 = calculateATR(h1, l1, p1);
-      const obv1 = calculateOBV(p1, v1);
-      const mfi1 = calculateMFI(h1, l1, p1, v1, indicatorPeriods.mfi);
-      const vol1 = calculateVolatility(p1, indicatorPeriods.volatility);
-      const harami1 = calculateBearishHarami(o1, p1);
-      const marubozu1 = calculateMarubozu(o1, h1, l1, p1);
-      const engulfing1 = calculateEngulfing(o1, p1);
-
-      const normalize = (arr: number[]) => {
-        const min = Math.min(...arr);
-        const max = Math.max(...arr);
-        return arr.map(v => (max === min ? 0.5 : (v - min) / (max - min)));
-      };
-
-      const winIdx1 = Array.from({ length: windowSize }, (_, k) => bufferSize - windowSize + k);
-      const np1 = normalize(winIdx1.map(idx => p1[idx]));
-      const nr1 = winIdx1.map(idx => rsi1[idx] / 100);
-      const ne1 = normalize(winIdx1.map(idx => ema1[idx]));
-      const nu1 = normalize(winIdx1.map(idx => bb1.upper[idx]));
-      const nl1 = normalize(winIdx1.map(idx => bb1.lower[idx]));
-      const nm1 = normalize(winIdx1.map(idx => macd1.histogram[idx]));
-      const na1 = normalize(winIdx1.map(idx => atr1[idx]));
-      const ne9_1 = normalize(winIdx1.map(idx => ema9_1[idx]));
-      const nobv1 = normalize(winIdx1.map(idx => obv1[idx]));
-      const nvol1 = normalize(winIdx1.map(idx => vol1[idx]));
-
-      const x1: number[] = [];
-      for (let j = 0; j < windowSize; j++) {
-        const h = hr1[winIdx1[j]];
-        x1.push(
-          np1[j], nr1[j], ne1[j], nu1[j], nl1[j],
-          nm1[j], stoch1[winIdx1[j]], na1[j],
-          ne9_1[j], cross1.isBelow[winIdx1[j]], cross1.isCross[winIdx1[j]],
-          nobv1[j], mfi1[winIdx1[j]] / 100, nvol1[j],
-          h / 24, h >= 0 && h <= 9 ? 1 : 0, h >= 8 && h <= 17 ? 1 : 0, h >= 13 && h <= 22 ? 1 : 0, d1[winIdx1[j]] / 7,
-          harami1[winIdx1[j]], marubozu1[winIdx1[j]], engulfing1[winIdx1[j]]
-        );
-      }
-
-      const result = m1h.predictMultiple(x1, mcPasses);
+    for (let i = 0; i < featuresList.length; i++) {
+      const features = featuresList[i];
+      generatedFeatures.push(features);
+      
+      // Primary GRU Prediction
+      const result = m1h.predictMultiple(features, mcPasses);
       generatedPredictions.push(result.mean);
       generatedUncertainties.push(result.std);
-      generatedFeatures.push(x1);
+
+      // Parallel XGBoost Prediction
+      if (mXG) {
+        xgGeneratedPredictions.push(mXG.predict(features));
+      }
+
+      // Deep Reinforcement Learning Prediction
+      const drlAction = drlService.predict(features);
+      drlGeneratedActions.push(drlAction);
     }
 
-    return { predictions: generatedPredictions, uncertainties: generatedUncertainties, features: generatedFeatures };
+    return { 
+      predictions: generatedPredictions, 
+      uncertainties: generatedUncertainties, 
+      features: generatedFeatures,
+      xgPredictions: xgGeneratedPredictions,
+      drlActions: drlGeneratedActions
+    };
   };
 
   const startTraining = async () => {
@@ -1010,68 +930,34 @@ export default function App() {
       const endTs = new Date(trainingRange.end).getTime() + (24 * 60 * 60 * 1000) - 1;
       
       logger.info(`Fetching 1h candles from ${trainingRange.start} to ${trainingRange.end}...`);
-      const fetchedCandles = await fetchBTCData(0, '1h', startTs - (INDICATOR_WARMUP * 60 * 60 * 1000), endTs);
+      const fetchStartTs = startTs - (INDICATOR_WARMUP * 60 * 60 * 1000);
+      const fetchedCandles = await fetchBTCData(0, '1h', fetchStartTs, endTs);
       setCandles(fetchedCandles);
       
       // 2. Train Primary 1h Model
-      setStatus('Calculating Technical Indicators...');
-      logger.info('Calculating technical indicators...');
-      const prices1h = fetchedCandles.map(c => c.close);
-      const highs1h = fetchedCandles.map(c => c.high);
-      const lows1h = fetchedCandles.map(c => c.low);
-      const volumes1h = fetchedCandles.map(c => c.volume);
-      const hours1h = fetchedCandles.map(c => new Date(c.time).getHours());
-      const days1h = fetchedCandles.map(c => new Date(c.time).getDay());
-
-      const rsi1h = calculateRSI(prices1h, indicatorPeriods.rsi);
-      const ema1h = calculateEMA(prices1h, indicatorPeriods.ema);
-      const ema9_1h = calculateEMA(prices1h, indicatorPeriods.ema9);
-      const cross1h = calculateEMACross(ema9_1h, ema1h);
-      const bb1h = calculateBollingerBands(prices1h, indicatorPeriods.bb);
-      const macd1h = calculateMACD(prices1h);
-      const stochRsi1h = calculateStochasticRSI(rsi1h);
-      const atr1h = calculateATR(highs1h, lows1h, prices1h);
-      const obv1h = calculateOBV(prices1h, volumes1h);
-      const mfi1h = calculateMFI(highs1h, lows1h, prices1h, volumes1h, indicatorPeriods.mfi);
-      const vol1h = calculateVolatility(prices1h, indicatorPeriods.volatility);
-      const opens1h = fetchedCandles.map(c => c.open);
-      const harami1h = calculateBearishHarami(opens1h, prices1h);
-      const marubozu1h = calculateMarubozu(opens1h, highs1h, lows1h, prices1h);
-      const engulfing1h = calculateEngulfing(opens1h, prices1h);
-
-      setStatus('Preparing 1h Training Data...');
-      logger.info('Preparing 1h training data...');
-      const data1h = prepareData({
-        prices: prices1h,
-        highs: highs1h,
-        lows: lows1h,
-        rsi: rsi1h,
-        ema: ema1h,
-        bbUpper: bb1h.upper,
-        bbLower: bb1h.lower,
+      setStatus('Preparing 1h Training Data (using unified features)...');
+      logger.info('Preparing 1h training data using generateFeatureSequence...');
+      
+      const startIdx = INDICATOR_WARMUP;
+      const featuresList = generateFeatureSequence(
+        fetchedCandles,
+        indicatorPeriods,
         windowSize,
-        macdHistogram: macd1h.histogram,
-        stochRsi: stochRsi1h,
-        atr: atr1h,
+        startIdx,
+        fetchedCandles.length - 1
+      );
+
+      const data1h = prepareDataFromFeatures(fetchedCandles, featuresList, {
         dropThreshold,
         longThreshold,
         maxLookahead: settings.maxDurationHours,
-        ema9: ema9_1h,
-        emaBelow: cross1h.isBelow,
-        emaCross: cross1h.isCross,
-        obv: obv1h,
-        mfi: mfi1h,
-        volatility: vol1h,
-        hourOfDay: hours1h,
-        dayOfWeek: days1h,
-        bearishHarami: harami1h,
-        marubozu: marubozu1h,
-        engulfing: engulfing1h,
-        startIndex: INDICATOR_WARMUP
+        startIndex: startIdx,
+        windowSize
       });
+      
       setTrainingStats1h(data1h.stats);
       
-      const featureCount1h = 22;
+      const featureCount1h = 24;
       const model1h = new GRUModel(windowSize, featureCount1h, 'temp_1h');
       localStorage.setItem('temp_1h_metadata', JSON.stringify({ windowSize, featureCount: featureCount1h }));
       setStatus(`Building Deep GRU Architecture (${featureCount1h} Features)...`);
@@ -1090,21 +976,73 @@ export default function App() {
       });
       model1hRef.current = model1h;
       
+      // 3. Train Parallel XGBoost Model
+      setStatus('Training Parallel XGBoost Model...');
+      const xgModel = new XGBoostModel(featureCount1h);
+      await xgModel.train(data1h.xs, data1h.ys, windowSize, 100);
+      xgModelRef.current = xgModel;
+
+      // 4. Train DRL Agent
+      setStatus('Training DRL Agent (PPO)...');
+      setDrlTrainingLogs([]);
+      drlService.initialize(windowSize, featureCount1h);
+      const drlData = {
+        marketData: featuresList,
+        prices: fetchedCandles.slice(startIdx).map(c => c.close)
+      };
+      
+      await drlService.train(
+        drlData.marketData,
+        drlData.prices,
+        drlEpisodes,
+        (progress) => {
+          setDrlTrainingLogs(prev => [...prev, progress]);
+          setStatus(`DRL Training Episode ${progress.episode}/${drlEpisodes}...`);
+        }
+      );
+
       setStatus('Generating Final Predictions...');
-      const { predictions: generatedPredictions, features: generatedFeatures } = await getPredictionsForRange(fetchedCandles, model1h, settings.mcPasses);
+      const { 
+        predictions: generatedPredictions, 
+        features: generatedFeatures,
+        xgPredictions: generatedXgPredictions,
+        drlActions: drlGeneratedActions
+      } = await getPredictionsForRange(fetchedCandles, model1h, xgModel, settings.mcPasses);
       
       setPredictions(generatedPredictions);
-      const shortCount = generatedPredictions.filter(p => p[0] > settings.shortThreshold).length;
-      const longCount = generatedPredictions.filter(p => p[1] > settings.longThreshold).length;
+      // Store XG predictions in a ref or state if needed for UI, but backtest logic will consume it
+      (window as any).lastXgPredictions = generatedXgPredictions;
+
+      const shortCount = generatedPredictions.filter((p, idx) => 
+        (p[0] * 100 > settings.shortThreshold) && 
+        (generatedXgPredictions[idx][0] * 100 >= (settings.xgShortThreshold ?? 0))
+      ).length;
+      
+      const longCount = generatedPredictions.filter((p, idx) => 
+        (p[1] * 100 > settings.longThreshold) && 
+        (generatedXgPredictions[idx][1] * 100 >= (settings.xgLongThreshold ?? 0))
+      ).length;
+
       setPredictionStats({ total: generatedPredictions.length, short: shortCount, long: longCount });
-      setStatus('Model trained! Ready for backtest.');
-      logger.success(`Predictions generated. ${shortCount} short signals, ${longCount} long signals above threshold.`);
+      setStatus('Models trained! Ready for backtest.');
+      logger.success(`Predictions generated. ${shortCount} dual-confluence signals found.`);
       
       // Auto-run initial backtest
       logger.info('Running initial backtest...');
-      const realBufferSize = 300;
-      const startIdx = Math.max(windowSize, realBufferSize);
-      const result = runBacktest(fetchedCandles, generatedPredictions, settings, 10000, startIdx, generatedFeatures, FEATURE_NAMES);
+      const realBufferSize = INDICATOR_WARMUP;
+      const btStartIdx = Math.max(windowSize, realBufferSize);
+      const result = runBacktest(
+        fetchedCandles, 
+        generatedPredictions, 
+        { ...settings, labelDropThreshold: dropThreshold, labelLongThreshold: longThreshold }, 
+        10000, 
+        btStartIdx, 
+        generatedFeatures, 
+        FEATURE_NAMES,
+        undefined,
+        generatedXgPredictions,
+        drlGeneratedActions
+      );
       setBacktestResult(result);
       logger.success('--- Training and Backtest Complete ---');
     } catch (err: any) {
@@ -1148,26 +1086,30 @@ export default function App() {
       const { 
         predictions: btPredictions, 
         uncertainties: btUncertainties,
-        features: btFeatures 
-      } = await getPredictionsForRange(btCandles1h, model1hRef.current, settings.mcPasses);
+        features: btFeatures,
+        xgPredictions: btXgPredictions,
+        drlActions: btDrlActions
+      } = await getPredictionsForRange(btCandles1h, model1hRef.current, xgModelRef.current, settings.mcPasses);
       logger.info(`Generated ${btPredictions.length} predictions.`);
 
       setStatus('Running Backtest (1h)...');
       logger.info(`Running backtest on ${btPredictions.length} prediction windows...`);
       
-      const realBufferSize = 300; // Must match INDICATOR_WARMUP and getPredictionsForRange
+      const realBufferSize = INDICATOR_WARMUP; // Must match INDICATOR_BUFFER_SIZE in featureService.ts
       const startIdx = realBufferSize;
       // The first prediction (idx 0) corresponds to btCandles1h[startIdx] (which is startTs)
       
       const result = runBacktest(
         btCandles1h, 
         btPredictions, 
-        settings, 
+        { ...settings, labelDropThreshold: dropThreshold, labelLongThreshold: longThreshold }, 
         10000, 
         startIdx, 
         btFeatures, 
         FEATURE_NAMES, 
-        btUncertainties
+        btUncertainties,
+        btXgPredictions,
+        btDrlActions
       );
       
       setBacktestResult(result);
@@ -1202,6 +1144,14 @@ export default function App() {
     if (!backtestResult) return [];
     return backtestResult.candles.map((c, i) => {
       const pred = backtestResult.predictions[i] || [0, 0, 1];
+      const xgPred = (backtestResult.xgPredictions && backtestResult.xgPredictions[i]) || [0, 0, 1];
+      const drlAct = (backtestResult.drlActions && backtestResult.drlActions[i]) !== undefined 
+        ? backtestResult.drlActions[i] 
+        : 2; // Default to neutral/2 if missing
+
+      // Map DRL actions to chart values: Long=0 -> 20, Short=1 -> 80, Neutral=2 -> 50
+      const drlPlot = drlAct === 0 ? 20 : (drlAct === 1 ? 80 : 50);
+
       return {
         time: format(new Date(c.time), 'MM/dd HH:mm'),
         price: c.close,
@@ -1209,6 +1159,9 @@ export default function App() {
         shortProb: parseFloat((pred[0] * 100).toFixed(2)),
         longProb: parseFloat((pred[1] * 100).toFixed(2)),
         sideProb: parseFloat((pred[2] * 100).toFixed(2)),
+        xgShort: parseFloat((xgPred[0] * 100).toFixed(2)),
+        xgLong: parseFloat((xgPred[1] * 100).toFixed(2)),
+        drl: drlPlot
       };
     });
   }, [backtestResult]);
@@ -1430,26 +1383,26 @@ export default function App() {
                       <div className="space-y-2">
                         <div className="flex items-center justify-between text-[10px]">
                           <span className="text-red-400">Short:</span>
-                          <span className="text-white/70 font-mono">{predictionStats.short} ({((predictionStats.short / predictionStats.total) * 100).toFixed(1)}%)</span>
+                          <span className="text-white/70 font-mono">{predictionStats.short} ({(predictionStats.total > 0 ? (predictionStats.short / predictionStats.total) * 100 : 0).toFixed(1)}%)</span>
                         </div>
                         <div className="w-full h-1 bg-white/5 rounded-full overflow-hidden">
-                          <div className="h-full bg-red-500" style={{ width: `${(predictionStats.short / predictionStats.total) * 100}%` }} />
+                          <div className="h-full bg-red-500" style={{ width: `${predictionStats.total > 0 ? (predictionStats.short / predictionStats.total) * 100 : 0}%` }} />
                         </div>
                         
                         <div className="flex items-center justify-between text-[10px]">
                           <span className="text-emerald-400">Long:</span>
-                          <span className="text-white/70 font-mono">{predictionStats.long} ({((predictionStats.long / predictionStats.total) * 100).toFixed(1)}%)</span>
+                          <span className="text-white/70 font-mono">{predictionStats.long} ({(predictionStats.total > 0 ? (predictionStats.long / predictionStats.total) * 100 : 0).toFixed(1)}%)</span>
                         </div>
                         <div className="w-full h-1 bg-white/5 rounded-full overflow-hidden">
-                          <div className="h-full bg-emerald-500" style={{ width: `${(predictionStats.long / predictionStats.total) * 100}%` }} />
+                          <div className="h-full bg-emerald-500" style={{ width: `${predictionStats.total > 0 ? (predictionStats.long / predictionStats.total) * 100 : 0}%` }} />
                         </div>
 
                         <div className="flex items-center justify-between text-[10px]">
                           <span className="text-blue-400">Sideways:</span>
-                          <span className="text-white/70 font-mono">{predictionStats.total - predictionStats.short - predictionStats.long} ({(((predictionStats.total - predictionStats.short - predictionStats.long) / predictionStats.total) * 100).toFixed(1)}%)</span>
+                          <span className="text-white/70 font-mono">{predictionStats.total - predictionStats.short - predictionStats.long} ({(predictionStats.total > 0 ? ((predictionStats.total - predictionStats.short - predictionStats.long) / predictionStats.total) * 100 : 0).toFixed(1)}%)</span>
                         </div>
                         <div className="w-full h-1 bg-white/5 rounded-full overflow-hidden">
-                          <div className="h-full bg-blue-500" style={{ width: `${((predictionStats.total - predictionStats.short - predictionStats.long) / predictionStats.total) * 100}%` }} />
+                          <div className="h-full bg-blue-500" style={{ width: `${predictionStats.total > 0 ? ((predictionStats.total - predictionStats.short - predictionStats.long) / predictionStats.total) * 100 : 0}%` }} />
                         </div>
                       </div>
                     </div>
@@ -1488,6 +1441,10 @@ export default function App() {
                     <div className="space-y-1.5">
                       <label className="text-[10px] text-white/40 uppercase font-bold">Dropout</label>
                       <input type="number" step="0.05" min="0" max="0.5" value={modelHyperparams.dropout} onChange={(e) => setModelHyperparams({...modelHyperparams, dropout: parseFloat(e.target.value) || 0.2})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs focus:border-purple-500/50 outline-none" />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-white/40 uppercase font-bold">DRL Episodes</label>
+                      <input type="number" min="10" max="500" value={drlEpisodes} onChange={(e) => setDrlEpisodes(parseInt(e.target.value) || 50)} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs focus:border-purple-500/50 outline-none" />
                     </div>
                   </div>
                   <div className="grid grid-cols-1 gap-3">
@@ -1582,6 +1539,30 @@ export default function App() {
                         )}
                       </div>
                     </div>
+                    {/* DRL Logs Column */}
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Deep RL Logs</h4>
+                        {drlTrainingLogs.length > 0 && (
+                          <span className="text-[9px] text-purple-400 font-mono">
+                            Eps: {drlEpisodes}
+                          </span>
+                        )}
+                      </div>
+                      <div className="bg-black/40 rounded-xl border border-white/5 p-4 h-[200px] overflow-y-auto font-mono text-[10px] space-y-1 custom-scrollbar">
+                        {drlTrainingLogs.length === 0 ? (
+                          <div className="h-full flex items-center justify-center text-white/20 italic">Waiting for DRL...</div>
+                        ) : (
+                          drlTrainingLogs.slice().reverse().map((log, i) => (
+                            <div key={i} className="flex justify-between border-b border-white/5 pb-1">
+                              <span className="text-blue-500">Ep {log.episode.toString().padStart(3, '0')}</span>
+                              <span className="text-white/60">R: {(log.reward || 0).toFixed(2)}</span>
+                              <span className="text-amber-500">L: {(log.loss || 0).toFixed(4)}</span>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1615,26 +1596,50 @@ export default function App() {
                       <input type="date" value={backtestRange.end} onChange={(e) => setBacktestRange({...backtestRange, end: e.target.value})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
                     </div>
                   </div>
-                  <div className="grid grid-cols-2 gap-4 pt-2 border-t border-white/5">
-                    <div className="space-y-1.5">
-                      <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Short Entry</label>
-                      <input type="number" step="0.01" value={isNaN(settings.shortThreshold) ? '' : settings.shortThreshold} onChange={(e) => setSettings({...settings, shortThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
+                    <div className="grid grid-cols-2 gap-4 pt-2 border-t border-white/5">
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">GRU Short Entry</label>
+                        <input type="number" step="0.01" value={isNaN(settings.shortThreshold) ? '' : settings.shortThreshold} onChange={(e) => setSettings({...settings, shortThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">GRU Short Exit</label>
+                        <input type="number" step="0.01" value={isNaN(settings.shortExitThreshold) ? '' : settings.shortExitThreshold} onChange={(e) => setSettings({...settings, shortExitThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
+                      </div>
                     </div>
-                    <div className="space-y-1.5">
-                      <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Short Exit</label>
-                      <input type="number" step="0.01" value={isNaN(settings.shortExitThreshold) ? '' : settings.shortExitThreshold} onChange={(e) => setSettings({...settings, shortExitThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
+                    <div className="grid grid-cols-2 gap-4 pt-2 border-t border-white/5">
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">GRU Long Entry</label>
+                        <input type="number" step="0.01" value={isNaN(settings.longThreshold) ? '' : settings.longThreshold} onChange={(e) => setSettings({...settings, longThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">GRU Long Exit</label>
+                        <input type="number" step="0.01" value={isNaN(settings.longExitThreshold) ? '' : settings.longExitThreshold} onChange={(e) => setSettings({...settings, longExitThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
+                      </div>
                     </div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-4 pt-2 border-t border-white/5">
-                    <div className="space-y-1.5">
-                      <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Long Entry</label>
-                      <input type="number" step="0.01" value={isNaN(settings.longThreshold) ? '' : settings.longThreshold} onChange={(e) => setSettings({...settings, longThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
+
+                    <div className="pt-4 mt-2 border-t border-white/10">
+                      <h4 className="text-[10px] text-amber-400/80 uppercase font-black tracking-widest mb-3">Parallel XGBoost (Confluence)</h4>
+                      <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-1.5">
+                          <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">XG Short Entry</label>
+                          <input type="number" step="1" value={isNaN(settings.xgShortThreshold ?? 0) ? '' : settings.xgShortThreshold} onChange={(e) => setSettings({...settings, xgShortThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">XG Short Exit</label>
+                          <input type="number" step="1" value={isNaN(settings.xgShortExitThreshold ?? 0) ? '' : settings.xgShortExitThreshold} onChange={(e) => setSettings({...settings, xgShortExitThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 gap-4 pt-2">
+                        <div className="space-y-1.5">
+                          <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">XG Long Entry</label>
+                          <input type="number" step="1" value={isNaN(settings.xgLongThreshold ?? 0) ? '' : settings.xgLongThreshold} onChange={(e) => setSettings({...settings, xgLongThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">XG Long Exit</label>
+                          <input type="number" step="1" value={isNaN(settings.xgLongExitThreshold ?? 0) ? '' : settings.xgLongExitThreshold} onChange={(e) => setSettings({...settings, xgLongExitThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
+                        </div>
+                      </div>
                     </div>
-                    <div className="space-y-1.5">
-                      <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Long Exit</label>
-                      <input type="number" step="0.01" value={isNaN(settings.longExitThreshold) ? '' : settings.longExitThreshold} onChange={(e) => setSettings({...settings, longExitThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
-                    </div>
-                  </div>
                   <div className="grid grid-cols-2 gap-4 pt-2 border-t border-white/5">
                     <div className="space-y-1.5">
                       <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Bias (Diff) Thr.</label>
@@ -1724,6 +1729,26 @@ export default function App() {
                         />
                         <label htmlFor="useOnlyCompletedCandlesBT" className="text-[10px] text-white/60 uppercase font-bold cursor-pointer">Completed Candles Only</label>
                       </div>
+                      <div className="flex items-center gap-2">
+                        <input 
+                          type="checkbox" 
+                          id="useDRLConfluenceBT"
+                          checked={settings.useDRLConfluence} 
+                          onChange={(e) => setSettings({...settings, useDRLConfluence: e.target.checked})}
+                          className="w-4 h-4 rounded border-white/10 bg-white/5 text-purple-500 focus:ring-purple-500/50"
+                        />
+                        <label htmlFor="useDRLConfluenceBT" className="text-[10px] text-purple-400 uppercase font-bold cursor-pointer">DRL Confluence</label>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <input 
+                          type="checkbox" 
+                          id="useDRLOnlyBT"
+                          checked={settings.useDRLOnly} 
+                          onChange={(e) => setSettings({...settings, useDRLOnly: e.target.checked})}
+                          className="w-4 h-4 rounded border-white/10 bg-white/5 text-emerald-500 focus:ring-emerald-500/50"
+                        />
+                        <label htmlFor="useDRLOnlyBT" className="text-[10px] text-emerald-400 uppercase font-bold cursor-pointer">DRL Autonomous Mode</label>
+                      </div>
                     </div>
                   </div>
                   {settings.useSessionTrading && (
@@ -1752,6 +1777,33 @@ export default function App() {
 
             {/* Results & Equity */}
             <div className="lg:col-span-3 space-y-6">
+              {/* Backtest Mode Badge */}
+              {backtestResult && (
+                <div className="flex items-center gap-3 p-3 bg-[#0D0D0E] border border-white/5 rounded-2xl animate-in fade-in slide-in-from-top-2 duration-300">
+                  <span className="text-[10px] text-white/40 uppercase font-bold tracking-widest px-2">Mode:</span>
+                  {settings.useDRLOnly ? (
+                    <div className="flex items-center gap-2 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 rounded-lg">
+                      <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                      <span className="text-xs font-bold text-emerald-400">DRL Autonomous</span>
+                    </div>
+                  ) : settings.useDRLConfluence ? (
+                    <div className="flex items-center gap-2 px-3 py-1 bg-purple-500/10 border border-purple-500/20 rounded-lg">
+                      <div className="w-1.5 h-1.5 rounded-full bg-purple-500 animate-pulse" />
+                      <span className="text-xs font-bold text-purple-400">Triple Confluence</span>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2 px-3 py-1 bg-amber-500/10 border border-amber-500/20 rounded-lg">
+                      <div className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                      <span className="text-xs font-bold text-amber-400">Statistical Thresholds</span>
+                    </div>
+                  )}
+                  <div className="ml-auto flex items-center gap-4 pr-2">
+                     <span className="text-[10px] text-white/20 font-mono">XG:{settings.xgShortThreshold}%</span>
+                     <span className="text-[10px] text-white/20 font-mono">GRU:{settings.shortThreshold}%</span>
+                  </div>
+                </div>
+              )}
+
               {/* Detailed Metrics */}
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <MetricCard title="Total Profit" value={backtestResult ? `$${backtestResult.totalProfit.toLocaleString()}` : '---'} color="text-emerald-400" />
@@ -1763,6 +1815,89 @@ export default function App() {
                 <MetricCard title="Max Profit" value={backtestResult ? `$${(backtestResult.maxProfit || 0).toFixed(2)}` : '---'} color="text-emerald-600" />
                 <MetricCard title="Max Loss" value={backtestResult ? `$${(backtestResult.maxLoss || 0).toFixed(2)}` : '---'} color="text-red-600" />
               </div>
+
+              {backtestResult && backtestResult.confusionMatrix && (
+                <div className="bg-[#0D0D0E] border border-white/5 rounded-2xl p-6 shadow-xl space-y-6">
+                  <div className="flex items-center gap-2 border-b border-white/5 pb-2">
+                    <Target className="w-5 h-5 text-blue-400" />
+                    <h3 className="text-sm font-bold uppercase tracking-wider text-white/80">Classification Performance (Confusion Matrix)</h3>
+                  </div>
+                  
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                    {/* Short Accuracy */}
+                    <div className="space-y-4">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-red-400 uppercase tracking-widest">Short Class</span>
+                        <div className="flex gap-4">
+                          <div className="text-center">
+                            <div className="text-[10px] text-white/30 uppercase">Precision</div>
+                            <div className="text-sm font-mono text-white">{(backtestResult.confusionMatrix.short.precision || 0).toFixed(1)}%</div>
+                          </div>
+                          <div className="text-center">
+                            <div className="text-[10px] text-white/30 uppercase">Recall</div>
+                            <div className="text-sm font-mono text-white">{(backtestResult.confusionMatrix.short.recall || 0).toFixed(1)}%</div>
+                          </div>
+                        </div>
+                      </div>
+                      
+                      <div className="grid grid-cols-2 gap-px bg-white/5 rounded-lg overflow-hidden border border-white/5">
+                        <div className="bg-emerald-500/10 p-3 flex flex-col items-center justify-center border-r border-b border-white/10">
+                          <span className="text-[8px] text-white/30 uppercase">True Pos (TP)</span>
+                          <span className="text-lg font-bold text-emerald-400">{backtestResult.confusionMatrix.short.tp.toString()}</span>
+                        </div>
+                        <div className="bg-red-500/10 p-3 flex flex-col items-center justify-center border-b border-white/10">
+                          <span className="text-[8px] text-white/30 uppercase">False Pos (FP)</span>
+                          <span className="text-lg font-bold text-red-400">{backtestResult.confusionMatrix.short.fp.toString()}</span>
+                        </div>
+                        <div className="bg-amber-500/10 p-3 flex flex-col items-center justify-center border-r border-white/10">
+                          <span className="text-[8px] text-white/30 uppercase">False Neg (FN)</span>
+                          <span className="text-lg font-bold text-amber-400">{backtestResult.confusionMatrix.short.fn.toString()}</span>
+                        </div>
+                        <div className="bg-blue-500/10 p-3 flex flex-col items-center justify-center">
+                          <span className="text-[8px] text-white/30 uppercase">True Neg (TN)</span>
+                          <span className="text-lg font-bold text-blue-400">{backtestResult.confusionMatrix.short.tn.toString()}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Long Accuracy */}
+                    <div className="space-y-4">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-emerald-400 uppercase tracking-widest">Long Class</span>
+                        <div className="flex gap-4">
+                          <div className="text-center">
+                            <div className="text-[10px] text-white/30 uppercase">Precision</div>
+                            <div className="text-sm font-mono text-white">{(backtestResult.confusionMatrix.long.precision || 0).toFixed(1)}%</div>
+                          </div>
+                          <div className="text-center">
+                            <div className="text-[10px] text-white/30 uppercase">Recall</div>
+                            <div className="text-sm font-mono text-white">{(backtestResult.confusionMatrix.long.recall || 0).toFixed(1)}%</div>
+                          </div>
+                        </div>
+                      </div>
+                      
+                      <div className="grid grid-cols-2 gap-px bg-white/5 rounded-lg overflow-hidden border border-white/5">
+                        <div className="bg-emerald-500/10 p-3 flex flex-col items-center justify-center border-r border-b border-white/10">
+                          <span className="text-[8px] text-white/30 uppercase">True Pos (TP)</span>
+                          <span className="text-lg font-bold text-emerald-400">{backtestResult.confusionMatrix.long.tp.toString()}</span>
+                        </div>
+                        <div className="bg-red-500/10 p-3 flex flex-col items-center justify-center border-b border-white/10">
+                          <span className="text-[8px] text-white/30 uppercase">False Pos (FP)</span>
+                          <span className="text-lg font-bold text-red-400">{backtestResult.confusionMatrix.long.fp.toString()}</span>
+                        </div>
+                        <div className="bg-amber-500/10 p-3 flex flex-col items-center justify-center border-r border-white/10">
+                          <span className="text-[8px] text-white/30 uppercase">False Neg (FN)</span>
+                          <span className="text-lg font-bold text-amber-400">{backtestResult.confusionMatrix.long.fn.toString()}</span>
+                        </div>
+                        <div className="bg-blue-500/10 p-3 flex flex-col items-center justify-center">
+                          <span className="text-[8px] text-white/30 uppercase">True Neg (TN)</span>
+                          <span className="text-lg font-bold text-blue-400">{backtestResult.confusionMatrix.long.tn.toString()}</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Price & Prediction Chart */}
               {backtestResult && (
@@ -1783,28 +1918,38 @@ export default function App() {
                           itemStyle={{ fontSize: '10px' }}
                         />
                         <Line yAxisId="left" type="monotone" dataKey="price" stroke="#3b82f6" dot={false} strokeWidth={2} />
-                        <Line yAxisId="right" type="monotone" dataKey="shortProb" stroke="#f87171" dot={false} strokeWidth={1} name="Short %" />
-                        <Line yAxisId="right" type="monotone" dataKey="longProb" stroke="#34d399" dot={false} strokeWidth={1} name="Long %" />
-                        <Line yAxisId="right" type="monotone" dataKey="sideProb" stroke="#94a3b8" dot={false} strokeWidth={1} strokeDasharray="3 3" name="Side %" />
+                        <Line yAxisId="right" type="monotone" dataKey="shortProb" stroke="#ef4444" dot={false} strokeWidth={1} name="GRU Short %" />
+                        <Line yAxisId="right" type="monotone" dataKey="longProb" stroke="#10b981" dot={false} strokeWidth={1} name="GRU Long %" />
+                        <Line yAxisId="right" type="monotone" dataKey="xgShort" stroke="#f87171" dot={false} strokeWidth={1} strokeDasharray="5 5" name="XG Short %" />
+                        <Line yAxisId="right" type="monotone" dataKey="xgLong" stroke="#34d399" dot={false} strokeWidth={1} strokeDasharray="5 5" name="XG Long %" />
+                        <Line yAxisId="right" type="stepAfter" dataKey="drl" stroke="#a855f7" dot={false} strokeWidth={2} name="DRL Action" />
                       </LineChart>
                     </ResponsiveContainer>
                   </div>
-                  <div className="flex justify-center gap-4 mt-4 flex-wrap">
+                  <div className="flex justify-center gap-6 mt-4 flex-wrap">
                     <div className="flex items-center gap-2">
                       <div className="w-3 h-0.5 bg-[#3b82f6]"></div>
                       <span className="text-[10px] text-white/40 uppercase">Price</span>
                     </div>
                     <div className="flex items-center gap-2">
-                      <div className="w-3 h-0.5 bg-[#f87171]"></div>
-                      <span className="text-[10px] text-white/40 uppercase">Short %</span>
+                      <div className="w-3 h-0.5 bg-[#ef4444]"></div>
+                      <span className="text-[10px] text-white/40 uppercase">GRU Short</span>
                     </div>
                     <div className="flex items-center gap-2">
-                      <div className="w-3 h-0.5 bg-[#34d399]"></div>
-                      <span className="text-[10px] text-white/40 uppercase">Long %</span>
+                      <div className="w-3 h-0.5 bg-[#10b981]"></div>
+                      <span className="text-[10px] text-white/40 uppercase">GRU Long</span>
                     </div>
                     <div className="flex items-center gap-2">
-                      <div className="w-3 h-0.5 bg-[#94a3b8] border-t border-dashed"></div>
-                      <span className="text-[10px] text-white/40 uppercase">Sideways %</span>
+                      <div className="w-3 h-0.5 bg-[#f87171] border-t border-dashed"></div>
+                      <span className="text-[10px] text-white/40 uppercase">XG Short</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="w-3 h-0.5 bg-[#34d399] border-t border-dashed"></div>
+                      <span className="text-[10px] text-white/40 uppercase">XG Long</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="w-4 h-0.5 bg-[#a855f7]"></div>
+                      <span className="text-[10px] text-white/40 uppercase">DRL Action (S:80, L:20)</span>
                     </div>
                   </div>
                 </div>
@@ -2264,6 +2409,49 @@ export default function App() {
               </div>
 
               <div className="space-y-4">
+                <h3 className="text-xs font-bold text-white/40 uppercase tracking-wider">Deep Reinforcement Learning (DRL)</h3>
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between p-3 bg-white/5 rounded-xl border border-white/5">
+                    <div className="space-y-0.5">
+                      <div className="text-xs font-bold text-white/80">DRL Autonomous Mode</div>
+                      <div className="text-[10px] text-white/30">Action leads, thresholds ignored</div>
+                    </div>
+                    <button 
+                      onClick={() => setSettings({...settings, useDRLOnly: !settings.useDRLOnly})}
+                      className={cn(
+                        "w-10 h-5 rounded-full transition-all relative",
+                        settings.useDRLOnly ? "bg-emerald-600" : "bg-white/10"
+                      )}
+                    >
+                      <div className={cn(
+                        "absolute top-1 w-3 h-3 rounded-full bg-white transition-all",
+                        settings.useDRLOnly ? "right-1" : "left-1"
+                      )} />
+                    </button>
+                  </div>
+
+                  <div className="flex items-center justify-between p-3 bg-white/5 rounded-xl border border-white/5">
+                    <div className="space-y-0.5">
+                      <div className="text-xs font-bold text-white/80">DRL Confluence Filter</div>
+                      <div className="text-[10px] text-white/30">Action must match threshold signals</div>
+                    </div>
+                    <button 
+                      onClick={() => setSettings({...settings, useDRLConfluence: !settings.useDRLConfluence})}
+                      className={cn(
+                        "w-10 h-5 rounded-full transition-all relative",
+                        settings.useDRLConfluence ? "bg-purple-600" : "bg-white/10"
+                      )}
+                    >
+                      <div className={cn(
+                        "absolute top-1 w-3 h-3 rounded-full bg-white transition-all",
+                        settings.useDRLConfluence ? "right-1" : "left-1"
+                      )} />
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-4">
                 <h3 className="text-xs font-bold text-white/40 uppercase tracking-wider">Accuracy & Momentum</h3>
                 <div className="space-y-4">
                   <div className="space-y-1">
@@ -2641,6 +2829,17 @@ export default function App() {
                               ((Array.isArray(liveParams.velocity) ? Math.max(...liveParams.velocity) : (liveParams.velocity || 0)) > 0 ? '+' : '') + 
                               (Array.isArray(liveParams.velocity) ? Math.max(...liveParams.velocity) : (liveParams.velocity || 0)).toFixed(4) 
                               : '0.0000'}
+                          </span>
+                        </div>
+                        <div className="col-span-2 flex justify-between items-center pt-2 border-t border-purple-500/20">
+                          <span className="text-[10px] text-purple-400 uppercase font-bold tracking-widest">DRL Agent Signal</span>
+                          <span className={cn(
+                            "text-[10px] font-black px-2 py-0.5 rounded tracking-tight",
+                            liveParams.drlAction === 0 ? "text-emerald-400 bg-emerald-400/10 shadow-[0_0_10px_rgba(52,211,153,0.1)]" :
+                            liveParams.drlAction === 1 ? "text-red-400 bg-red-400/10 shadow-[0_0_10px_rgba(248,113,113,0.1)]" :
+                            "text-white/40 bg-white/5"
+                          )}>
+                            {liveParams.drlAction === 0 ? 'LONG / BUY' : liveParams.drlAction === 1 ? 'SHORT / SELL' : 'NEUTRAL / HOLD'}
                           </span>
                         </div>
                         <div className="col-span-2 flex justify-between items-center pt-2 border-t border-white/5 opacity-40">

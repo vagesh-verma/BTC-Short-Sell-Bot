@@ -16,6 +16,10 @@ export interface Trade {
 export interface BacktestSettings {
   shortThreshold: number;
   longThreshold: number;
+  xgShortThreshold?: number;
+  xgLongThreshold?: number;
+  xgShortExitThreshold?: number;
+  xgLongExitThreshold?: number;
   shortExitThreshold: number;
   longExitThreshold: number;
   biasThreshold?: number;
@@ -26,6 +30,8 @@ export interface BacktestSettings {
   maxDurationHours: number;
   quantity: number;
   quantityType: 'USD' | 'BTC' | 'LOTS';
+  labelDropThreshold?: number;
+  labelLongThreshold?: number;
   onlyHighVolumeSessions?: boolean;
   useSessionTrading?: boolean;
   asiaStart: number;
@@ -43,6 +49,8 @@ export interface BacktestSettings {
   longPutDelta?: number;
   dailyProfitLimit?: number;
   dailyLossLimit?: number;
+  useDRLConfluence?: boolean;
+  useDRLOnly?: boolean;
 }
 
 export interface BacktestResult {
@@ -55,8 +63,14 @@ export interface BacktestResult {
   avgLoss: number;
   maxProfit: number;
   maxLoss: number;
+  confusionMatrix?: {
+    short: { tp: number; fp: number; fn: number; tn: number; precision: number; recall: number };
+    long: { tp: number; fp: number; fn: number; tn: number; precision: number; recall: number };
+  };
   candles: Candle[];
   predictions: number[][];
+  xgPredictions?: number[][];
+  drlActions?: number[];
 }
 
 export function runBacktest(
@@ -67,12 +81,59 @@ export function runBacktest(
   startIdx: number = 0,
   features?: number[][],
   featureNames?: string[],
-  uncertainties?: number[][]
+  uncertainties?: number[][],
+  xgPredictions?: number[][],
+  drlActions?: number[]
 ): BacktestResult {
   const trades: Trade[] = [];
   let balance = initialBalance;
   let peakBalance = initialBalance;
   let maxDrawdown = 0;
+
+  // Confusion Matrix Stats
+  let shortTP = 0, shortFP = 0, shortFN = 0, shortTN = 0;
+  let longTP = 0, longFP = 0, longFN = 0, longTN = 0;
+  
+  const dropThr = settings.labelDropThreshold || (settings.takeProfit * 100);
+  const longThr = settings.labelLongThreshold || (settings.takeProfit * 100);
+  const lookahead = settings.maxDurationHours || 12;
+
+  // Actual labels determination (ground truth)
+  const actualLabels: number[][] = []; // [isShort, isLong, isSideways]
+  for (let i = startIdx; i < fullCandles.length; i++) {
+    const currentPrice = fullCandles[i].close;
+    const sTP = currentPrice * (1 - (dropThr / 100));
+    const sSL = currentPrice * (1 + (dropThr / 100));
+    const lTP = currentPrice * (1 + (longThr / 100));
+    const lSL = currentPrice * (1 - (longThr / 100));
+
+    let actualShort = false;
+    let actualLong = false;
+    const lookLimit = Math.min(i + lookahead, fullCandles.length - 1);
+
+    for (let j = i + 1; j <= lookLimit; j++) {
+      const h = fullCandles[j].high;
+      const l = fullCandles[j].low;
+      if (l <= sTP && h < sSL) {
+        actualShort = true;
+        break;
+      }
+      if (h >= sSL) break;
+    }
+
+    if (!actualShort) {
+      for (let j = i + 1; j <= lookLimit; j++) {
+        const h = fullCandles[j].high;
+        const l = fullCandles[j].low;
+        if (h >= lTP && l > lSL) {
+          actualLong = true;
+          break;
+        }
+        if (l <= lSL) break;
+      }
+    }
+    actualLabels.push([actualShort ? 1 : 0, actualLong ? 1 : 0]);
+  }
   
   // We start from startIdx because predictions[0] corresponds to fullCandles[startIdx]
   const equityCurve: { time: number; balance: number }[] = [{ time: fullCandles[startIdx]?.time || 0, balance }];
@@ -91,12 +152,49 @@ export function runBacktest(
     const candle = fullCandles[i];
     const predictionIdx = i - startIdx;
     
+    // DRL Action if features provided
+    let currentDrlAction = 2; // Default NEUTRAL
+    if (features && features[predictionIdx]) {
+      // Note: In real life we'd need drlService, here we assume third-party provided it in a new arg
+      // For now let's skip the DRL confluence calculation during backtest unless we pass it specifically
+    }
+    
     // If we run out of predictions before candles, stop
     if (predictionIdx >= predictions.length) break;
     
     const predictionFull = predictions[predictionIdx];
+    const xgPredictionFull = xgPredictions ? xgPredictions[predictionIdx] : [1, 1, 0];
+    
     const shortProb = predictionFull[0];
     const longProb = predictionFull[1];
+    const xgShortProb = xgPredictionFull[0];
+    const xgLongProb = xgPredictionFull[1];
+
+    // Confusion Matrix Logic: Requires both to pass thresholds if configured
+    const predShort = (shortProb * 100 > settings.shortThreshold) && (xgShortProb * 100 >= (settings.xgShortThreshold ?? 0));
+    const predLong = (longProb * 100 > settings.longThreshold) && (xgLongProb * 100 >= (settings.xgLongThreshold ?? 0));
+    const groundTruth = actualLabels[predictionIdx];
+
+    if (groundTruth) {
+      const isActualShort = groundTruth[0] === 1;
+      const isActualLong = groundTruth[1] === 1;
+
+      if (predShort) {
+        if (isActualShort) shortTP++;
+        else shortFP++;
+      } else {
+        if (isActualShort) shortFN++;
+        else shortTN++;
+      }
+
+      if (predLong) {
+        if (isActualLong) longTP++;
+        else longFP++;
+      } else {
+        if (isActualLong) longFN++;
+        else longTN++;
+      }
+    }
     
     const uncertaintyFull = uncertainties ? uncertainties[predictionIdx] : [0, 0, 0];
     const uncertaintyShort = uncertaintyFull[0];
@@ -133,7 +231,7 @@ export function runBacktest(
           shouldExit = true;
           exitReason = 'TRAILING_STOP';
           exitPrice = activeTrade.trailingStopPrice;
-        } else if (shortProb < settings.shortExitThreshold) {
+        } else if (shortProb * 100 < settings.shortExitThreshold || (xgPredictions && xgShortProb * 100 < (settings.xgShortExitThreshold ?? 0))) {
           shouldExit = true;
           exitReason = 'PREDICTION';
           exitPrice = candle.close;
@@ -151,7 +249,7 @@ export function runBacktest(
           shouldExit = true;
           exitReason = 'TRAILING_STOP';
           exitPrice = activeTrade.trailingStopPrice;
-        } else if (longProb < settings.longExitThreshold) {
+        } else if (longProb * 100 < settings.longExitThreshold || (xgPredictions && xgLongProb * 100 < (settings.xgLongExitThreshold ?? 0))) {
           shouldExit = true;
           exitReason = 'PREDICTION';
           exitPrice = candle.close;
@@ -266,14 +364,29 @@ export function runBacktest(
 
       if (sessionFilter()) {
         const bias = settings.biasThreshold || 0;
-        const canShort = shortProb > settings.shortThreshold && 
-                        (shortProb - longProb) >= bias &&
-                        velocityShort >= minVelocity && 
-                        (mcPasses <= 1 || uncertaintyShort <= maxUncertainty);
-        const canLong = longProb > settings.longThreshold && 
-                       (longProb - shortProb) >= bias &&
-                       velocityLong >= minVelocity && 
-                       (mcPasses <= 1 || uncertaintyLong <= maxUncertainty);
+        const drlMatchesShort = drlActions && drlActions[predictionIdx] === 1;
+        const drlMatchesLong = drlActions && drlActions[predictionIdx] === 0;
+
+        let canShort = false;
+        let canLong = false;
+
+        if (settings.useDRLOnly) {
+          canShort = !!drlMatchesShort;
+          canLong = !!drlMatchesLong;
+        } else {
+          canShort = (shortProb * 100) > settings.shortThreshold && 
+                          ((shortProb - longProb) * 100) >= bias &&
+                          velocityShort >= minVelocity && 
+                          (mcPasses <= 1 || uncertaintyShort <= maxUncertainty) &&
+                          (!xgPredictions || (xgShortProb * 100 >= (settings.xgShortThreshold ?? 0))) &&
+                          (!settings.useDRLConfluence || drlMatchesShort);
+          canLong = (longProb * 100) > settings.longThreshold && 
+                         ((longProb - shortProb) * 100) >= bias &&
+                         velocityLong >= minVelocity && 
+                         (mcPasses <= 1 || uncertaintyLong <= maxUncertainty) &&
+                         (!xgPredictions || (xgLongProb * 100 >= (settings.xgLongThreshold ?? 0))) &&
+                         (!settings.useDRLConfluence || drlMatchesLong);
+        }
 
         if (canShort && (!canLong || shortProb > longProb)) {
           if (settings.strategyType === 'SHORT_BTC' || settings.strategyType === 'BOTH') {
@@ -337,6 +450,11 @@ export function runBacktest(
   const maxProfit = trades.length > 0 ? Math.max(...trades.map(t => t.profit)) : 0;
   const maxLoss = trades.length > 0 ? Math.min(...trades.map(t => t.profit)) : 0;
 
+  const precisionShort = (shortTP / (shortTP + shortFP) || 0) * 100;
+  const recallShort = (shortTP / (shortTP + shortFN) || 0) * 100;
+  const precisionLong = (longTP / (longTP + longFP) || 0) * 100;
+  const recallLong = (longTP / (longTP + longFN) || 0) * 100;
+
   return {
     trades,
     totalProfit: balance - initialBalance,
@@ -347,7 +465,13 @@ export function runBacktest(
     avgLoss,
     maxProfit,
     maxLoss,
+    confusionMatrix: {
+      short: { tp: shortTP, fp: shortFP, fn: shortFN, tn: shortTN, precision: precisionShort, recall: recallShort },
+      long: { tp: longTP, fp: longFP, fn: longFN, tn: longTN, precision: precisionLong, recall: recallLong }
+    },
     candles: fullCandles.slice(startIdx, startIdx + predictions.length),
-    predictions
+    predictions,
+    xgPredictions,
+    drlActions
   };
 }

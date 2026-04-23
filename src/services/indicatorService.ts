@@ -198,6 +198,17 @@ export function calculateVolatility(prices: number[], period: number = 20): numb
   return volatility;
 }
 
+export function calculateROC(prices: number[], period: number = 12): number[] {
+  const roc: number[] = new Array(prices.length).fill(0);
+  for (let i = period; i < prices.length; i++) {
+    const prevPrice = prices[i - period];
+    if (prevPrice !== 0) {
+      roc[i] = ((prices[i] - prevPrice) / prevPrice) * 100;
+    }
+  }
+  return roc;
+}
+
 export function calculateBearishHarami(opens: number[], prices: number[]): number[] {
   const result: number[] = new Array(prices.length).fill(0);
   for (let i = 1; i < prices.length; i++) {

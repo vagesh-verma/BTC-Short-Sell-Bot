@@ -1,5 +1,6 @@
 import * as tf from '@tensorflow/tfjs';
 import { logger } from './loggerService';
+import { Candle } from './dataService';
 
 export interface DataPreparationOptions {
   prices: number[];
@@ -10,8 +11,9 @@ export interface DataPreparationOptions {
   bbUpper: number[];
   bbLower: number[];
   windowSize: number;
-  secondaryPredictions?: number[];
   macdHistogram?: number[];
+  macdLine?: number[];
+  roc?: number[];
   stochRsi?: number[];
   atr?: number[];
   dropThreshold?: number;
@@ -239,10 +241,129 @@ export class GRUModel {
   }
 }
 
+export function prepareDataFromFeatures(
+  candles: Candle[],
+  features: number[][],
+  options: {
+    dropThreshold?: number;
+    longThreshold?: number;
+    maxLookahead?: number;
+    startIndex: number;
+    windowSize: number;
+  }
+) {
+  const {
+    dropThreshold = 0.5,
+    longThreshold = 0.5,
+    maxLookahead = 12,
+    startIndex,
+    windowSize
+  } = options;
+
+  const samples: { x: number[], y: number[] }[] = [];
+  
+  // features[0] corresponds to candles[startIndex]
+  // We loop through the features and find the corresponding labels in candles
+  for (let i = 0; i < features.length; i++) {
+    const candleIdx = startIndex + i;
+    if (candleIdx >= candles.length - 1) break;
+
+    const x = features[i];
+    const currentPrice = candles[candleIdx].close;
+    
+    const shortTP = currentPrice * (1 - (dropThreshold / 100));
+    const shortSL = currentPrice * (1 + (dropThreshold / 100));
+    
+    const longTP = currentPrice * (1 + (longThreshold / 100));
+    const longSL = currentPrice * (1 - (longThreshold / 100));
+
+    let isShort = false;
+    let isLong = false;
+
+    const lookLimit = Math.min(candleIdx + maxLookahead, candles.length - 1);
+    
+    for (let j = candleIdx + 1; j <= lookLimit; j++) {
+      const h = candles[j].high;
+      const l = candles[j].low;
+      
+      if (l <= shortTP && h < shortSL) {
+        isShort = true;
+        break;
+      }
+      if (h >= shortSL) break;
+    }
+
+    if (!isShort) {
+      for (let j = candleIdx + 1; j <= lookLimit; j++) {
+        const h = candles[j].high;
+        const l = candles[j].low;
+        
+        if (h >= longTP && l > longSL) {
+          isLong = true;
+          break;
+        }
+        if (l <= longSL) break;
+      }
+    }
+
+    let classification: number[];
+    if (isShort) {
+      classification = [1, 0, 0];
+    } else if (isLong) {
+      classification = [0, 1, 0];
+    } else {
+      classification = [0, 0, 1];
+    }
+    
+    samples.push({ x, y: classification });
+  }
+
+  // Same balancing logic as prepareData
+  const shortSamples = samples.filter(s => s.y[0] === 1);
+  const longSamples = samples.filter(s => s.y[1] === 1);
+  const sidewaysSamples = samples.filter(s => s.y[2] === 1);
+  
+  const balancedSamples: { x: number[], y: number[] }[] = [];
+  const maxClassCount = Math.max(shortSamples.length, longSamples.length, sidewaysSamples.length);
+  
+  const oversample = (arr: {x: number[], y: number[]}[], target: number) => {
+    if (arr.length === 0) return [];
+    const result = [...arr];
+    while (result.length < target) {
+      result.push(arr[Math.floor(Math.random() * arr.length)]);
+    }
+    return result;
+  };
+
+  const targetCount = Math.min(maxClassCount, sidewaysSamples.length * 2);
+  balancedSamples.push(...oversample(shortSamples, targetCount));
+  balancedSamples.push(...oversample(longSamples, targetCount));
+  balancedSamples.push(...sidewaysSamples);
+
+  for (let i = balancedSamples.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [balancedSamples[i], balancedSamples[j]] = [balancedSamples[j], balancedSamples[i]];
+  }
+
+  const xs = balancedSamples.flatMap(s => s.x);
+  const ys = balancedSamples.flatMap(s => s.y);
+
+  return { 
+    xs, 
+    ys, 
+    stats: { 
+      total: samples.length, 
+      short: shortSamples.length,
+      long: longSamples.length,
+      sideways: sidewaysSamples.length
+    } 
+  };
+}
+
 export function prepareData(options: DataPreparationOptions) {
     const {
     prices, highs, lows, rsi, ema, bbUpper, bbLower, windowSize,
-    secondaryPredictions, macdHistogram, stochRsi, atr,
+    macdHistogram, macdLine, roc, stochRsi, atr,
     dropThreshold = 0.5, longThreshold = 0.5, maxLookahead = 12,
     ema9, emaBelow, emaCross, obv, mfi, volatility,
     hourOfDay, dayOfWeek, bearishHarami, marubozu, engulfing,
@@ -277,8 +398,9 @@ export function prepareData(options: DataPreparationOptions) {
     for (let j = 0; j < windowSize; j++) {
       x.push(normPrice[j], normRsi[j], normEma[j], normBbUpper[j], normBbLower[j]);
       
-      if (secondaryPredictions) x.push(secondaryPredictions[i - windowSize + j + 1] || 0.5);
       if (macdHistogram) x.push(normalize(windowIndices.map(idx => macdHistogram[idx]))[j]);
+      if (macdLine) x.push(normalize(windowIndices.map(idx => macdLine[idx]))[j]);
+      if (roc) x.push(normalize(windowIndices.map(idx => roc[idx]))[j]);
       if (stochRsi) x.push(stochRsi[windowIndices[j]]);
       if (atr) x.push(normalize(windowIndices.map(idx => atr[idx]))[j]);
       if (ema9) x.push(normalize(windowIndices.map(idx => ema9[idx]))[j]);
@@ -391,4 +513,208 @@ export function prepareData(options: DataPreparationOptions) {
       sideways: sidewaysSamples.length
     } 
   };
+}
+
+export class XGBoostModel {
+  private model: any = null;
+  private featureCount: number;
+  public name: string = 'xgboost_parallel';
+
+  constructor(featureCount: number = 24) {
+    this.featureCount = featureCount;
+  }
+
+  public async train(
+    data: number[], 
+    labels: number[],
+    windowSize: number,
+    iterations: number = 100
+  ) {
+    try {
+      const numSamples = labels.length / 3;
+      const inputSize = windowSize * this.featureCount;
+
+      const X: number[][] = [];
+      const y: number[] = [];
+
+      for (let i = 0; i < numSamples; i++) {
+        X.push(data.slice(i * inputSize, (i + 1) * inputSize));
+        const sampleLabels = labels.slice(i * 3, (i + 1) * 3);
+        const labelIndex = sampleLabels.indexOf(1);
+        y.push(labelIndex === -1 ? 2 : labelIndex);
+      }
+
+      logger.info(`Starting XGBoost training with ${numSamples} samples...`);
+      
+      let XGB;
+      try {
+        logger.info('Waiting for XGBoost library to load...');
+        
+        // Dynamic import to handle potential CJS/ESM interop issues in Vite
+        // @ts-ignore
+        const mlxg = await import('ml-xgboost');
+        const loader = mlxg.default || mlxg;
+        
+        // Add a timeout to the loading promise
+        const timeoutPromise = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('XGBoost library loading timed out after 10s. This may be due to missing xgboost.wasm in the public folder.')), 10000)
+        );
+        
+        XGB = await Promise.race([loader, timeoutPromise]);
+        
+        if (typeof XGB !== 'function') {
+          // Sometimes the promise resolves to the loader function itself if it's already resolved
+          if (XGB && XGB.default) XGB = XGB.default;
+          if (typeof XGB !== 'function') {
+             throw new Error(`XGBoost library loaded but is not a constructor (got ${typeof XGB})`);
+          }
+        }
+        
+        logger.info('XGBoost library loaded successfully.');
+      } catch (loadErr: any) {
+        logger.error(`Failed to load XGBoost library: ${loadErr.message}`);
+        throw loadErr;
+      }
+
+      logger.info('Initializing XGBoost model instance...');
+      this.model = new XGB({
+        objective: 'multi:softprob',
+        max_depth: 6,
+        eta: 0.1,
+        iterations,
+        num_class: 3,
+        silent: 1
+      });
+
+      logger.info(`Training XGBoost model (iterations: ${iterations})...`);
+      // Use setTimeout to avoid blocking the main thread immediately and let status update
+      await new Promise(resolve => setTimeout(resolve, 100));
+      this.model.train(X, y);
+      logger.success('XGBoost parallel model trained successfully.');
+    } catch (err: any) {
+      logger.error(`Error training XGBoost: ${err.message}`);
+      throw err;
+    }
+  }
+
+  public predictMultiple(features: number[][]): number[][] {
+    if (!this.model) return features.map(() => [0, 0, 1]);
+    try {
+      const results = this.model.predict(features);
+      return results;
+    } catch (err: any) {
+      logger.error(`XGBoost prediction error: ${err.message}`);
+      return features.map(() => [0, 0, 1]);
+    }
+  }
+
+  public predict(features: number[]): number[] {
+    if (!this.model) return [0, 0, 1];
+    try {
+      const results = this.model.predict([features]);
+      return results[0];
+    } catch (err: any) {
+      logger.error(`XGBoost prediction error: ${err.message}`);
+      return [0, 0, 1];
+    }
+  }
+}
+
+export function prepareDRLData(options: DataPreparationOptions): { marketData: number[][], prices: number[] } {
+  const { prices, highs, lows, rsi, ema, bbUpper, bbLower, windowSize, macdHistogram, macdLine, roc, stochRsi, atr, ema9, emaBelow, emaCross, obv, mfi, volatility, hourOfDay, dayOfWeek, bearishHarami, marubozu, engulfing } = options;
+  const marketData: number[][] = [];
+  const finalPrices: number[] = [];
+
+  for (let i = windowSize; i < prices.length; i++) {
+    const windowIndices = Array.from({ length: windowSize }, (_, k) => i - windowSize + k);
+    
+    const priceWindow = windowIndices.map(idx => prices[idx]);
+    const rsiWindow = windowIndices.map(idx => rsi[idx]);
+    const emaWindow = windowIndices.map(idx => ema[idx]);
+    const bbUpperWindow = windowIndices.map(idx => bbUpper[idx]);
+    const bbLowerWindow = windowIndices.map(idx => bbLower[idx]);
+
+    const normalize = (arr: number[]) => {
+      const min = Math.min(...arr);
+      const max = Math.max(...arr);
+      return arr.map(v => (max === min ? 0.5 : (v - min) / (max - min)));
+    };
+
+    const normPrice = normalize(priceWindow);
+    const normRsi = rsiWindow.map(v => v / 100);
+    const normEma = normalize(normPrice); // Normalize based on price window
+    const normBbUpper = normalize(normPrice); 
+    const normBbLower = normalize(normPrice);
+
+    const x: number[] = [];
+    for (let j = 0; j < windowSize; j++) {
+      // Re-normalize EMA and BB relative to price window for better consistency
+      const pMin = Math.min(...priceWindow);
+      const pMax = Math.max(...priceWindow);
+      const pRange = pMax - pMin;
+      
+      const normVal = (v: number) => pRange === 0 ? 0.5 : (v - pMin) / pRange;
+
+      x.push(normVal(priceWindow[j]), rsi[windowIndices[j]] / 100, normVal(ema[windowIndices[j]]), normVal(bbUpper[windowIndices[j]]), normVal(bbLower[windowIndices[j]]));
+      
+      if (macdHistogram) {
+        const histWindow = windowIndices.map(idx => macdHistogram[idx]);
+        const hMin = Math.min(...histWindow);
+        const hMax = Math.max(...histWindow);
+        x.push(hMax === hMin ? 0.5 : (macdHistogram[windowIndices[j]] - hMin) / (hMax - hMin));
+      }
+      if (macdLine) {
+        const lineWindow = windowIndices.map(idx => macdLine[idx]);
+        const lMin = Math.min(...lineWindow);
+        const lMax = Math.max(...lineWindow);
+        x.push(lMax === lMin ? 0.5 : (macdLine[windowIndices[j]] - lMin) / (lMax - lMin));
+      }
+      if (roc) {
+        const rocWindow = windowIndices.map(idx => roc[idx]);
+        const rMin = Math.min(...rocWindow);
+        const rMax = Math.max(...rocWindow);
+        x.push(rMax === rMin ? 0.5 : (roc[windowIndices[j]] - rMin) / (rMax - rMin));
+      }
+      if (stochRsi) x.push(stochRsi[windowIndices[j]]);
+      if (atr) {
+        const atrWindow = windowIndices.map(idx => atr[idx]);
+        const aMin = Math.min(...atrWindow);
+        const aMax = Math.max(...atrWindow);
+        x.push(aMax === aMin ? 0.5 : (atr[windowIndices[j]] - aMin) / (aMax - aMin));
+      }
+      if (ema9) x.push(normVal(ema9[windowIndices[j]]));
+      if (emaBelow) x.push(emaBelow[windowIndices[j]]);
+      if (emaCross) x.push(emaCross[windowIndices[j]]);
+      if (obv) {
+        const obvWindow = windowIndices.map(idx => obv[idx]);
+        const oMin = Math.min(...obvWindow);
+        const oMax = Math.max(...obvWindow);
+        x.push(oMax === oMin ? 0.5 : (obv[windowIndices[j]] - oMin) / (oMax - oMin));
+      }
+      if (mfi) x.push(mfi[windowIndices[j]] / 100);
+      if (volatility) {
+        const vWindow = windowIndices.map(idx => volatility[idx]);
+        const vMin = Math.min(...vWindow);
+        const vMax = Math.max(...vWindow);
+        x.push(vMax === vMin ? 0.5 : (volatility[windowIndices[j]] - vMin) / (vMax - vMin));
+      }
+      
+      if (hourOfDay) {
+        const h = hourOfDay[windowIndices[j]];
+        x.push(h / 24);
+        x.push(h >= 0 && h <= 9 ? 1 : 0);
+        x.push(h >= 8 && h <= 17 ? 1 : 0);
+        x.push(h >= 13 && h <= 22 ? 1 : 0);
+      }
+      if (dayOfWeek) x.push(dayOfWeek[windowIndices[j]] / 7);
+      if (bearishHarami) x.push(bearishHarami[windowIndices[j]]);
+      if (marubozu) x.push(marubozu[windowIndices[j]]);
+      if (engulfing) x.push(engulfing[windowIndices[j]]);
+    }
+    
+    marketData.push(x);
+    finalPrices.push(prices[i]);
+  }
+
+  return { marketData, prices: finalPrices };
 }
