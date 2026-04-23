@@ -546,28 +546,26 @@ export class XGBoostModel {
 
       logger.info(`Starting XGBoost training with ${numSamples} samples...`);
       
-      let XGB;
+      let XGB: any;
       try {
         logger.info('Waiting for XGBoost library to load...');
         
-        // Dynamic import to handle potential CJS/ESM interop issues in Vite
+        // Use dynamic import to ensure it's loaded within the browser context
         // @ts-ignore
         const mlxg = await import('ml-xgboost');
-        const loader = mlxg.default || mlxg;
+        XGB = mlxg.default || mlxg;
         
-        // Add a timeout to the loading promise
-        const timeoutPromise = new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('XGBoost library loading timed out after 10s. This may be due to missing xgboost.wasm in the public folder.')), 10000)
-        );
-        
-        XGB = await Promise.race([loader, timeoutPromise]);
+        // Wait if it's a promise
+        if (XGB && typeof XGB.then === 'function') {
+          XGB = await XGB;
+        }
+
+        if (typeof XGB !== 'function') {
+          if (XGB && XGB.default) XGB = XGB.default;
+        }
         
         if (typeof XGB !== 'function') {
-          // Sometimes the promise resolves to the loader function itself if it's already resolved
-          if (XGB && XGB.default) XGB = XGB.default;
-          if (typeof XGB !== 'function') {
-             throw new Error(`XGBoost library loaded but is not a constructor (got ${typeof XGB})`);
-          }
+           throw new Error(`XGBoost library loaded but is not a constructor (got ${typeof XGB}). Ensure 'global' and 'process.env' are polyfilled.`);
         }
         
         logger.info('XGBoost library loaded successfully.');

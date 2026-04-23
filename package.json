@@ -4,9 +4,10 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx server.ts",
+    "dev": "node copy-wasm.js && tsx server.ts",
     "start": "node server.ts",
-    "build": "vite build",
+    "build": "node copy-wasm.js && vite build",
+    "postinstall": "node copy-wasm.js",
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit"
