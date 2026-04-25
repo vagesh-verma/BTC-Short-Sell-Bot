@@ -1014,13 +1014,13 @@ export default function App() {
       (window as any).lastXgPredictions = generatedXgPredictions;
 
       const shortCount = generatedPredictions.filter((p, idx) => 
-        (p[0] * 100 > settings.shortThreshold) && 
-        (generatedXgPredictions[idx][0] * 100 >= (settings.xgShortThreshold ?? 0))
+        p && (p[0] * 100 > settings.shortThreshold) && 
+        (!generatedXgPredictions[idx] || (generatedXgPredictions[idx][0] * 100 >= (settings.xgShortThreshold ?? 0)))
       ).length;
       
       const longCount = generatedPredictions.filter((p, idx) => 
-        (p[1] * 100 > settings.longThreshold) && 
-        (generatedXgPredictions[idx][1] * 100 >= (settings.xgLongThreshold ?? 0))
+        p && (p[1] * 100 > settings.longThreshold) && 
+        (!generatedXgPredictions[idx] || (generatedXgPredictions[idx][1] * 100 >= (settings.xgLongThreshold ?? 0)))
       ).length;
 
       setPredictionStats({ total: generatedPredictions.length, short: shortCount, long: longCount });
@@ -1798,6 +1798,20 @@ export default function App() {
                     </div>
                   )}
                   <div className="ml-auto flex items-center gap-4 pr-2">
+                    {backtestResult.drlActions && backtestResult.drlActions.length > 0 && (
+                      <div className="flex items-center gap-2 px-2 py-1 bg-white/5 border border-white/10 rounded-md">
+                        <span className="text-[10px] text-white/30 uppercase font-bold tracking-tighter">Last Signal</span>
+                        <span className={cn(
+                          "text-[10px] font-black px-1.5 py-0.5 rounded",
+                          backtestResult.drlActions[backtestResult.drlActions.length - 1] === 0 ? "text-emerald-400 bg-emerald-400/10" :
+                          backtestResult.drlActions[backtestResult.drlActions.length - 1] === 1 ? "text-red-400 bg-red-400/10" :
+                          "text-white/40 bg-white/5"
+                        )}>
+                          {backtestResult.drlActions[backtestResult.drlActions.length - 1] === 0 ? 'LONG / BUY' : 
+                           backtestResult.drlActions[backtestResult.drlActions.length - 1] === 1 ? 'SHORT / SELL' : 'NEUTRAL / HOLD'}
+                        </span>
+                      </div>
+                    )}
                      <span className="text-[10px] text-white/20 font-mono">XG:{settings.xgShortThreshold}%</span>
                      <span className="text-[10px] text-white/20 font-mono">GRU:{settings.shortThreshold}%</span>
                   </div>
@@ -1916,6 +1930,15 @@ export default function App() {
                         <Tooltip 
                           contentStyle={{ backgroundColor: '#0D0D0E', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px' }}
                           itemStyle={{ fontSize: '10px' }}
+                          formatter={(value: any, name: string) => {
+                            if (name === 'DRL Action') {
+                              if (value === 80) return ['SHORT', name];
+                              if (value === 20) return ['LONG', name];
+                              return ['NEUTRAL', name];
+                            }
+                            if (name.includes('%')) return [`${value}%`, name];
+                            return [value, name];
+                          }}
                         />
                         <Line yAxisId="left" type="monotone" dataKey="price" stroke="#3b82f6" dot={false} strokeWidth={2} />
                         <Line yAxisId="right" type="monotone" dataKey="shortProb" stroke="#ef4444" dot={false} strokeWidth={1} name="GRU Short %" />
@@ -1949,7 +1972,7 @@ export default function App() {
                     </div>
                     <div className="flex items-center gap-2">
                       <div className="w-4 h-0.5 bg-[#a855f7]"></div>
-                      <span className="text-[10px] text-white/40 uppercase">DRL Action (S:80, L:20)</span>
+                      <span className="text-[10px] text-white/40 uppercase">DRL Action (S:80, N:50, L:20)</span>
                     </div>
                   </div>
                 </div>

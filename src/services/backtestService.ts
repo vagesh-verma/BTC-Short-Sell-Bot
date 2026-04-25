@@ -163,7 +163,9 @@ export function runBacktest(
     if (predictionIdx >= predictions.length) break;
     
     const predictionFull = predictions[predictionIdx];
-    const xgPredictionFull = xgPredictions ? xgPredictions[predictionIdx] : [1, 1, 0];
+    if (!predictionFull) continue;
+
+    const xgPredictionFull = (xgPredictions && xgPredictions[predictionIdx]) ? xgPredictions[predictionIdx] : [1, 1, 0];
     
     const shortProb = predictionFull[0];
     const longProb = predictionFull[1];
@@ -196,7 +198,7 @@ export function runBacktest(
       }
     }
     
-    const uncertaintyFull = uncertainties ? uncertainties[predictionIdx] : [0, 0, 0];
+    const uncertaintyFull = (uncertainties && uncertainties[predictionIdx]) ? uncertainties[predictionIdx] : [0, 0, 0];
     const uncertaintyShort = uncertaintyFull[0];
     const uncertaintyLong = uncertaintyFull[1];
 
@@ -343,8 +345,9 @@ export function runBacktest(
     }
 
     // Check for entry if not in trade
-    const velocityShort = predictionIdx > 0 ? (shortProb - predictions[predictionIdx - 1][0]) : 0;
-    const velocityLong = predictionIdx > 0 ? (longProb - predictions[predictionIdx - 1][1]) : 0;
+    const prevPrediction = predictionIdx > 0 ? predictions[predictionIdx - 1] : null;
+    const velocityShort = prevPrediction ? (shortProb - prevPrediction[0]) : 0;
+    const velocityLong = prevPrediction ? (longProb - prevPrediction[1]) : 0;
     const minVelocity = settings.minSignalVelocity || 0;
     const maxUncertainty = settings.maxUncertainty || 1;
     const mcPasses = settings.mcPasses || 1;
