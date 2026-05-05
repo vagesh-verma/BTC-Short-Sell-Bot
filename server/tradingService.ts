@@ -122,6 +122,8 @@ export class TradingService {
   private lastTradeCloseTime: number = 0;
   private dailyProfit: number = 0;
   private lastDailyReset: number = 0;
+  private lastProcessedCandleTime: number = 0;
+  private lastDrlAction: number | null = null;
   private processInterval: number = 5000; // Process at most once every 5 seconds
 
   private apiKey: string = process.env.DELTA_API_KEY || '';
@@ -180,7 +182,15 @@ export class TradingService {
         
         if (this.isRunning) {
           this.log('Resuming trading session...', 'info');
-          this.fetchInitialData().then(() => this.connectWebSocket());
+          this.fetchInitialData().then(async () => {
+            if (this.candles.length > 0 && this.model1h) {
+              const lastPrice = this.candles[this.candles.length - 1].close;
+              this.log(`Generating initial prediction while resuming at $${lastPrice}`, 'info');
+              this.lastProcessTime = 0;
+              await this.processPriceUpdate(lastPrice);
+            }
+            this.connectWebSocket();
+          });
         }
       }
     } catch (err) {
@@ -241,6 +251,15 @@ export class TradingService {
     this.log(`Starting Live Trading (Real: ${this.isRealTrading})`, 'success');
     
     await this.fetchInitialData();
+
+    // Trigger initial prediction using last completed candle if models are ready
+    if (this.candles.length > 0 && this.model1h) {
+      const lastPrice = this.candles[this.candles.length - 1].close;
+      this.log(`Generating initial prediction using last candle at $${lastPrice}`, 'info');
+      this.lastProcessTime = 0; 
+      await this.processPriceUpdate(lastPrice);
+    }
+
     this.connectWebSocket();
   }
 
@@ -615,9 +634,9 @@ export class TradingService {
 
     if (!this.model1h || !this.settings) return;
 
-    // 1. Maintain MTF Candle Buffers
     const nowDate = new Date();
-    const last1h = (this.candles[this.candles.length - 1]?.time || 0) * 1000;
+    const lastCandle = this.candles[this.candles.length - 1];
+    const last1h = (lastCandle?.time || 0) * 1000;
     const last4h = (this.candles4h[this.candles4h.length - 1]?.time || 0) * 1000;
     const nowTs = nowDate.getTime();
 
@@ -625,53 +644,58 @@ export class TradingService {
       await this.fetchInitialData();
     }
 
-    // 2. Generate MTF Predictions
-    const res1hData = this.generateMTFPrediction(this.candles, this.model1h);
-    const res4hData = this.generateMTFPrediction(this.candles4h, this.model4h);
+    // 2. Generate MTF Predictions & DRL Action ONLY on new candles or if first time
+    const currentCandleTime = this.candles[this.candles.length - 1]?.time || 0;
+    const isNewCandle = currentCandleTime > this.lastProcessedCandleTime;
+    
+    if (isNewCandle || !this.lastPrediction) {
+      this.lastProcessedCandleTime = currentCandleTime;
+      
+      const res1hData = this.generateMTFPrediction(this.candles, this.model1h);
+      const res4hData = this.generateMTFPrediction(this.candles4h, this.model4h);
 
-    const res1h = res1hData?.result;
-    const res4h = res4hData?.result;
-    this.lastFeatures = res1hData?.features ? indicators.mapFeaturesToRecord(res1hData.features.slice((20-1)*24)) : null;
+      const res1h = res1hData?.result;
+      const res4h = res4hData?.result;
+      this.lastFeatures = res1hData?.features ? indicators.mapFeaturesToRecord(res1hData.features.slice((20-1)*24)) : null;
 
-    if (res1h) {
-      this.lastVelocity = this.lastPrediction !== null ? res1h.mean.map((p, i) => p - this.lastPrediction![i]) : [0, 0, 0];
-      this.lastPrediction = res1h.mean;
-      this.lastUncertainty = res1h.std;
-    }
-    if (res4h) {
-      this.lastPrediction4h = res4h.mean;
+      if (res1h) {
+        this.lastVelocity = this.lastPrediction !== null ? res1h.mean.map((p, i) => p - this.lastPrediction![i]) : [0, 0, 0];
+        this.lastPrediction = res1h.mean;
+        this.lastUncertainty = res1h.std;
+      }
+      if (res4h) {
+        this.lastPrediction4h = res4h.mean;
+      }
+
+      // Calculate DRL Action if model present
+      this.lastDrlAction = null;
+      if (this.drlModel && res1hData?.features) {
+        this.lastDrlAction = tf.tidy(() => {
+          const pos = this.activeTrade ? this.activeTrade.type : 'NEUTRAL';
+          const state = [...res1hData.features, ...this.encodePosition(pos as any)];
+          const input = tf.tensor2d([state]);
+          const probs = (this.drlModel as tf.LayersModel).predict(input) as tf.Tensor;
+          return probs.argMax(1).dataSync()[0];
+        });
+      }
+
+      this.lastParams = {
+        ...this.lastParams,
+        velocity: this.lastVelocity,
+        session: nowDate.getUTCHours() >= this.settings.asiaStart && nowDate.getUTCHours() < this.settings.asiaEnd ? 'Asia' : 
+                 nowDate.getUTCHours() >= this.settings.nyStart && nowDate.getUTCHours() < this.settings.nyEnd ? 'New York' : 'Off-Session',
+        dayOfWeek: nowDate.getDay(),
+        drlAction: this.lastDrlAction
+      };
+
+      this.log(`MTF Signal Refresh [Candle:${new Date(currentCandleTime * 1000).toISOString()}]: 1h[S:${this.lastPrediction![0].toFixed(2)} L:${this.lastPrediction![1].toFixed(2)}]${this.lastDrlAction !== null ? ` DRL:${this.lastDrlAction}` : ''}`, 'info');
     }
 
     const prediction = this.lastPrediction || [0, 0, 1];
     const prediction4h = this.lastPrediction4h || [0, 0, 1];
     const uncertainty = this.lastUncertainty || [0, 0, 0];
     const velocity = this.lastVelocity || [0, 0, 0];
-
-    // 2.1 Calculate DRL Action if model present
-    let drlAction: number | null = null;
-    if (this.drlModel && res1hData?.features) {
-      drlAction = tf.tidy(() => {
-        const pos = this.activeTrade ? this.activeTrade.type : 'NEUTRAL';
-        const state = [...res1hData.features, ...this.encodePosition(pos as any)];
-        const input = tf.tensor2d([state]);
-        const probs = (this.drlModel as tf.LayersModel).predict(input) as tf.Tensor;
-        return probs.argMax(1).dataSync()[0];
-      });
-    }
-
-    // Logging MTF signals periodically
-    if (this.tickerCount % 20 === 0) {
-      this.log(`MTF Sync: 1h[S:${prediction[0].toFixed(2)} L:${prediction[1].toFixed(2)}] 4h[S:${prediction4h[0].toFixed(2)} L:${prediction4h[1].toFixed(2)}]${drlAction !== null ? ` DRL:${drlAction}` : ''}`);
-    }
-
-    this.lastParams = {
-      ...this.lastParams,
-      velocity: velocity,
-      session: nowDate.getUTCHours() >= this.settings.asiaStart && nowDate.getUTCHours() < this.settings.asiaEnd ? 'Asia' : 
-               nowDate.getUTCHours() >= this.settings.nyStart && nowDate.getUTCHours() < this.settings.nyEnd ? 'New York' : 'Off-Session',
-      dayOfWeek: nowDate.getDay(),
-      drlAction: drlAction
-    };
+    const drlAction = this.lastDrlAction;
 
     // 3. Trading Logic
     if (this.activeTrade) {
