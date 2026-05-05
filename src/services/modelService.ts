@@ -50,27 +50,46 @@ export class GRUModel {
     dropout: number = 0.2, 
     learningRate: number = 0.001
   ) {
-    logger.info(`Building GRU Model (Window: ${this.windowSize}, Features: ${this.featureCount}, Units: ${units}, Dropout: ${dropout}, LR: ${learningRate})...`);
-    const model = tf.sequential();
+    logger.info(`Building Enhanced Attention-GRU Model (Window: ${this.windowSize}, Features: ${this.featureCount}, Units: ${units}, Dropout: ${dropout}, LR: ${learningRate})...`);
     
-    // GRU Layer
-    model.add(tf.layers.gru({
-      units: units,
-      inputShape: [this.windowSize, this.featureCount],
-      returnSequences: true,
-    }));
+    const input = tf.input({ shape: [this.windowSize, this.featureCount] });
     
-    model.add(tf.layers.dropout({ rate: dropout }));
+    // 1. Feature-wise Attention (Variable Selection) with LayerNorm
+    let featureDense = tf.layers.dense({ units: this.featureCount, activation: 'sigmoid', kernelInitializer: 'glorotNormal', biasInitializer: 'ones' }).apply(input) as tf.SymbolicTensor;
+    let weightedInput = tf.layers.multiply().apply([input, featureDense]) as tf.SymbolicTensor;
+    let norm1 = tf.layers.layerNormalization().apply(weightedInput);
 
-    model.add(tf.layers.gru({
-      units: Math.floor(units / 2),
-      returnSequences: false,
-    }));
+    // 2. Temporal GRU Layers (Stacked)
+    let gru1 = tf.layers.gru({
+      units: units,
+      returnSequences: true,
+      dropout: dropout,
+      recurrentDropout: dropout
+    }).apply(norm1) as tf.SymbolicTensor;
     
-    model.add(tf.layers.dropout({ rate: dropout }));
+    let gru2 = tf.layers.gru({
+      units: units,
+      returnSequences: true,
+      dropout: dropout,
+      recurrentDropout: dropout
+    }).apply(gru1) as tf.SymbolicTensor;
+
+    // 3. Self-Attention Layer (Temporal Focus)
+    let attentionScores = tf.layers.dense({ units: units, activation: 'tanh' }).apply(gru2) as tf.SymbolicTensor;
+    let attentionWeights = tf.layers.dense({ units: 1, activation: 'softmax' }).apply(attentionScores) as tf.SymbolicTensor;
+    let attendedSequence = tf.layers.multiply().apply([gru2, attentionWeights]) as tf.SymbolicTensor;
     
-    // Output Layer: Predict Short, Long, or Sideways
-    model.add(tf.layers.dense({ units: 3, activation: 'softmax' }));
+    let pooled = tf.layers.globalAveragePooling1d().apply(attendedSequence) as tf.SymbolicTensor;
+    let norm2 = tf.layers.layerNormalization().apply(pooled);
+
+    // 4. Output Layers with LeakyReLU
+    let dense1 = tf.layers.dense({ units: Math.floor(units / 2) }).apply(norm2) as tf.SymbolicTensor;
+    let leaky1 = tf.layers.leakyReLU().apply(dense1);
+    let drop2 = tf.layers.dropout({ rate: dropout }).apply(leaky1);
+    
+    let output = tf.layers.dense({ units: 3, activation: 'softmax' }).apply(drop2) as tf.SymbolicTensor;
+
+    const model = tf.model({ inputs: input, outputs: output });
 
     model.compile({
       optimizer: tf.train.adam(learningRate),
@@ -79,7 +98,7 @@ export class GRUModel {
     });
 
     this.model = model;
-    logger.success('Model architecture compiled.');
+    logger.success('Enhanced Attention-GRU architecture compiled.');
   }
 
   public async train(
@@ -93,27 +112,52 @@ export class GRUModel {
   ) {
     if (!this.model) await this.buildModel(units, dropout, learningRate);
     
-    const numSamples = data.length / (this.windowSize * this.featureCount);
-    logger.info(`Starting training with ${numSamples} samples for ${epochs} epochs...`);
+    const numLabels = Math.floor(labels.length / 3);
+    const inputSize = this.windowSize * this.featureCount;
+    const numSamples = Math.floor(Math.min(numLabels, data.length / inputSize));
+
+    if (numSamples === 0) {
+      throw new Error('No samples available for training.');
+    }
+
+    const xs = tf.tensor3d(data.slice(0, numSamples * inputSize), [numSamples, this.windowSize, this.featureCount]);
+    const ys = tf.tensor2d(labels.slice(0, numSamples * 3), [numSamples, 3]);
+
+    // Calculate class weights for better balancing
+    const labelData = labels.slice(0, numSamples * 3);
+    let shortCount = 0, longCount = 0, sideCount = 0;
+    for (let i = 0; i < numSamples; i++) {
+        if (labelData[i*3] === 1) shortCount++;
+        else if (labelData[i*3+1] === 1) longCount++;
+        else sideCount++;
+    }
     
-    const xs = tf.tensor3d(data, [numSamples, this.windowSize, this.featureCount]);
-    const ys = tf.tensor2d(labels, [labels.length / 3, 3]);
+    const totalCount = numSamples;
+    const classWeight = {
+        0: (totalCount / (3 * Math.max(1, shortCount))),
+        1: (totalCount / (3 * Math.max(1, longCount))),
+        2: (totalCount / (3 * Math.max(1, sideCount)))
+    };
+
+    logger.info(`Class Weights: Short: ${classWeight[0].toFixed(2)}, Long: ${classWeight[1].toFixed(2)}, Sideways: ${classWeight[2].toFixed(2)}`);
 
     await this.model!.fit(xs, ys, {
       epochs,
-      batchSize: 32,
+      batchSize: 64,
       shuffle: true,
+      validationSplit: 0.2,
+      classWeight,
       callbacks: {
         onEpochEnd: (epoch, logs) => {
           if (logs) {
-            logger.info(`Epoch ${epoch + 1}/${epochs} - loss: ${(logs.loss || 0).toFixed(4)}, acc: ${(logs.acc || 0).toFixed(4)}`);
+            logger.info(`Epoch ${epoch + 1}/${epochs} - loss: ${(logs.loss || 0).toFixed(4)}, val_loss: ${(logs.val_loss || 0).toFixed(4)}, acc: ${(logs.acc || 0).toFixed(4)}`);
           }
           if (onEpochEnd) onEpochEnd(epoch, logs);
         }
       }
     });
 
-    logger.success('Training completed.');
+    logger.success('Enhanced model training completed.');
     xs.dispose();
     ys.dispose();
   }
@@ -382,33 +426,63 @@ export function prepareData(options: DataPreparationOptions) {
     const bbUpperWindow = windowIndices.map(idx => bbUpper[idx]);
     const bbLowerWindow = windowIndices.map(idx => bbLower[idx]);
 
-    const normalize = (arr: number[]) => {
-      const min = Math.min(...arr);
-      const max = Math.max(...arr);
-      return arr.map(v => (max === min ? 0.5 : (v - min) / (max - min)));
-    };
+    const pMin = Math.min(...priceWindow);
+    const pMax = Math.max(...priceWindow);
+    const pRange = pMax - pMin;
 
-    const normPrice = normalize(priceWindow);
+    const normVal = (v: number) => (pRange === 0 ? 0.5 : (v - pMin) / pRange);
+
+    const normPrice = priceWindow.map(normVal);
     const normRsi = rsiWindow.map(v => v / 100);
-    const normEma = normalize(emaWindow);
-    const normBbUpper = normalize(bbUpperWindow);
-    const normBbLower = normalize(bbLowerWindow);
+    const normEma = emaWindow.map(normVal);
+    const normBbUpper = bbUpperWindow.map(normVal);
+    const normBbLower = bbLowerWindow.map(normVal);
 
     const x: number[] = [];
     for (let j = 0; j < windowSize; j++) {
       x.push(normPrice[j], normRsi[j], normEma[j], normBbUpper[j], normBbLower[j]);
       
-      if (macdHistogram) x.push(normalize(windowIndices.map(idx => macdHistogram[idx]))[j]);
-      if (macdLine) x.push(normalize(windowIndices.map(idx => macdLine[idx]))[j]);
-      if (roc) x.push(normalize(windowIndices.map(idx => roc[idx]))[j]);
+      if (macdHistogram) {
+        const histWindow = windowIndices.map(idx => macdHistogram[idx]);
+        const hMin = Math.min(...histWindow);
+        const hMax = Math.max(...histWindow);
+        x.push(hMax === hMin ? 0.5 : (macdHistogram[windowIndices[j]] - hMin) / (hMax - hMin));
+      }
+      if (macdLine) {
+        const lineWindow = windowIndices.map(idx => macdLine[idx]);
+        const lMin = Math.min(...lineWindow);
+        const lMax = Math.max(...lineWindow);
+        x.push(lMax === lMin ? 0.5 : (macdLine[windowIndices[j]] - lMin) / (lMax - lMin));
+      }
+      if (roc) {
+        const rocWindow = windowIndices.map(idx => roc[idx]);
+        const rMin = Math.min(...rocWindow);
+        const rMax = Math.max(...rocWindow);
+        x.push(rMax === rMin ? 0.5 : (roc[windowIndices[j]] - rMin) / (rMax - rMin));
+      }
       if (stochRsi) x.push(stochRsi[windowIndices[j]]);
-      if (atr) x.push(normalize(windowIndices.map(idx => atr[idx]))[j]);
-      if (ema9) x.push(normalize(windowIndices.map(idx => ema9[idx]))[j]);
+      if (atr) {
+        const atrWindow = windowIndices.map(idx => atr[idx]);
+        const aMin = Math.min(...atrWindow);
+        const aMax = Math.max(...atrWindow);
+        x.push(aMax === aMin ? 0.5 : (atr[windowIndices[j]] - aMin) / (aMax - aMin));
+      }
+      if (ema9) x.push(normVal(ema9[windowIndices[j]]));
       if (emaBelow) x.push(emaBelow[windowIndices[j]]);
       if (emaCross) x.push(emaCross[windowIndices[j]]);
-      if (obv) x.push(normalize(windowIndices.map(idx => obv[idx]))[j]);
+      if (obv) {
+        const obvWindow = windowIndices.map(idx => obv[idx]);
+        const oMin = Math.min(...obvWindow);
+        const oMax = Math.max(...obvWindow);
+        x.push(oMax === oMin ? 0.5 : (obv[windowIndices[j]] - oMin) / (oMax - oMin));
+      }
       if (mfi) x.push(mfi[windowIndices[j]] / 100);
-      if (volatility) x.push(normalize(windowIndices.map(idx => volatility[idx]))[j]);
+      if (volatility) {
+        const vWindow = windowIndices.map(idx => volatility[idx]);
+        const vMin = Math.min(...vWindow);
+        const vMax = Math.max(...vWindow);
+        x.push(vMax === vMin ? 0.5 : (volatility[windowIndices[j]] - vMin) / (vMax - vMin));
+      }
       
       if (hourOfDay) {
         const h = hourOfDay[windowIndices[j]];
@@ -513,109 +587,6 @@ export function prepareData(options: DataPreparationOptions) {
       sideways: sidewaysSamples.length
     } 
   };
-}
-
-export class XGBoostModel {
-  private model: any = null;
-  private featureCount: number;
-  public name: string = 'xgboost_parallel';
-
-  constructor(featureCount: number = 24) {
-    this.featureCount = featureCount;
-  }
-
-  public async train(
-    data: number[], 
-    labels: number[],
-    windowSize: number,
-    iterations: number = 100
-  ) {
-    try {
-      const numSamples = labels.length / 3;
-      const inputSize = windowSize * this.featureCount;
-
-      const X: number[][] = [];
-      const y: number[] = [];
-
-      for (let i = 0; i < numSamples; i++) {
-        X.push(data.slice(i * inputSize, (i + 1) * inputSize));
-        const sampleLabels = labels.slice(i * 3, (i + 1) * 3);
-        const labelIndex = sampleLabels.indexOf(1);
-        y.push(labelIndex === -1 ? 2 : labelIndex);
-      }
-
-      logger.info(`Starting XGBoost training with ${numSamples} samples...`);
-      
-      let XGB: any;
-      try {
-        logger.info('Waiting for XGBoost library to load...');
-        
-        // Use dynamic import to ensure it's loaded within the browser context
-        // @ts-ignore
-        const mlxg = await import('ml-xgboost');
-        XGB = mlxg.default || mlxg;
-        
-        // Wait if it's a promise
-        if (XGB && typeof XGB.then === 'function') {
-          XGB = await XGB;
-        }
-
-        if (typeof XGB !== 'function') {
-          if (XGB && XGB.default) XGB = XGB.default;
-        }
-        
-        if (typeof XGB !== 'function') {
-           throw new Error(`XGBoost library loaded but is not a constructor (got ${typeof XGB}). Ensure 'global' and 'process.env' are polyfilled.`);
-        }
-        
-        logger.info('XGBoost library loaded successfully.');
-      } catch (loadErr: any) {
-        logger.error(`Failed to load XGBoost library: ${loadErr.message}`);
-        throw loadErr;
-      }
-
-      logger.info('Initializing XGBoost model instance...');
-      this.model = new XGB({
-        objective: 'multi:softprob',
-        max_depth: 6,
-        eta: 0.1,
-        iterations,
-        num_class: 3,
-        silent: 1
-      });
-
-      logger.info(`Training XGBoost model (iterations: ${iterations})...`);
-      // Use setTimeout to avoid blocking the main thread immediately and let status update
-      await new Promise(resolve => setTimeout(resolve, 100));
-      this.model.train(X, y);
-      logger.success('XGBoost parallel model trained successfully.');
-    } catch (err: any) {
-      logger.error(`Error training XGBoost: ${err.message}`);
-      throw err;
-    }
-  }
-
-  public predictMultiple(features: number[][]): number[][] {
-    if (!this.model) return features.map(() => [0, 0, 1]);
-    try {
-      const results = this.model.predict(features);
-      return results;
-    } catch (err: any) {
-      logger.error(`XGBoost prediction error: ${err.message}`);
-      return features.map(() => [0, 0, 1]);
-    }
-  }
-
-  public predict(features: number[]): number[] {
-    if (!this.model) return [0, 0, 1];
-    try {
-      const results = this.model.predict([features]);
-      return results[0];
-    } catch (err: any) {
-      logger.error(`XGBoost prediction error: ${err.message}`);
-      return [0, 0, 1];
-    }
-  }
 }
 
 export function prepareDRLData(options: DataPreparationOptions): { marketData: number[][], prices: number[] } {

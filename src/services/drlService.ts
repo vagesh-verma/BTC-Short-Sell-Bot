@@ -305,8 +305,8 @@ export class DRLService {
 
   public async saveToLocalStorage(name: string) {
     if (this.actorModel && this.criticModel) {
-      await this.actorModel.save(`localstorage://ppo-actor-${name}`);
-      await this.criticModel.save(`localstorage://ppo-critic-${name}`);
+      await this.actorModel.save(`indexeddb://ppo-actor-${name}`);
+      await this.criticModel.save(`indexeddb://ppo-critic-${name}`);
       localStorage.setItem(`ppo-meta-${name}`, JSON.stringify({
         windowSize: this.windowSize,
         featureCount: this.featureCount
@@ -317,8 +317,8 @@ export class DRLService {
 
   public async loadFromLocalStorage(name: string) {
     try {
-      this.actorModel = await tf.loadLayersModel(`localstorage://ppo-actor-${name}`);
-      this.criticModel = await tf.loadLayersModel(`localstorage://ppo-critic-${name}`);
+      this.actorModel = await tf.loadLayersModel(`indexeddb://ppo-actor-${name}`);
+      this.criticModel = await tf.loadLayersModel(`indexeddb://ppo-critic-${name}`);
       
       this.actorModel.compile({ optimizer: tf.train.adam(this.actorLR), loss: 'categoricalCrossentropy' });
       this.criticModel.compile({ optimizer: tf.train.adam(this.criticLR), loss: 'meanSquaredError' });

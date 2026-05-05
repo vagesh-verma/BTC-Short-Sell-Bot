@@ -130,6 +130,7 @@ export function calculateEMACross(shortEMA: number[], longEMA: number[]) {
       isCross.push(0);
     } else {
       const prevBelow = shortEMA[i - 1] < longEMA[i - 1] ? 1 : 0;
+      // Cross occurs if the "below" state changed
       isCross.push(below !== prevBelow ? 1 : 0);
     }
   }
@@ -197,6 +198,17 @@ export function calculateVolatility(prices: number[], period: number = 20): numb
   return volatility;
 }
 
+export function calculateROC(prices: number[], period: number = 12): number[] {
+  const roc: number[] = new Array(prices.length).fill(0);
+  for (let i = period; i < prices.length; i++) {
+    const prevPrice = prices[i - period];
+    if (prevPrice !== 0) {
+      roc[i] = ((prices[i] - prevPrice) / prevPrice) * 100;
+    }
+  }
+  return roc;
+}
+
 export function calculateBearishHarami(opens: number[], prices: number[]): number[] {
   const result: number[] = new Array(prices.length).fill(0);
   for (let i = 1; i < prices.length; i++) {
@@ -216,7 +228,7 @@ export function calculateMarubozu(opens: number[], highs: number[], lows: number
     const bodySize = Math.abs(prices[i] - opens[i]);
     const totalSize = highs[i] - lows[i];
     if (totalSize > 0 && (bodySize / totalSize) > 0.95) {
-      result[i] = prices[i] > opens[i] ? 1 : -1;
+      result[i] = prices[i] > opens[i] ? 1 : -1; // 1 for bullish, -1 for bearish
     }
   }
   return result;
@@ -230,11 +242,32 @@ export function calculateEngulfing(opens: number[], prices: number[]): number[] 
     const currBearish = prices[i] < opens[i];
     const currBullish = prices[i] > opens[i];
 
+    // Bullish Engulfing
     if (prevBearish && currBullish && opens[i] < prices[i - 1] && prices[i] > opens[i - 1]) {
       result[i] = 1;
-    } else if (prevBullish && currBearish && opens[i] > prices[i - 1] && prices[i] < opens[i - 1]) {
+    }
+    // Bearish Engulfing
+    else if (prevBullish && currBearish && opens[i] > prices[i - 1] && prices[i] < opens[i - 1]) {
       result[i] = -1;
     }
   }
+  return result;
+}
+
+export const FEATURE_NAMES = [
+  'Normalized Price', 'RSI', 'EMA', 'BB Upper', 'BB Lower',
+  'MACD Histogram', 'MACD Line', 'ROC', 'Stochastic RSI', 'ATR',
+  'EMA 9', 'Price < EMA9', 'EMA Cross', 'OBV', 'MFI', 'Volatility',
+  'Hour of Day', 'Is Asia Session', 'Is London Session', 'Is NY Session', 'Day of Week',
+  'Bearish Harami', 'Marubozu', 'Engulfing'
+];
+
+export function mapFeaturesToRecord(features: number[]): Record<string, number> {
+  const result: Record<string, number> = {};
+  FEATURE_NAMES.forEach((name, idx) => {
+    if (idx < features.length) {
+      result[name] = features[idx];
+    }
+  });
   return result;
 }

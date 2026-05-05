@@ -38,7 +38,7 @@ import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
 import { fetchBTCData, Candle } from './services/dataService';
-import { GRUModel, prepareData, prepareDataFromFeatures, XGBoostModel, prepareDRLData } from './services/modelService';
+import { GRUModel, prepareData, prepareDataFromFeatures, prepareDRLData } from './services/modelService';
 import { drlService, TrainingProgress as DRLProgress } from './services/drlService';
 import { runBacktest, BacktestResult, Trade, BacktestSettings } from './services/backtestService';
 import { calculateEMA, calculateRSI, calculateBollingerBands, calculateMACD, calculateStochasticRSI, calculateATR, calculateEMACross, calculateOBV, calculateMFI, calculateVolatility, calculateROC, calculateBearishHarami, calculateMarubozu, calculateEngulfing } from './services/indicatorService';
@@ -64,6 +64,7 @@ const INDICATOR_WARMUP = 500; // Match INDICATOR_BUFFER_SIZE in featureService.t
 
 export default function App() {
   const [candles, setCandles] = useState<Candle[]>([]);
+  const [candles4h, setCandles4h] = useState<Candle[]>([]);
   const [loading, setLoading] = useState(true);
   const [training, setTraining] = useState(false);
   const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(null);
@@ -74,13 +75,14 @@ export default function App() {
   const [drlTrainingLogs, setDrlTrainingLogs] = useState<DRLProgress[]>([]);
   const [drlEpisodes, setDrlEpisodes] = useState<number>(50);
   const [trainingStats1h, setTrainingStats1h] = useState<{total: number, positive: number, negative: number} | null>(null);
+  const [trainingStats4h, setTrainingStats4h] = useState<{total: number, positive: number, negative: number} | null>(null);
   const [predictions, setPredictions] = useState<number[][]>([]);
   const [predictionStats, setPredictionStats] = useState<{total: number, short: number, long: number} | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<{ name: string, type: 'local' | 'github' | 'complete' } | null>(null);
   
   const model1hRef = useRef<GRUModel | null>(null);
-  const xgModelRef = useRef<XGBoostModel | null>(null);
-
+  const model4hRef = useRef<GRUModel | null>(null);
+  
   const [trainingRange, setTrainingRange] = useState({
     start: format(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000), 'yyyy-MM-dd'),
     end: format(new Date(), 'yyyy-MM-dd')
@@ -109,12 +111,8 @@ export default function App() {
   const [settings, setSettings] = useState<BacktestSettings>({
     shortThreshold: 65,
     longThreshold: 65,
-    xgShortThreshold: 65,
-    xgLongThreshold: 65,
     shortExitThreshold: 40,
     longExitThreshold: 40,
-    xgShortExitThreshold: 40,
-    xgLongExitThreshold: 40,
     biasThreshold: 0,
     stopLoss: 0.01, // 1%
     takeProfit: 0.02, // 2%
@@ -209,11 +207,15 @@ export default function App() {
       setGithubConfig(config);
       
       // Auto-sync on load if config is complete
-      if (config.owner && config.repo && config.token) {
+      if (config.owner && config.repo && config.token && config.token.trim() !== '') {
         syncModelsFromGitHub(config).then(updated => {
           setSavedModels(updated);
         }).catch(err => {
-          logger.error(`Initial GitHub sync failed: ${err.message || err}`);
+          if (err.message?.includes('Bad credentials')) {
+            console.warn('GitHub Sync: Invalid token provided.');
+          } else {
+            logger.error(`Initial GitHub sync failed: ${err.message || err}`);
+          }
           console.error('Initial GitHub sync failed:', err);
         });
       }
@@ -224,17 +226,24 @@ export default function App() {
     localStorage.setItem('github_config', JSON.stringify(githubConfig));
     logger.success('GitHub configuration saved.');
     
-    if (githubConfig.owner && githubConfig.repo && githubConfig.token) {
+    if (githubConfig.owner && githubConfig.repo && githubConfig.token && githubConfig.token.trim() !== '') {
       try {
         setLoading(true);
         setStatus('Syncing models from GitHub...');
         const updated = await syncModelsFromGitHub(githubConfig);
         setSavedModels(updated);
-      } catch (err) {
+      } catch (err: any) {
+        if (err.message?.includes('Bad credentials')) {
+          logger.error('Invalid GitHub token. Please check your settings.');
+        } else {
+          logger.error(`GitHub Sync Failed: ${err.message || err}`);
+        }
         console.error(err);
       } finally {
         setLoading(false);
       }
+    } else {
+      logger.info('GitHub configuration saved, but sync skipped due to missing credentials.');
     }
   };
 
@@ -300,10 +309,18 @@ export default function App() {
   useEffect(() => {
     const fetchServerStatus = async () => {
       try {
-        const res = await fetch('/api/status');
+        const res = await fetch('/api/status', {
+          headers: { 'Accept': 'application/json' }
+        });
         if (res.ok) {
-          const data = await res.json();
-          setServerStatus(data);
+          const contentType = res.headers.get('content-type');
+          if (contentType && contentType.includes('application/json')) {
+            const data = await res.json();
+            setServerStatus(data);
+          } else {
+            const text = await res.text();
+            console.warn('Expected JSON response from /api/status, but got:', text.substring(0, 100));
+          }
         }
       } catch (e) {
         console.error('Failed to fetch server status');
@@ -314,28 +331,39 @@ export default function App() {
 
   const fetchStatus = async () => {
     try {
-      const res = await fetch('/api/trading/status');
+      const res = await fetch('/api/trading/status', {
+        headers: { 'Accept': 'application/json' }
+      });
+      const contentType = res.headers.get('content-type');
       if (res.ok) {
-        const data = await res.json();
-        setServerTradingStatus(data);
-        setIsLiveMode(data.isRunning);
-        // Only sync isRealTrading from server if the bot is actually running
-        // This prevents the UI from resetting to "Paper Only" while the bot is stopped
-        if (data.isRunning) {
-          setIsRealTrading(data.isRealTrading);
+        if (contentType && contentType.includes('application/json')) {
+          const data = await res.json();
+          setServerTradingStatus(data);
+          setIsLiveMode(data.isRunning);
+          // Only sync isRealTrading from server if the bot is actually running
+          // This prevents the UI from resetting to "Paper Only" while the bot is stopped
+          if (data.isRunning) {
+            setIsRealTrading(data.isRealTrading);
+          }
+          if (data.lastPrice) setLivePrice(data.lastPrice);
+          if (data.lastPrediction !== null) setLivePrediction(data.lastPrediction);
+          if (data.lastParams) setLiveParams(data.lastParams);
+          if (data.lastUpdate) setLastLiveUpdate(new Date(data.lastUpdate));
+          if (data.closedTrades) setLiveTrades(data.closedTrades);
+          
+          // Sync settings from server on first successful load
+          if (!hasSyncedFromServer.current && data.settings) {
+            setSettings(prev => ({ ...prev, ...data.settings }));
+            hasSyncedFromServer.current = true;
+            logger.info('Trading settings synchronized from server');
+          }
+        } else {
+          const text = await res.text();
+          console.error(`Expected JSON but got ${contentType}. Content: ${text.substring(0, 100)}`);
         }
-        if (data.lastPrice) setLivePrice(data.lastPrice);
-        if (data.lastPrediction !== null) setLivePrediction(data.lastPrediction);
-        if (data.lastParams) setLiveParams(data.lastParams);
-        if (data.lastUpdate) setLastLiveUpdate(new Date(data.lastUpdate));
-        if (data.closedTrades) setLiveTrades(data.closedTrades);
-        
-        // Sync settings from server on first successful load
-        if (!hasSyncedFromServer.current && data.settings) {
-          setSettings(prev => ({ ...prev, ...data.settings }));
-          hasSyncedFromServer.current = true;
-          logger.info('Trading settings synchronized from server');
-        }
+      } else {
+        const text = await res.text();
+        console.error(`Server error ${res.status}: ${text.substring(0, 100)}`);
       }
     } catch (e: any) {
       console.error('Failed to fetch trading status:', e.message || e);
@@ -392,15 +420,33 @@ export default function App() {
         (model1hArtifacts as any).weightData = arrayBufferToBase64(model1hArtifacts.weightData);
       }
 
-      const metadata1h = JSON.parse(localStorage.getItem(`${model1hRef.current.name}_metadata`) || '{"windowSize":20,"featureCount":22}');
+      const metadata1h = JSON.parse(localStorage.getItem(`${model1hRef.current.name}_metadata`) || '{"windowSize":20,"featureCount":24}');
+
+      const body: any = {
+        model1hArtifacts,
+        metadata1h
+      };
+
+      if (model4hRef.current) {
+        const model4hArtifacts = await model4hRef.current.getArtifacts();
+        if (model4hArtifacts.weightData instanceof ArrayBuffer) {
+          (model4hArtifacts as any).weightData = arrayBufferToBase64(model4hArtifacts.weightData);
+        }
+        const metadata4h = JSON.parse(localStorage.getItem(`${model4hRef.current.name}_metadata`) || '{"windowSize":20,"featureCount":24}');
+        body.model4hArtifacts = model4hArtifacts;
+        body.metadata4h = metadata4h;
+      }
+
+      const drlArtifacts = await drlService.getModelArtifacts();
+      if (drlArtifacts && drlArtifacts.weightData instanceof ArrayBuffer) {
+        (drlArtifacts as any).weightData = arrayBufferToBase64(drlArtifacts.weightData);
+      }
+      body.drlArtifacts = drlArtifacts;
 
       const res = await fetch('/api/trading/sync-model', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model1hArtifacts,
-          metadata1h
-        })
+        body: JSON.stringify(body)
       });
 
       if (res.ok) {
@@ -535,57 +581,38 @@ export default function App() {
   const processLiveUpdateRef = useRef<((price: number) => Promise<void>) | null>(null);
 
   const processLiveUpdate = async (price: number) => {
-    if (!model1hRef.current || candles.length < windowSize) return;
+    if (!model1hRef.current || candles.length < windowSize || !model4hRef.current || candles4h.length < windowSize) return;
 
     const now = new Date();
     
-    // 0. Check for completed candle entry if enabled
-    if (settings.useOnlyCompletedCandles && !activeLiveTrade) {
-      const lastCandleTime = candles[candles.length - 1].time;
-      const currentHourStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours()).getTime();
-      if (currentHourStart <= lastCandleTime) {
-        // Still in the same hour as the last candle
-        return;
-      }
-    }
-
-    // 1. Calculate features for 1h model using unified service for bit-perfect alignment
-    const lastCandle = candles[candles.length - 1];
-    const currentCandle: Candle = {
-      time: now.getTime(),
-      open: lastCandle.close,
-      high: Math.max(lastCandle.close, price),
-      low: Math.min(lastCandle.close, price),
-      close: price,
-      volume: 0
-    };
-    const botCandles = [...candles, currentCandle];
-    const x1h = generateFeatureVector(botCandles, indicatorPeriods, windowSize);
-
-    const currentFeatures: Record<string, number> = {};
-    const lastStepStart = (windowSize - 1) * 24;
-    const lastStepFeatures = x1h.slice(lastStepStart);
+    // 1. Calculate 1h Prediction
+    const botCandles1h = [...candles, { time: now.getTime(), close: price, open: candles[candles.length - 1].close, high: Math.max(candles[candles.length - 1].close, price), low: Math.min(candles[candles.length - 1].close, price), volume: 0 }];
+    const x1h = generateFeatureVector(botCandles1h, indicatorPeriods, windowSize);
+    const res1h = model1hRef.current.predictMultiple(x1h, settings.mcPasses);
     
-    FEATURE_NAMES.forEach((name, idx) => {
-      currentFeatures[name] = lastStepFeatures[idx];
-    });
+    // 2. Calculate 4h Prediction
+    const botCandles4h = [...candles4h, { time: now.getTime(), close: price, open: candles4h[candles4h.length - 1].close, high: Math.max(candles4h[candles4h.length - 1].close, price), low: Math.min(candles4h[candles4h.length - 1].close, price), volume: 0 }];
+    const x4h = generateFeatureVector(botCandles4h, indicatorPeriods, windowSize);
+    const res4h = model4hRef.current.predict(x4h);
 
-    const predictionResult = model1hRef.current.predictMultiple(x1h, settings.mcPasses);
-    const prediction = predictionResult.mean;
-    const xgPrediction = xgModelRef.current ? xgModelRef.current.predict(x1h) : [1, 1, 0];
+    const prediction = res1h.mean;
+    const prediction4h = res4h;
     const drlAction = drlService.predict(x1h);
 
     setLivePrediction(prediction);
     setLivePrice(price);
     setLastLiveUpdate(new Date());
 
+    const lastStepStart = (windowSize - 1) * 24;
+    const lastStepFeatures = x1h.slice(lastStepStart);
+    const currentFeatures: Record<string, number> = {};
+    FEATURE_NAMES.forEach((name, idx) => { currentFeatures[name] = lastStepFeatures[idx]; });
+
     setLiveParams({
       rsi: lastStepFeatures[1] * 100,
       ema: lastStepFeatures[2],
       shortProb: prediction[0],
       longProb: prediction[1],
-      xgShortProb: xgPrediction[0],
-      xgLongProb: xgPrediction[1],
       drlAction: drlAction // 0: LONG, 1: SHORT, 2: NEUTRAL
     });
 
@@ -629,9 +656,12 @@ export default function App() {
         } else if (currentTrailingStop && price >= currentTrailingStop) {
           shouldExit = true;
           reason = 'TRAILING_STOP';
-        } else if (prediction[0] * 100 < settings.shortExitThreshold || (xgModelRef.current && xgPrediction[0] * 100 < (settings.xgShortExitThreshold ?? 0))) {
+        } else if (prediction[0] * 100 < settings.shortExitThreshold) {
           shouldExit = true;
           reason = 'PREDICTION';
+        } else if (settings.useDRLOnly && drlAction !== 1) {
+          shouldExit = true;
+          reason = 'PREDICTION'; // DRL reversal
         }
       } else { // LONG
         if (price <= stopLossPrice) {
@@ -643,9 +673,12 @@ export default function App() {
         } else if (currentTrailingStop && price <= currentTrailingStop) {
           shouldExit = true;
           reason = 'TRAILING_STOP';
-        } else if (prediction[1] * 100 < settings.longExitThreshold || (xgModelRef.current && xgPrediction[1] * 100 < (settings.xgLongExitThreshold ?? 0))) {
+        } else if (prediction[1] * 100 < settings.longExitThreshold) {
           shouldExit = true;
           reason = 'PREDICTION';
+        } else if (settings.useDRLOnly && drlAction !== 0) {
+          shouldExit = true;
+          reason = 'PREDICTION'; // DRL reversal
         }
       }
 
@@ -688,6 +721,7 @@ export default function App() {
       const drlAction = drlService.predict(x1h);
       const drlMatchesShort = drlAction === 1; // 1 is SHORT
       const drlMatchesLong = drlAction === 0; // 0 is LONG
+      const mtfThresh = 0.40; // 40% confidence req for 4h signal
 
       let canShort = false;
       let canLong = false;
@@ -696,12 +730,14 @@ export default function App() {
         canShort = drlMatchesShort;
         canLong = drlMatchesLong;
       } else {
+        const mtfThresh = 0.40; // 40% confidence req for 4h trend
+        
         canShort = (prediction[0] * 100 > settings.shortThreshold) && 
-                   (xgPrediction[0] * 100 >= (settings.xgShortThreshold ?? 0)) &&
+                   (prediction4h[0] > mtfThresh) &&
                    (!settings.useDRLConfluence || drlMatchesShort);
         
         canLong = (prediction[1] * 100 > settings.longThreshold) && 
-                  (xgPrediction[1] * 100 >= (settings.xgLongThreshold ?? 0)) &&
+                  (prediction4h[1] > mtfThresh) &&
                   (!settings.useDRLConfluence || drlMatchesLong);
       }
       
@@ -763,7 +799,7 @@ export default function App() {
       return;
     }
     try {
-      await saveModelPair(newModelName, model1hRef.current);
+      await saveModelPair(newModelName, model1hRef.current, model4hRef.current || undefined);
       await drlService.saveToLocalStorage(newModelName);
       setSavedModels(getSavedModelPairs());
       setNewModelName('');
@@ -776,8 +812,11 @@ export default function App() {
     try {
       setLoading(true);
       setStatus(`Loading model "${name}"...`);
-      const { model1h } = await loadModelPair(name);
+      const { model1h, model4h } = await loadModelPair(name);
       model1hRef.current = model1h;
+      if (model4h) {
+        model4hRef.current = model4h;
+      }
       await drlService.loadFromLocalStorage(name);
       setStatus(`Model "${name}" loaded!`);
       // Trigger a re-render to update UI buttons
@@ -837,17 +876,23 @@ export default function App() {
       const endTs = new Date(trainingRange.end).getTime();
       
       // Fetch extra data before the start for indicator stability
-      const fetchStartTs = startTs - (INDICATOR_WARMUP * 60 * 60 * 1000);
+      const fetchStartTs1h = startTs - (INDICATOR_WARMUP * 60 * 60 * 1000);
+      const fetchStartTs4h = startTs - (INDICATOR_WARMUP * 4 * 60 * 60 * 1000);
       
-      const data = await fetchBTCData(0, '1h', fetchStartTs, endTs);
+      setStatus('Fetching BTC/USD Data (1h & 4h)...');
+      const [data1h, data4h] = await Promise.all([
+        fetchBTCData(0, '1h', fetchStartTs1h, endTs),
+        fetchBTCData(0, '4h', fetchStartTs4h, endTs)
+      ]);
       
-      if (data.length === 0) {
+      if (data1h.length === 0 || data4h.length === 0) {
         logger.error('Failed to fetch initial data.');
         throw new Error('Failed to fetch data');
       }
-      setCandles(data);
-      setStatus(`Loaded ${data.length}h candles`);
-      logger.success(`Successfully loaded ${data.length} 1h candles.`);
+      setCandles(data1h);
+      setCandles4h(data4h);
+      setStatus(`Loaded ${data1h.length}h and ${data4h.length} 4h candles`);
+      logger.success(`Successfully loaded historical data.`);
     } catch (err) {
       const msg = 'Error loading BTC data. Please check your connection.';
       setError(msg);
@@ -858,56 +903,52 @@ export default function App() {
     }
   };
 
-  const getPredictionsForRange = async (candles1h: Candle[], m1h: GRUModel, mXG: XGBoostModel | null, mcPasses: number = 1) => {
-    logger.info(`Generating predictions for provided range (MC Passes: ${mcPasses})...`);
+  const getPredictionsForRange = async (candles1h: Candle[], m1h: GRUModel, mcPasses: number = 1, m4h?: GRUModel | null) => {
+    logger.info(`Generating MTF Predictions (MC Passes: ${mcPasses}, MTF Confluence: ${!!m4h})...`);
     
-    const bufferSize = 300; // Match live bot buffer size (increased from 100 for stability)
+    const bufferSize = 300; 
     const generatedPredictions: number[][] = [];
-    const xgGeneratedPredictions: number[][] = [];
     const drlGeneratedActions: number[] = [];
     const generatedUncertainties: number[][] = [];
     const generatedFeatures: number[][] = [];
 
-    // We start from where we have enough data for both the window and the indicator buffer
     const startIdx = Math.max(windowSize, bufferSize);
     
     if (candles1h.length <= startIdx) {
-      logger.warning(`Not enough 1h candles (${candles1h.length}) to generate predictions with buffer ${bufferSize}`);
-      return { predictions: [], uncertainties: [], features: [], xgPredictions: [] };
+      logger.warning(`Not enough candles (${candles1h.length}) for predictions.`);
+      return { predictions: [], uncertainties: [], features: [] };
     }
 
-    const featuresList = generateFeatureSequence(
-      candles1h,
-      indicatorPeriods,
-      windowSize,
-      startIdx,
-      candles1h.length - 1
-    );
+    const featuresList = generateFeatureSequence(candles1h, indicatorPeriods, windowSize, startIdx, candles1h.length - 1);
 
     for (let i = 0; i < featuresList.length; i++) {
       const features = featuresList[i];
       generatedFeatures.push(features);
       
-      // Primary GRU Prediction
-      const result = m1h.predictMultiple(features, mcPasses);
-      generatedPredictions.push(result.mean);
-      generatedUncertainties.push(result.std);
+      const res1h = m1h.predictMultiple(features, mcPasses);
+      let finalPred = res1h.mean;
+      let finalUncert = res1h.std;
 
-      // Parallel XGBoost Prediction
-      if (mXG) {
-        xgGeneratedPredictions.push(mXG.predict(features));
+      // If m4h provided, we perform confluence check. 
+      if (m4h) {
+        const res4h = m4h.predict(features);
+        // Average the probabilities or use one as a filter
+        finalPred = [
+          (finalPred[0] + res4h[0]) / 2,
+          (finalPred[1] + res4h[1]) / 2,
+          (finalPred[2] + res4h[2]) / 2
+        ];
       }
 
-      // Deep Reinforcement Learning Prediction
-      const drlAction = drlService.predict(features);
-      drlGeneratedActions.push(drlAction);
+      generatedPredictions.push(finalPred);
+      generatedUncertainties.push(finalUncert);
+      drlGeneratedActions.push(drlService.predict(features));
     }
 
     return { 
       predictions: generatedPredictions, 
       uncertainties: generatedUncertainties, 
       features: generatedFeatures,
-      xgPredictions: xgGeneratedPredictions,
       drlActions: drlGeneratedActions
     };
   };
@@ -916,123 +957,73 @@ export default function App() {
     if (candles.length < windowSize + 50) return;
     
     setTraining(true);
-    logger.info('--- Starting Training Process ---');
+    logger.info('--- Starting MTF TFT-Lite Training ---');
     setPredictions([]);
     setBacktestResult(null);
     setTrainingLogs([]);
-    setTrainingLogs([]);
     setTrainingStats1h(null);
+    setTrainingStats4h(null);
     
     try {
-      // 1. Fetch data
-      setStatus('Fetching BTC-USD Data (1h)...');
       const startTs = new Date(trainingRange.start).getTime();
       const endTs = new Date(trainingRange.end).getTime() + (24 * 60 * 60 * 1000) - 1;
       
-      logger.info(`Fetching 1h candles from ${trainingRange.start} to ${trainingRange.end}...`);
-      const fetchStartTs = startTs - (INDICATOR_WARMUP * 60 * 60 * 1000);
-      const fetchedCandles = await fetchBTCData(0, '1h', fetchStartTs, endTs);
-      setCandles(fetchedCandles);
+      // 1. Fetch data for both timeframes
+      setStatus('Fetching BTC-USD Data (1h & 4h)...');
+      const fetchStartTs1h = startTs - (INDICATOR_WARMUP * 60 * 60 * 1000);
+      const fetchStartTs4h = startTs - (INDICATOR_WARMUP * 4 * 60 * 60 * 1000);
       
-      // 2. Train Primary 1h Model
-      setStatus('Preparing 1h Training Data (using unified features)...');
-      logger.info('Preparing 1h training data using generateFeatureSequence...');
+      const [fetched1h, fetched4h] = await Promise.all([
+        fetchBTCData(0, '1h', fetchStartTs1h, endTs),
+        fetchBTCData(0, '4h', fetchStartTs4h, endTs)
+      ]);
+      setCandles(fetched1h);
+      setCandles4h(fetched4h);
       
-      const startIdx = INDICATOR_WARMUP;
-      const featuresList = generateFeatureSequence(
-        fetchedCandles,
-        indicatorPeriods,
-        windowSize,
-        startIdx,
-        fetchedCandles.length - 1
-      );
-
-      const data1h = prepareDataFromFeatures(fetchedCandles, featuresList, {
-        dropThreshold,
-        longThreshold,
-        maxLookahead: settings.maxDurationHours,
-        startIndex: startIdx,
-        windowSize
-      });
-      
+      // 2. Train Primary 1h Model (Trend)
+      setStatus('Training 1h Trend Model (TFT-Lite)...');
+      const startIdx1h = INDICATOR_WARMUP;
+      const features1h = generateFeatureSequence(fetched1h, indicatorPeriods, windowSize, startIdx1h, fetched1h.length - 1);
+      const data1h = prepareDataFromFeatures(fetched1h, features1h, { dropThreshold, longThreshold, maxLookahead: settings.maxDurationHours, startIndex: startIdx1h, windowSize });
       setTrainingStats1h(data1h.stats);
       
-      const featureCount1h = 24;
-      const model1h = new GRUModel(windowSize, featureCount1h, 'temp_1h');
-      localStorage.setItem('temp_1h_metadata', JSON.stringify({ windowSize, featureCount: featureCount1h }));
-      setStatus(`Building Deep GRU Architecture (${featureCount1h} Features)...`);
+      const model1h = new GRUModel(windowSize, 24, 'model_1h');
       await model1h.buildModel(modelHyperparams.units, modelHyperparams.dropout, modelHyperparams.learningRate);
-      
-      setStatus(`Training Model (${epochs} Epochs)...`);
-      logger.info(`Training model for ${epochs} epochs...`);
-      await model1h.train(data1h.xs, data1h.ys, epochs, modelHyperparams.units, modelHyperparams.dropout, modelHyperparams.learningRate, (epoch, logs) => {
-        if (logs) {
-          setTrainingLogs(prev => [...prev, { 
-            epoch: epoch + 1, 
-            loss: logs.loss, 
-            acc: logs.acc 
-          }]);
-        }
-      });
+      await model1h.train(data1h.xs, data1h.ys, epochs, modelHyperparams.units, modelHyperparams.dropout, modelHyperparams.learningRate);
       model1hRef.current = model1h;
-      
-      // 3. Train Parallel XGBoost Model
-      setStatus('Training Parallel XGBoost Model...');
-      const xgModel = new XGBoostModel(featureCount1h);
-      await xgModel.train(data1h.xs, data1h.ys, windowSize, 100);
-      xgModelRef.current = xgModel;
 
-      // 4. Train DRL Agent
-      setStatus('Training DRL Agent (PPO)...');
-      setDrlTrainingLogs([]);
-      drlService.initialize(windowSize, featureCount1h);
-      const drlData = {
-        marketData: featuresList,
-        prices: fetchedCandles.slice(startIdx).map(c => c.close)
-      };
+      // 3. Train 4h Signal Model (Execution)
+      setStatus('Training 4h Signal Model (TFT-Lite)...');
+      const startIdx4h = INDICATOR_WARMUP;
+      const features4h = generateFeatureSequence(fetched4h, indicatorPeriods, windowSize, startIdx4h, fetched4h.length - 1);
+      const data4h = prepareDataFromFeatures(fetched4h, features4h, { dropThreshold, longThreshold, maxLookahead: Math.max(1, Math.floor(settings.maxDurationHours / 4)), startIndex: startIdx4h, windowSize });
+      setTrainingStats4h(data4h.stats);
       
-      await drlService.train(
-        drlData.marketData,
-        drlData.prices,
-        drlEpisodes,
-        (progress) => {
-          setDrlTrainingLogs(prev => [...prev, progress]);
-          setStatus(`DRL Training Episode ${progress.episode}/${drlEpisodes}...`);
-        }
-      );
+      const model4h = new GRUModel(windowSize, 24, 'model_4h');
+      await model4h.buildModel(modelHyperparams.units, modelHyperparams.dropout, modelHyperparams.learningRate);
+      await model4h.train(data4h.xs, data4h.ys, epochs, modelHyperparams.units, modelHyperparams.dropout, modelHyperparams.learningRate);
+      model4hRef.current = model4h;
+      
+      // 4. Train DRL Agent on fused features (simplified for MTF)
+      setStatus('Training DRL Agent (MTF Confluence)...');
+      drlService.initialize(windowSize, 24);
+      await drlService.train(features1h, fetched1h.slice(startIdx1h).map(c => c.close), drlEpisodes, (progress) => {
+        setDrlTrainingLogs(prev => [...prev, progress]);
+      });
 
-      setStatus('Generating Final Predictions...');
+      setStatus('Generating MTF Confluence Signals...');
       const { 
         predictions: generatedPredictions, 
         features: generatedFeatures,
-        xgPredictions: generatedXgPredictions,
         drlActions: drlGeneratedActions
-      } = await getPredictionsForRange(fetchedCandles, model1h, xgModel, settings.mcPasses);
+      } = await getPredictionsForRange(fetched1h, model1h, settings.mcPasses, model4h);
       
       setPredictions(generatedPredictions);
-      // Store XG predictions in a ref or state if needed for UI, but backtest logic will consume it
-      (window as any).lastXgPredictions = generatedXgPredictions;
-
-      const shortCount = generatedPredictions.filter((p, idx) => 
-        p && (p[0] * 100 > settings.shortThreshold) && 
-        (!generatedXgPredictions[idx] || (generatedXgPredictions[idx][0] * 100 >= (settings.xgShortThreshold ?? 0)))
-      ).length;
+      setStatus('MTF Models trained! Running backtest...');
       
-      const longCount = generatedPredictions.filter((p, idx) => 
-        p && (p[1] * 100 > settings.longThreshold) && 
-        (!generatedXgPredictions[idx] || (generatedXgPredictions[idx][1] * 100 >= (settings.xgLongThreshold ?? 0)))
-      ).length;
-
-      setPredictionStats({ total: generatedPredictions.length, short: shortCount, long: longCount });
-      setStatus('Models trained! Ready for backtest.');
-      logger.success(`Predictions generated. ${shortCount} dual-confluence signals found.`);
-      
-      // Auto-run initial backtest
-      logger.info('Running initial backtest...');
-      const realBufferSize = INDICATOR_WARMUP;
-      const btStartIdx = Math.max(windowSize, realBufferSize);
+      const btStartIdx = Math.max(windowSize, INDICATOR_WARMUP);
       const result = runBacktest(
-        fetchedCandles, 
+        fetched1h, 
         generatedPredictions, 
         { ...settings, labelDropThreshold: dropThreshold, labelLongThreshold: longThreshold }, 
         10000, 
@@ -1040,16 +1031,13 @@ export default function App() {
         generatedFeatures, 
         FEATURE_NAMES,
         undefined,
-        generatedXgPredictions,
         drlGeneratedActions
       );
       setBacktestResult(result);
-      logger.success('--- Training and Backtest Complete ---');
+      logger.success('--- MTF Training and Backtest Complete ---');
     } catch (err: any) {
-      const msg = err.message || 'Error during training';
-      setError(msg);
-      logger.error(`Training failed: ${msg}`);
-      console.error(err);
+      setError(err.message || 'Error during MTF training');
+      logger.error(`MTF Training failed: ${err.message}`);
     } finally {
       setTraining(false);
     }
@@ -1087,9 +1075,8 @@ export default function App() {
         predictions: btPredictions, 
         uncertainties: btUncertainties,
         features: btFeatures,
-        xgPredictions: btXgPredictions,
         drlActions: btDrlActions
-      } = await getPredictionsForRange(btCandles1h, model1hRef.current, xgModelRef.current, settings.mcPasses);
+      } = await getPredictionsForRange(btCandles1h, model1hRef.current, settings.mcPasses, model4hRef.current);
       logger.info(`Generated ${btPredictions.length} predictions.`);
 
       setStatus('Running Backtest (1h)...');
@@ -1108,7 +1095,6 @@ export default function App() {
         btFeatures, 
         FEATURE_NAMES, 
         btUncertainties,
-        btXgPredictions,
         btDrlActions
       );
       
@@ -1144,7 +1130,6 @@ export default function App() {
     if (!backtestResult) return [];
     return backtestResult.candles.map((c, i) => {
       const pred = backtestResult.predictions[i] || [0, 0, 1];
-      const xgPred = (backtestResult.xgPredictions && backtestResult.xgPredictions[i]) || [0, 0, 1];
       const drlAct = (backtestResult.drlActions && backtestResult.drlActions[i]) !== undefined 
         ? backtestResult.drlActions[i] 
         : 2; // Default to neutral/2 if missing
@@ -1159,8 +1144,6 @@ export default function App() {
         shortProb: parseFloat((pred[0] * 100).toFixed(2)),
         longProb: parseFloat((pred[1] * 100).toFixed(2)),
         sideProb: parseFloat((pred[2] * 100).toFixed(2)),
-        xgShort: parseFloat((xgPred[0] * 100).toFixed(2)),
-        xgLong: parseFloat((xgPred[1] * 100).toFixed(2)),
         drl: drlPlot
       };
     });
@@ -1598,48 +1581,25 @@ export default function App() {
                   </div>
                     <div className="grid grid-cols-2 gap-4 pt-2 border-t border-white/5">
                       <div className="space-y-1.5">
-                        <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">GRU Short Entry</label>
+                        <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Short Entry</label>
                         <input type="number" step="0.01" value={isNaN(settings.shortThreshold) ? '' : settings.shortThreshold} onChange={(e) => setSettings({...settings, shortThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
                       </div>
                       <div className="space-y-1.5">
-                        <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">GRU Short Exit</label>
+                        <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Short Exit</label>
                         <input type="number" step="0.01" value={isNaN(settings.shortExitThreshold) ? '' : settings.shortExitThreshold} onChange={(e) => setSettings({...settings, shortExitThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
                       </div>
                     </div>
                     <div className="grid grid-cols-2 gap-4 pt-2 border-t border-white/5">
                       <div className="space-y-1.5">
-                        <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">GRU Long Entry</label>
+                        <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Long Entry</label>
                         <input type="number" step="0.01" value={isNaN(settings.longThreshold) ? '' : settings.longThreshold} onChange={(e) => setSettings({...settings, longThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
                       </div>
                       <div className="space-y-1.5">
-                        <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">GRU Long Exit</label>
+                        <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Long Exit</label>
                         <input type="number" step="0.01" value={isNaN(settings.longExitThreshold) ? '' : settings.longExitThreshold} onChange={(e) => setSettings({...settings, longExitThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
                       </div>
                     </div>
 
-                    <div className="pt-4 mt-2 border-t border-white/10">
-                      <h4 className="text-[10px] text-amber-400/80 uppercase font-black tracking-widest mb-3">Parallel XGBoost (Confluence)</h4>
-                      <div className="grid grid-cols-2 gap-4">
-                        <div className="space-y-1.5">
-                          <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">XG Short Entry</label>
-                          <input type="number" step="1" value={isNaN(settings.xgShortThreshold ?? 0) ? '' : settings.xgShortThreshold} onChange={(e) => setSettings({...settings, xgShortThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">XG Short Exit</label>
-                          <input type="number" step="1" value={isNaN(settings.xgShortExitThreshold ?? 0) ? '' : settings.xgShortExitThreshold} onChange={(e) => setSettings({...settings, xgShortExitThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
-                        </div>
-                      </div>
-                      <div className="grid grid-cols-2 gap-4 pt-2">
-                        <div className="space-y-1.5">
-                          <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">XG Long Entry</label>
-                          <input type="number" step="1" value={isNaN(settings.xgLongThreshold ?? 0) ? '' : settings.xgLongThreshold} onChange={(e) => setSettings({...settings, xgLongThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">XG Long Exit</label>
-                          <input type="number" step="1" value={isNaN(settings.xgLongExitThreshold ?? 0) ? '' : settings.xgLongExitThreshold} onChange={(e) => setSettings({...settings, xgLongExitThreshold: parseFloat(e.target.value)})} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-amber-500/50" />
-                        </div>
-                      </div>
-                    </div>
                   <div className="grid grid-cols-2 gap-4 pt-2 border-t border-white/5">
                     <div className="space-y-1.5">
                       <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Bias (Diff) Thr.</label>
@@ -1812,8 +1772,8 @@ export default function App() {
                         </span>
                       </div>
                     )}
-                     <span className="text-[10px] text-white/20 font-mono">XG:{settings.xgShortThreshold}%</span>
-                     <span className="text-[10px] text-white/20 font-mono">GRU:{settings.shortThreshold}%</span>
+                     <span className="text-[10px] text-white/20 font-mono">Thr:{settings.shortThreshold}%</span>
+
                   </div>
                 </div>
               )}
@@ -1943,8 +1903,7 @@ export default function App() {
                         <Line yAxisId="left" type="monotone" dataKey="price" stroke="#3b82f6" dot={false} strokeWidth={2} />
                         <Line yAxisId="right" type="monotone" dataKey="shortProb" stroke="#ef4444" dot={false} strokeWidth={1} name="GRU Short %" />
                         <Line yAxisId="right" type="monotone" dataKey="longProb" stroke="#10b981" dot={false} strokeWidth={1} name="GRU Long %" />
-                        <Line yAxisId="right" type="monotone" dataKey="xgShort" stroke="#f87171" dot={false} strokeWidth={1} strokeDasharray="5 5" name="XG Short %" />
-                        <Line yAxisId="right" type="monotone" dataKey="xgLong" stroke="#34d399" dot={false} strokeWidth={1} strokeDasharray="5 5" name="XG Long %" />
+
                         <Line yAxisId="right" type="stepAfter" dataKey="drl" stroke="#a855f7" dot={false} strokeWidth={2} name="DRL Action" />
                       </LineChart>
                     </ResponsiveContainer>

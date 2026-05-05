@@ -1,4 +1,5 @@
 import express from "express";
+import * as tf from '@tensorflow/tfjs';
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import crypto from "crypto";
@@ -15,7 +16,25 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 
 app.use(express.json({ limit: '50mb' }));
 
+// Logging middleware for API routes
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api')) {
+    console.log(`[Server] ${req.method} ${req.path}`);
+  }
+  next();
+});
+
 // Trading API Endpoints
+app.get("/api/trading/status", (req, res) => {
+  try {
+    const status = tradingService.getStatus();
+    res.json(status);
+  } catch (err: any) {
+    console.error("Failed to get trading status:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/api/trading/start", async (req, res) => {
   const { settings, isRealTrading, indicatorPeriods } = req.body;
   if (indicatorPeriods) {
@@ -50,21 +69,27 @@ app.post("/api/trading/mode", async (req, res) => {
   res.json({ success: true });
 });
 
-app.get("/api/trading/status", (req, res) => {
-  try {
-    const status = tradingService.getStatus();
-    res.json(status);
-  } catch (err: any) {
-    console.error("Failed to get trading status:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 app.post("/api/trading/sync-model", async (req, res) => {
   try {
-    const { model1hArtifacts, metadata1h } = req.body;
+    const { model1hArtifacts, metadata1h, model4hArtifacts, metadata4h, drlArtifacts } = req.body;
     const model1h = await GRUModel.loadFromArtifacts(model1hArtifacts, metadata1h);
-    tradingService.setModels(model1h);
+    let model4h = null;
+    if (model4hArtifacts && metadata4h) {
+      model4h = await GRUModel.loadFromArtifacts(model4hArtifacts, metadata4h);
+    }
+
+    let drlModel = null;
+    if (drlArtifacts) {
+      if (typeof drlArtifacts.weightData === 'string') {
+        const buffer = Buffer.from(drlArtifacts.weightData, 'base64');
+        drlArtifacts.weightData = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+      }
+      drlModel = await tf.loadLayersModel({
+        load: () => Promise.resolve(drlArtifacts)
+      });
+    }
+    
+    tradingService.setModels(model1h, model4h || undefined, drlModel || undefined);
     res.json({ success: true });
   } catch (err: any) {
     console.error("Model sync failed:", err);
@@ -158,6 +183,15 @@ app.get("/api/auth/websocket", (req, res) => {
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// Global Error Handler for API routes
+app.use("/api", (err: any, req: any, res: any, next: any) => {
+  console.error("[Server] Unhandled API Error:", err);
+  res.status(500).json({ 
+    error: err.message || "Internal Server Error",
+    path: req.path
+  });
 });
 
 async function logServerInfo() {

@@ -1,4 +1,5 @@
 import WebSocket from 'ws';
+import * as tf from '@tensorflow/tfjs';
 import { GRUModel } from './modelService';
 import * as indicators from './indicatorService';
 import fetch from 'node-fetch';
@@ -44,6 +45,8 @@ interface TradingSettings {
     mfi: number;
     volatility: number;
   };
+  useDRLConfluence?: boolean;
+  useDRLOnly?: boolean;
 }
 
 interface ActiveTrade {
@@ -94,13 +97,18 @@ export class TradingService {
   private isOpeningTrade: boolean = false;
   private settings: TradingSettings | null = null;
   private model1h: GRUModel | null = null;
+  private model4h: GRUModel | null = null;
+  private drlModel: tf.LayersModel | null = null;
   private ws: WebSocket | null = null;
   private candles: any[] = [];
+  private candles4h: any[] = [];
   private activeTrade: ActiveTrade | null = null;
   private closedTrades: ClosedTrade[] = [];
   private lastPrediction: number[] | null = null;
+  private lastPrediction4h: number[] | null = null;
   private previousPrediction: number[] | null = null;
   private lastPredictionTime: number = 0;
+  private lastPredictionTime4h: number = 0;
   private lastUncertainty: number[] = [0, 0, 0];
   private lastVelocity: number[] = [0, 0, 0];
   private lastPrice: number | null = null;
@@ -293,9 +301,11 @@ export class TradingService {
     this.log('Stopped Live Trading', 'warning');
   }
 
-  public setModels(model1h: GRUModel) {
+  public setModels(model1h: GRUModel, model4h?: GRUModel, drlModel?: tf.LayersModel) {
     this.model1h = model1h;
-    this.log('Model updated on server', 'success');
+    if (model4h) this.model4h = model4h;
+    if (drlModel) this.drlModel = drlModel;
+    this.log('MTF 1h/4h and DRL Models updated on server', 'success');
   }
 
   public getStatus() {
@@ -305,12 +315,14 @@ export class TradingService {
       activeTrade: this.activeTrade,
       closedTrades: this.closedTrades.slice(0, 50),
       lastPrediction: this.lastPrediction,
+      lastPrediction4h: this.lastPrediction4h,
       lastPrice: this.lastPrice,
       lastFeatures: this.lastFeatures,
       lastParams: this.lastParams,
       lastUpdate: this.lastUpdate,
       logs: this.logs.slice(0, 20),
       hasModels: !!this.model1h,
+      has4hModel: !!this.model4h,
       settings: this.settings,
       dailyProfit: this.dailyProfit
     };
@@ -329,57 +341,66 @@ export class TradingService {
 
   private async fetchInitialData() {
     try {
-      this.log('Fetching initial candle data with batches...');
-      const endTs = Date.now();
-      const startMs = endTs - (30 * 24 * 60 * 60 * 1000); // 30 days
-      const secondsPerCandle = 3600; // 1h
+      this.log('Fetching initial candle data (MTF 1h & 4h)...');
       
-      let allCandles: any[] = [];
-      let currentEnd = Math.floor(endTs / 1000);
-      let targetStart = Math.floor(startMs / 1000);
-      let symbol = 'BTCUSD';
-      let remaining = 1000; // Fetch up to 1000 candles to be safe
-      
-      while (remaining > 0 && currentEnd > targetStart) {
-        const batchSize = Math.min(remaining, 500);
-        let batchStart = currentEnd - (batchSize * secondsPerCandle);
-        if (batchStart < targetStart) batchStart = targetStart;
+      const fetchTimeframe = async (resolution: string, days: number) => {
+        const endTs = Date.now();
+        const startMs = endTs - (days * 24 * 60 * 60 * 1000);
+        const secondsPerCandle = resolution === '1h' ? 3600 : (resolution === '4h' ? 14400 : 900);
         
-        const url = `https://api.india.delta.exchange/v2/history/candles?symbol=${symbol}&resolution=1h&start=${batchStart}&end=${currentEnd}`;
-        const res = await fetch(url);
-        const data = await res.json() as any;
+        let candles: any[] = [];
+        let currentEnd = Math.floor(endTs / 1000);
+        let targetStart = Math.floor(startMs / 1000);
+        let symbol = 'BTCUSD';
         
-        if (!data.result || data.result.length === 0) {
-          if (symbol === 'BTCUSD') {
-            symbol = 'BTCUSD_P';
-            continue; // Retry batch with different symbol
-          }
-          break;
-        }
-        
-        const batch = data.result;
-        allCandles = [...batch, ...allCandles];
-        remaining -= batch.length;
-        
-        const oldestInBatch = Math.min(...batch.map((c: any) => c.time));
-        currentEnd = oldestInBatch - secondsPerCandle;
-      }
-      
-      // Sort and unique
-      this.candles = allCandles
-        .map(d => ({
-          time: d.time,
-          open: parseFloat(d.open),
-          high: parseFloat(d.high),
-          low: parseFloat(d.low),
-          close: parseFloat(d.close),
-          volume: parseFloat(d.volume)
-        }))
-        .sort((a, b) => a.time - b.time)
-        .filter((c, i, self) => i === 0 || c.time !== self[i-1].time);
+        const maxSamples = 1000;
+        let fetchedCount = 0;
 
+        while (fetchedCount < maxSamples && currentEnd > targetStart) {
+          const batchSize = Math.min(maxSamples - fetchedCount, 500);
+          let batchStart = currentEnd - (batchSize * secondsPerCandle);
+          if (batchStart < targetStart) batchStart = targetStart;
+          
+          const url = `https://api.india.delta.exchange/v2/history/candles?symbol=${symbol}&resolution=${resolution}&start=${batchStart}&end=${currentEnd}`;
+          const res = await fetch(url);
+          const data = await res.json() as any;
+          
+          if (!data.result || data.result.length === 0) {
+            if (symbol === 'BTCUSD') {
+              symbol = 'BTCUSD_P';
+              continue;
+            }
+            break;
+          }
+          
+          candles = [...data.result, ...candles];
+          fetchedCount += data.result.length;
+          const oldestInBatch = Math.min(...data.result.map((c: any) => c.time));
+          currentEnd = oldestInBatch - secondsPerCandle;
+        }
+
+        return candles
+          .map(d => ({
+            time: d.time,
+            open: parseFloat(d.open),
+            high: parseFloat(d.high),
+            low: parseFloat(d.low),
+            close: parseFloat(d.close),
+            volume: parseFloat(d.volume)
+          }))
+          .sort((a, b) => a.time - b.time)
+          .filter((c, i, self) => i === 0 || c.time !== self[i-1].time);
+      };
+
+      const [c1h, c4h] = await Promise.all([
+        fetchTimeframe('1h', 30),
+        fetchTimeframe('4h', 60)
+      ]);
+
+      this.candles = c1h;
+      this.candles4h = c4h;
       this.lastRefreshTime = Date.now();
-      this.log(`Loaded ${this.candles.length} historical 1h candles.`);
+      this.log(`Loaded ${this.candles.length}h and ${this.candles4h.length} 4h historical candles.`);
     } catch (err) {
       this.log(`Error fetching initial data: ${err}`, 'error');
     }
@@ -498,224 +519,158 @@ export class TradingService {
     });
   }
 
+  private encodePosition(pos: 'LONG' | 'SHORT' | 'NEUTRAL'): number[] {
+    if (pos === 'LONG') return [1, 0, 0];
+    if (pos === 'SHORT') return [0, 1, 0];
+    return [0, 0, 1];
+  }
+
+  private generateMTFPrediction(candles: any[], model: GRUModel | null) {
+    if (!model || candles.length < 300) return null;
+    
+    const bufferSize = 300;
+    const windowSize = 20;
+    const context = candles.slice(candles.length - bufferSize);
+    
+    const p = context.map(c => c.close);
+    const h = context.map(c => c.high);
+    const l = context.map(c => c.low);
+    const v = context.map(c => c.volume);
+    const o = context.map(c => c.open);
+    
+    const periods = this.settings?.indicatorPeriods || { rsi: 14, ema: 20, ema9: 9, bb: 20, mfi: 14, volatility: 20 };
+    const rsi = indicators.calculateRSI(p, periods.rsi);
+    const ema = indicators.calculateEMA(p, periods.ema);
+    const ema9 = indicators.calculateEMA(p, periods.ema9);
+    const bb = indicators.calculateBollingerBands(p, periods.bb);
+    const macd = indicators.calculateMACD(p);
+    const stochRsi = indicators.calculateStochasticRSI(rsi);
+    const atr = indicators.calculateATR(h, l, p);
+    const cross = indicators.calculateEMACross(ema9, ema);
+    const obv = indicators.calculateOBV(p, v);
+    const mfi = indicators.calculateMFI(h, l, p, v, periods.mfi);
+    const vol = indicators.calculateVolatility(p, periods.volatility);
+    const roc = indicators.calculateROC(p, 12);
+    const harami = indicators.calculateBearishHarami(o, p);
+    const marubozu = indicators.calculateMarubozu(o, h, l, p);
+    const engulfing = indicators.calculateEngulfing(o, p);
+
+    const x: number[] = [];
+    const winIdx = Array.from({ length: windowSize }, (_, k) => bufferSize - windowSize + k);
+    
+    const pWin = winIdx.map(idx => p[idx]);
+    const pMin = Math.min(...pWin);
+    const pMax = Math.max(...pWin);
+    const pRange = pMax - pMin;
+    const normVal = (v: number) => (pRange === 0 ? 0.5 : (v - pMin) / pRange);
+
+    const np = pWin.map(normVal);
+    const nr = winIdx.map(idx => rsi[idx] / 100);
+    const ne = winIdx.map(idx => ema[idx]).map(normVal);
+    const nu = winIdx.map(idx => bb.upper[idx]).map(normVal);
+    const nl = winIdx.map(idx => bb.lower[idx]).map(normVal);
+    
+    const normalizeLocal = (nums: number[]) => {
+      const min = Math.min(...nums);
+      const max = Math.max(...nums);
+      return nums.map(v => (max === min ? 0.5 : (v - min) / (max - min)));
+    };
+
+    const nm = normalizeLocal(winIdx.map(idx => macd.histogram[idx]));
+    const nml = normalizeLocal(winIdx.map(idx => macd.macdLine[idx]));
+    const nroc = normalizeLocal(winIdx.map(idx => roc[idx]));
+    const nas = normalizeLocal(winIdx.map(idx => atr[idx]));
+    const ne9 = winIdx.map(idx => ema9[idx]).map(normVal);
+    const nobv = normalizeLocal(winIdx.map(idx => obv[idx]));
+    const nvol = normalizeLocal(winIdx.map(idx => vol[idx]));
+
+    for (let j = 0; j < windowSize; j++) {
+      const t = new Date(context[winIdx[j]].time * 1000);
+      const hour = t.getUTCHours();
+      x.push(
+        np[j], nr[j], ne[j], nu[j], nl[j],
+        nm[j], nml[j], nroc[j], stochRsi[winIdx[j]], nas[j],
+        ne9[j], cross.isBelow[winIdx[j]], cross.isCross[winIdx[j]],
+        nobv[j], mfi[winIdx[j]] / 100, nvol[j],
+        hour / 24, hour >= 0 && hour <= 9 ? 1 : 0, hour >= 8 && hour <= 17 ? 1 : 0, hour >= 13 && hour <= 22 ? 1 : 0, t.getUTCDay() / 7,
+        harami[winIdx[j]], marubozu[winIdx[j]], engulfing[winIdx[j]]
+      );
+    }
+    const result = model.predictMultiple(x, this.settings?.mcPasses || 1);
+    return { result, features: x };
+  }
+
   private async processPriceUpdate(price: number) {
     if (!this.isRunning) return;
     
     const nowMs = Date.now();
-    if (nowMs - this.lastProcessTime < this.processInterval) {
-      return;
-    }
+    if (nowMs - this.lastProcessTime < this.processInterval) return;
     this.lastProcessTime = nowMs;
 
-    // Reload settings to ensure we use the latest threshold
     this.loadSettings();
     this.checkDailyReset();
 
-    if (this.lastPrice === null) {
-      this.log(`First price received: $${price}`, 'success');
-    }
     this.lastPrice = price;
     this.lastUpdate = new Date();
 
-    if (!this.model1h || !this.settings) {
-      if (this.tickerCount % 100 === 0) {
-        this.log(`Waiting for model/settings. Model: ${!!this.model1h}, Settings: ${!!this.settings}`, 'warning');
-      }
-      return;
-    }
+    if (!this.model1h || !this.settings) return;
 
-    // Check if we need to update candles (every hour)
+    // 1. Maintain MTF Candle Buffers
     const nowDate = new Date();
-    if (this.candles.length > 0) {
-      const lastCandleTime = this.candles[this.candles.length - 1].time * 1000;
-      const oneHourMs = 60 * 60 * 1000;
-      const timeSinceLastCandle = nowDate.getTime() - lastCandleTime;
-      const timeSinceLastRefresh = nowDate.getTime() - this.lastRefreshTime;
+    const last1h = (this.candles[this.candles.length - 1]?.time || 0) * 1000;
+    const last4h = (this.candles4h[this.candles4h.length - 1]?.time || 0) * 1000;
+    const nowTs = nowDate.getTime();
 
-      // Only refresh if:
-      // 1. More than an hour has passed since the last candle started
-      // 2. We haven't tried refreshing in the last 2 minutes (to avoid spamming if the exchange is slow to finalize)
-      if (timeSinceLastCandle >= oneHourMs && timeSinceLastRefresh >= 2 * 60 * 1000) {
-        this.log('New hour detected, refreshing candles...');
-        await this.fetchInitialData();
-      }
+    if (nowTs - last1h >= 3600000 || nowTs - last4h >= 14400000) {
+      await this.fetchInitialData();
     }
 
-    // 1. Get completed candles
-    const nowSeconds = Math.floor(Date.now() / 1000);
-    const completed1h = this.candles.filter(c => c.time + 3600 <= nowSeconds);
+    // 2. Generate MTF Predictions
+    const res1hData = this.generateMTFPrediction(this.candles, this.model1h);
+    const res4hData = this.generateMTFPrediction(this.candles4h, this.model4h);
 
-    const windowSize = 20;
-    if (completed1h.length < windowSize) {
-      if (this.tickerCount % 100 === 0) {
-        this.log(`Insufficient data: 1h=${completed1h.length}`, 'warning');
-      }
-      return;
+    const res1h = res1hData?.result;
+    const res4h = res4hData?.result;
+    this.lastFeatures = res1hData?.features ? indicators.mapFeaturesToRecord(res1hData.features.slice((20-1)*24)) : null;
+
+    if (res1h) {
+      this.lastVelocity = this.lastPrediction !== null ? res1h.mean.map((p, i) => p - this.lastPrediction![i]) : [0, 0, 0];
+      this.lastPrediction = res1h.mean;
+      this.lastUncertainty = res1h.std;
     }
-
-    const lastCompleted1hTime = completed1h[completed1h.length - 1].time;
-    
-    // Only recalculate prediction when a new hour is finalized
-    if (lastCompleted1hTime !== this.lastPredictionTime) {
-      this.log(`New hour finalized: ${new Date(lastCompleted1hTime * 1000).toISOString()}. Calculating prediction...`);
-
-      const normalize = (arr: number[]) => {
-        const min = Math.min(...arr);
-        const max = Math.max(...arr);
-        return arr.map(v => (max === min ? 0.5 : (v - min) / (max - min)));
-      };
-
-      // A. Calculate Secondary Predictions for the 1h Window
-      const bufferSize = 300; // Increased from 100 to match frontend and improve indicator stability
-      
-      if (completed1h.length < bufferSize) {
-        if (this.tickerCount % 100 === 0) {
-          this.log(`Insufficient data for warm-up: 1h=${completed1h.length}/${bufferSize}`, 'warning');
-        }
-        return;
-      }
-
-      const context1h = completed1h.slice(completed1h.length - bufferSize);
-      const prices1h = context1h.map(c => c.close);
-      const highs1h = context1h.map(c => c.high);
-      const lows1h = context1h.map(c => c.low);
-      const volumes1h = context1h.map(c => c.volume);
-      const hours1h = context1h.map(c => new Date(c.time * 1000).getHours());
-      const days1h = context1h.map(c => new Date(c.time * 1000).getDay());
-      const opens1h = context1h.map(c => c.open);
-
-      // B. Calculate 1h Prediction
-      const periods = this.settings?.indicatorPeriods || { rsi: 14, ema: 20, ema9: 9, bb: 20, mfi: 14, volatility: 20 };
-      const rsi1h = indicators.calculateRSI(prices1h, periods.rsi);
-      const ema1h = indicators.calculateEMA(prices1h, periods.ema);
-      const ema9_1h = indicators.calculateEMA(prices1h, periods.ema9);
-      const bb1h = indicators.calculateBollingerBands(prices1h, periods.bb);
-      const macd1h = indicators.calculateMACD(prices1h);
-      const stochRsi1h = indicators.calculateStochasticRSI(rsi1h);
-      const atr1h = indicators.calculateATR(highs1h, lows1h, prices1h);
-      const cross1h = indicators.calculateEMACross(ema9_1h, ema1h);
-      const obv1h = indicators.calculateOBV(prices1h, volumes1h);
-      const mfi1h = indicators.calculateMFI(highs1h, lows1h, prices1h, volumes1h, periods.mfi);
-      const vol1h = indicators.calculateVolatility(prices1h, periods.volatility);
-      const harami1h = indicators.calculateBearishHarami(opens1h, prices1h);
-      const marubozu1h = indicators.calculateMarubozu(opens1h, highs1h, lows1h, prices1h);
-      const engulfing1h = indicators.calculateEngulfing(opens1h, prices1h);
-
-      const x1h: number[] = [];
-      const winIdx1h = Array.from({ length: windowSize }, (_, k) => bufferSize - windowSize + k);
-      
-      const pWin1h = winIdx1h.map(idx => prices1h[idx]);
-      const rWin1h = winIdx1h.map(idx => rsi1h[idx]);
-      const eWin1h = winIdx1h.map(idx => ema1h[idx]);
-      const uWin1h = winIdx1h.map(idx => bb1h.upper[idx]);
-      const lWin1h = winIdx1h.map(idx => bb1h.lower[idx]);
-      const mWin1h = winIdx1h.map(idx => macd1h.histogram[idx]);
-      const sWin1h = winIdx1h.map(idx => stochRsi1h[idx]);
-      const aWin1h = winIdx1h.map(idx => atr1h[idx]);
-      const e9Win1h = winIdx1h.map(idx => ema9_1h[idx]);
-      const belowWin1h = winIdx1h.map(idx => cross1h.isBelow[idx]);
-      const crossWin1h = winIdx1h.map(idx => cross1h.isCross[idx]);
-      const obvWin1h = winIdx1h.map(idx => obv1h[idx]);
-      const mfiWin1h = winIdx1h.map(idx => mfi1h[idx]);
-      const volWin1h = winIdx1h.map(idx => vol1h[idx]);
-      const hourWin1h = winIdx1h.map(idx => hours1h[idx]);
-      const dayWin1h = winIdx1h.map(idx => days1h[idx]);
-      const haramiWin1h = winIdx1h.map(idx => harami1h[idx]);
-      const marubozuWin1h = winIdx1h.map(idx => marubozu1h[idx]);
-      const engulfingWin1h = winIdx1h.map(idx => engulfing1h[idx]);
-
-      const np1h = normalize(pWin1h);
-      const nr1h = rWin1h.map(v => v / 100);
-      const ne1h = normalize(eWin1h);
-      const nu1h = normalize(uWin1h);
-      const nl1h = normalize(lWin1h);
-      const nm1h = normalize(mWin1h);
-      const na1h = normalize(aWin1h);
-      const ne9_1h = normalize(e9Win1h);
-      const nobv1h = normalize(obvWin1h);
-      const nvol1h = normalize(volWin1h);
-
-      for (let j = 0; j < windowSize; j++) {
-        const h = hourWin1h[j];
-        x1h.push(
-          np1h[j], nr1h[j], ne1h[j], nu1h[j], nl1h[j],
-          nm1h[j], sWin1h[j], na1h[j],
-          ne9_1h[j], belowWin1h[j], crossWin1h[j],
-          nobv1h[j], mfiWin1h[j] / 100, nvol1h[j],
-          h / 24, h >= 0 && h <= 9 ? 1 : 0, h >= 8 && h <= 17 ? 1 : 0, h >= 13 && h <= 22 ? 1 : 0, dayWin1h[j] / 7,
-          haramiWin1h[j], marubozuWin1h[j], engulfingWin1h[j]
-        );
-      }
-
-      let prediction: number[] = [0, 0, 1];
-      let uncertainty: number[] = [0, 0, 0];
-      try {
-        const mcPasses = this.settings?.mcPasses || 1;
-        const result = this.model1h.predictMultiple(x1h, mcPasses);
-        prediction = result.mean;
-        uncertainty = result.std;
-      } catch (err: any) {
-        this.log(`1h Prediction failed: ${err.message}`, 'error');
-      }
-
-      const featureNames = [
-        'Price', 'RSI', 'EMA', 'BB_Upper', 'BB_Lower', 'MACD_Hist', 'Stoch_RSI', 'ATR',
-        'EMA9', 'Below', 'Cross', 'OBV', 'MFI', 'Volatility', 'Hour', 'Asia', 'London', 'NY', 'Day',
-        'Harami', 'Marubozu', 'Engulfing'
-      ];
-      const currentFeatures: Record<string, number> = {};
-      const last1hFeatures = [
-        np1h[windowSize - 1], nr1h[windowSize - 1], ne1h[windowSize - 1], nu1h[windowSize - 1], nl1h[windowSize - 1],
-        nm1h[windowSize - 1], stochRsi1h[bufferSize - 1], na1h[windowSize - 1],
-        ne9_1h[windowSize - 1], cross1h.isBelow[bufferSize - 1], cross1h.isCross[bufferSize - 1],
-        nobv1h[windowSize - 1], mfi1h[bufferSize - 1] / 100, nvol1h[windowSize - 1],
-        hours1h[bufferSize - 1] / 24, 
-        hours1h[bufferSize - 1] >= 0 && hours1h[bufferSize - 1] <= 9 ? 1 : 0,
-        hours1h[bufferSize - 1] >= 8 && hours1h[bufferSize - 1] <= 17 ? 1 : 0,
-        hours1h[bufferSize - 1] >= 13 && hours1h[bufferSize - 1] <= 22 ? 1 : 0,
-        days1h[bufferSize - 1] / 7,
-        harami1h[bufferSize - 1], marubozu1h[bufferSize - 1], engulfing1h[bufferSize - 1]
-      ];
-      featureNames.forEach((name, idx) => { currentFeatures[name] = last1hFeatures[idx]; });
-
-      this.lastVelocity = this.lastPrediction !== null ? prediction.map((p, i) => p - this.lastPrediction![i]) : [0, 0, 0];
-      this.previousPrediction = this.lastPrediction;
-      this.lastPrediction = prediction;
-      this.lastUncertainty = uncertainty;
-      this.lastFeatures = currentFeatures;
-      this.lastPredictionTime = lastCompleted1hTime;
-      this.lastParams = {
-        ...this.lastParams,
-        rsi: rsi1h[rsi1h.length - 1],
-        ema: ema1h[ema1h.length - 1],
-        ema9: ema9_1h[ema9_1h.length - 1],
-        bbUpper: bb1h.upper[bb1h.upper.length - 1],
-        bbLower: bb1h.lower[bb1h.lower.length - 1],
-        macdHist: macd1h.histogram[macd1h.histogram.length - 1],
-        stochRsi: stochRsi1h[stochRsi1h.length - 1],
-        atr: atr1h[atr1h.length - 1],
-        emaCross: cross1h.isBelow[cross1h.isBelow.length - 1] === 1,
-        obv: obv1h[obv1h.length - 1],
-        mfi: mfi1h[mfi1h.length - 1],
-        volatility: vol1h[vol1h.length - 1],
-        harami: harami1h[harami1h.length - 1],
-        marubozu: marubozu1h[marubozu1h.length - 1],
-        uncertainty: uncertainty,
-      };
-
-      this.log(`New Hourly Prediction: Short=${prediction[0].toFixed(4)}, Long=${prediction[1].toFixed(4)}, Sideways=${prediction[2].toFixed(4)}`);
+    if (res4h) {
+      this.lastPrediction4h = res4h.mean;
     }
 
     const prediction = this.lastPrediction || [0, 0, 1];
+    const prediction4h = this.lastPrediction4h || [0, 0, 1];
     const uncertainty = this.lastUncertainty || [0, 0, 0];
     const velocity = this.lastVelocity || [0, 0, 0];
+
+    // 2.1 Calculate DRL Action if model present
+    let drlAction: number | null = null;
+    if (this.drlModel && res1hData?.features) {
+      drlAction = tf.tidy(() => {
+        const pos = this.activeTrade ? this.activeTrade.type : 'NEUTRAL';
+        const state = [...res1hData.features, ...this.encodePosition(pos as any)];
+        const input = tf.tensor2d([state]);
+        const probs = (this.drlModel as tf.LayersModel).predict(input) as tf.Tensor;
+        return probs.argMax(1).dataSync()[0];
+      });
+    }
+
+    // Logging MTF signals periodically
+    if (this.tickerCount % 20 === 0) {
+      this.log(`MTF Sync: 1h[S:${prediction[0].toFixed(2)} L:${prediction[1].toFixed(2)}] 4h[S:${prediction4h[0].toFixed(2)} L:${prediction4h[1].toFixed(2)}]${drlAction !== null ? ` DRL:${drlAction}` : ''}`);
+    }
 
     this.lastParams = {
       ...this.lastParams,
       velocity: velocity,
       session: nowDate.getUTCHours() >= this.settings.asiaStart && nowDate.getUTCHours() < this.settings.asiaEnd ? 'Asia' : 
                nowDate.getUTCHours() >= this.settings.nyStart && nowDate.getUTCHours() < this.settings.nyEnd ? 'New York' : 'Off-Session',
-      dayOfWeek: nowDate.getDay()
+      dayOfWeek: nowDate.getDay(),
+      drlAction: drlAction
     };
 
     // 3. Trading Logic
@@ -826,9 +781,12 @@ export class TradingService {
     } else if (currentTrailingStop && price >= currentTrailingStop) {
       shouldExit = true;
       reason = 'TRAILING_STOP';
-    } else if (prediction[0] < this.settings.shortExitThreshold) {
+    } else if (prediction[0] * 100 < this.settings.shortExitThreshold) {
       shouldExit = true;
       reason = 'PREDICTION';
+    } else if (this.settings.useDRLOnly && drlAction !== null && drlAction !== 1) {
+      shouldExit = true;
+      reason = 'DRL_REVERSAL';
     }
   } else {
     // Bullish (LONG, PUT_SPREAD, SHORT_PUT)
@@ -841,9 +799,21 @@ export class TradingService {
     } else if (currentTrailingStop && price <= currentTrailingStop) {
       shouldExit = true;
       reason = 'TRAILING_STOP';
-    } else if (prediction[1] < this.settings.longExitThreshold) {
+    } else if (prediction[1] * 100 < this.settings.longExitThreshold) {
       shouldExit = true;
       reason = 'PREDICTION';
+    } else if (this.settings.useDRLOnly && drlAction !== null && drlAction !== 0) {
+      shouldExit = true;
+      reason = 'DRL_REVERSAL';
+    }
+  }
+
+  // Time-based exit limit
+  if (!shouldExit && this.activeTrade) {
+    const tradeDurationHrs = (Date.now() - this.activeTrade.entryTime) / (1000 * 60 * 60);
+    if (tradeDurationHrs >= (this.settings.maxDurationHours || 12)) {
+      shouldExit = true;
+      reason = 'TIME_LIMIT';
     }
   }
 
@@ -896,20 +866,36 @@ export class TradingService {
     } else {
       // Entry Logic
       const bias = this.settings.biasThreshold || 0;
-      const canShort = prediction[0] > this.settings.shortThreshold && 
-                      (prediction[0] - prediction[1]) >= bias &&
+      const mtfConfluenceThresh = 40; // Hardcoded fallback or use setting
+
+      const canShort = (prediction[0] * 100) > this.settings.shortThreshold && 
+                      (prediction4h[0] * 100) > mtfConfluenceThresh &&
                       velocity[0] >= this.settings.minSignalVelocity && 
                       (this.settings.mcPasses <= 1 || uncertainty[0] <= this.settings.maxUncertainty);
-      const canLong = prediction[1] > this.settings.longThreshold && 
-                     (prediction[1] - prediction[0]) >= bias &&
+      
+      const canLong = (prediction[1] * 100) > this.settings.longThreshold && 
+                     (prediction4h[1] * 100) > mtfConfluenceThresh &&
                      velocity[1] >= this.settings.minSignalVelocity && 
                      (this.settings.mcPasses <= 1 || uncertainty[1] <= this.settings.maxUncertainty);
       
       let entryType: ActiveTrade['type'] | null = null;
-      if (canShort && (!canLong || prediction[0] > prediction[1])) {
-        entryType = 'SHORT';
-      } else if (canLong) {
-        entryType = 'LONG';
+      
+      if (this.settings.useDRLOnly) {
+        if (drlAction === 1) entryType = 'SHORT';
+        else if (drlAction === 0) entryType = 'LONG';
+      } else {
+        const drlMatchesShort = drlAction === 1;
+        const drlMatchesLong = drlAction === 0;
+
+        if (canShort && (!canLong || prediction[0] > prediction[1])) {
+          if (!this.settings.useDRLConfluence || drlMatchesShort) {
+            entryType = 'SHORT';
+          }
+        } else if (canLong) {
+          if (!this.settings.useDRLConfluence || drlMatchesLong) {
+            entryType = 'LONG';
+          }
+        }
       }
 
       if (entryType) {

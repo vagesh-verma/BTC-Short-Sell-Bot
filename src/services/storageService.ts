@@ -142,10 +142,13 @@ export async function syncModelsFromGitHub(config: GitHubConfig): Promise<ModelP
   }
 }
 
-export async function saveModelPair(name: string, model1h: GRUModel) {
+export async function saveModelPair(name: string, model1h: GRUModel, model4h?: GRUModel) {
   try {
     const id = nameToId(name);
     await model1h.save(`model_pair_${id}_1h`);
+    if (model4h) {
+      await model4h.save(`model_pair_${id}_4h`);
+    }
 
     const pairs = getSavedModelPairs();
     const newPair: ModelPair = { name, timestamp: Date.now() };
@@ -173,14 +176,20 @@ export async function uploadModelPairToGitHub(name: string, config: GitHubConfig
     const id = pair?.githubId || nameToId(name);
     const modelConfig = { ...config, path: config.path ? `${config.path}/${id}` : id };
     
-    const { model1h } = await loadModelPair(name);
+    const { model1h, model4h } = await loadModelPair(name);
 
     const artifacts1h = await model1h.getArtifacts();
-
     const metadata1h = localStorage.getItem(`model_pair_${id}_1h_metadata`);
 
     await uploadToGitHub(modelConfig, `1h.json`, serializeArtifacts(artifacts1h), `Upload model 1h: ${name}`);
     if (metadata1h) await uploadToGitHub(modelConfig, `1h_metadata.json`, metadata1h, `Upload metadata 1h: ${name}`);
+
+    if (model4h) {
+      const artifacts4h = await model4h.getArtifacts();
+      const metadata4h = localStorage.getItem(`model_pair_${id}_4h_metadata`);
+      await uploadToGitHub(modelConfig, `4h.json`, serializeArtifacts(artifacts4h), `Upload model 4h: ${name}`);
+      if (metadata4h) await uploadToGitHub(modelConfig, `4h_metadata.json`, metadata4h, `Upload metadata 4h: ${name}`);
+    }
 
     const idx = pairs.findIndex(p => p.name === name);
     if (idx !== -1) {
@@ -204,6 +213,14 @@ export async function deleteModelPairFromGitHub(name: string, config: GitHubConf
     
     await deleteFromGitHub(modelConfig, `1h.json`, `Delete model 1h: ${name}`);
     await deleteFromGitHub(modelConfig, `1h_metadata.json`, `Delete metadata 1h: ${name}`);
+    
+    // Try to delete 4h as well, but ignore error if not found
+    try {
+      await deleteFromGitHub(modelConfig, `4h.json`, `Delete model 4h: ${name}`);
+      await deleteFromGitHub(modelConfig, `4h_metadata.json`, `Delete metadata 4h: ${name}`);
+    } catch (e) {
+      // Ignore
+    }
 
     const idx = pairs.findIndex(p => p.name === name);
     if (idx !== -1) {
@@ -276,12 +293,18 @@ export async function loadModelPairFromGitHub(name: string, config: GitHubConfig
   }
 }
 
-export async function loadModelPair(name: string): Promise<{ model1h: GRUModel }> {
+export async function loadModelPair(name: string): Promise<{ model1h: GRUModel, model4h?: GRUModel }> {
   try {
     const id = nameToId(name);
     const model1h = await GRUModel.load(`model_pair_${id}_1h`);
+    let model4h;
+    try {
+      model4h = await GRUModel.load(`model_pair_${id}_4h`);
+    } catch (e) {
+      // Ignore if 4h doesn't exist
+    }
     logger.success(`Model "${name}" loaded successfully.`);
-    return { model1h };
+    return { model1h, model4h };
   } catch (err) {
     logger.error(`Failed to load model: ${err}`);
     throw err;
@@ -293,6 +316,7 @@ export async function deleteModelPair(name: string) {
   
   // Remove from IndexedDB
   await GRUModel.remove(`model_pair_${id}_1h`);
+  await GRUModel.remove(`model_pair_${id}_4h`);
   
   // Also clean up any legacy localStorage entries
   localStorage.removeItem(`model_pair_${id}_1h`);

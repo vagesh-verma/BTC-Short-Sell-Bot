@@ -16,10 +16,6 @@ export interface Trade {
 export interface BacktestSettings {
   shortThreshold: number;
   longThreshold: number;
-  xgShortThreshold?: number;
-  xgLongThreshold?: number;
-  xgShortExitThreshold?: number;
-  xgLongExitThreshold?: number;
   shortExitThreshold: number;
   longExitThreshold: number;
   biasThreshold?: number;
@@ -69,7 +65,6 @@ export interface BacktestResult {
   };
   candles: Candle[];
   predictions: number[][];
-  xgPredictions?: number[][];
   drlActions?: number[];
 }
 
@@ -82,7 +77,6 @@ export function runBacktest(
   features?: number[][],
   featureNames?: string[],
   uncertainties?: number[][],
-  xgPredictions?: number[][],
   drlActions?: number[]
 ): BacktestResult {
   const trades: Trade[] = [];
@@ -165,16 +159,12 @@ export function runBacktest(
     const predictionFull = predictions[predictionIdx];
     if (!predictionFull) continue;
 
-    const xgPredictionFull = (xgPredictions && xgPredictions[predictionIdx]) ? xgPredictions[predictionIdx] : [1, 1, 0];
-    
     const shortProb = predictionFull[0];
     const longProb = predictionFull[1];
-    const xgShortProb = xgPredictionFull[0];
-    const xgLongProb = xgPredictionFull[1];
 
     // Confusion Matrix Logic: Requires both to pass thresholds if configured
-    const predShort = (shortProb * 100 > settings.shortThreshold) && (xgShortProb * 100 >= (settings.xgShortThreshold ?? 0));
-    const predLong = (longProb * 100 > settings.longThreshold) && (xgLongProb * 100 >= (settings.xgLongThreshold ?? 0));
+    const predShort = (shortProb * 100 > settings.shortThreshold);
+    const predLong = (longProb * 100 > settings.longThreshold);
     const groundTruth = actualLabels[predictionIdx];
 
     if (groundTruth) {
@@ -220,6 +210,8 @@ export function runBacktest(
       let exitPrice = candle.close;
 
       // Check SL/TP/Trailing Stop
+      const currentDrlAction = (drlActions && drlActions[predictionIdx] !== undefined) ? drlActions[predictionIdx] : null;
+
       if (isShort) {
         if (candle.high >= stopLossPrice) {
           shouldExit = true;
@@ -233,9 +225,13 @@ export function runBacktest(
           shouldExit = true;
           exitReason = 'TRAILING_STOP';
           exitPrice = activeTrade.trailingStopPrice;
-        } else if (shortProb * 100 < settings.shortExitThreshold || (xgPredictions && xgShortProb * 100 < (settings.xgShortExitThreshold ?? 0))) {
+        } else if (shortProb * 100 < settings.shortExitThreshold) {
           shouldExit = true;
           exitReason = 'PREDICTION';
+          exitPrice = candle.close;
+        } else if (settings.useDRLOnly && currentDrlAction !== null && currentDrlAction !== 1) {
+          shouldExit = true;
+          exitReason = 'PREDICTION'; // DRL signal reversal
           exitPrice = candle.close;
         }
       } else { // LONG
@@ -251,9 +247,13 @@ export function runBacktest(
           shouldExit = true;
           exitReason = 'TRAILING_STOP';
           exitPrice = activeTrade.trailingStopPrice;
-        } else if (longProb * 100 < settings.longExitThreshold || (xgPredictions && xgLongProb * 100 < (settings.xgLongExitThreshold ?? 0))) {
+        } else if (longProb * 100 < settings.longExitThreshold) {
           shouldExit = true;
           exitReason = 'PREDICTION';
+          exitPrice = candle.close;
+        } else if (settings.useDRLOnly && currentDrlAction !== null && currentDrlAction !== 0) {
+          shouldExit = true;
+          exitReason = 'PREDICTION'; // DRL signal reversal
           exitPrice = candle.close;
         }
       }
@@ -381,13 +381,11 @@ export function runBacktest(
                           ((shortProb - longProb) * 100) >= bias &&
                           velocityShort >= minVelocity && 
                           (mcPasses <= 1 || uncertaintyShort <= maxUncertainty) &&
-                          (!xgPredictions || (xgShortProb * 100 >= (settings.xgShortThreshold ?? 0))) &&
                           (!settings.useDRLConfluence || drlMatchesShort);
           canLong = (longProb * 100) > settings.longThreshold && 
                          ((longProb - shortProb) * 100) >= bias &&
                          velocityLong >= minVelocity && 
                          (mcPasses <= 1 || uncertaintyLong <= maxUncertainty) &&
-                         (!xgPredictions || (xgLongProb * 100 >= (settings.xgLongThreshold ?? 0))) &&
                          (!settings.useDRLConfluence || drlMatchesLong);
         }
 
@@ -474,7 +472,6 @@ export function runBacktest(
     },
     candles: fullCandles.slice(startIdx, startIdx + predictions.length),
     predictions,
-    xgPredictions,
     drlActions
   };
 }
